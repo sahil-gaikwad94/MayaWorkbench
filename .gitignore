@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# MayaWorkbench local data (never commit a user's workbench state)
+.maya/
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
