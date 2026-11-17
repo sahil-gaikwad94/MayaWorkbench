@@ -9,22 +9,53 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
+from datetime import timedelta
 from typing import Any, TypeVar
 
-from mayaworkbench.clock import utcnow
-from mayaworkbench.domain.enums import IssueKind, IssueSeverity, SnapshotStatus, SymbolKind
+from mayaworkbench.clock import to_iso, utcnow
+from mayaworkbench.domain.enums import (
+    ApprovalStatus,
+    ClaimReviewStatus,
+    ClaimType,
+    IssueKind,
+    IssueSeverity,
+    SnapshotStatus,
+    SymbolKind,
+    WorkflowState,
+    WorkerJobStatus,
+)
 from mayaworkbench.domain.models import (
+    ClaimDependency,
+    ClaimMapping,
+    ClaimRevision,
+    ClaimRiskFactor,
     IndexIssue,
     IndexedFile,
+    MappingEvidence,
     ModelInvocation,
     Project,
     QaRecord,
     Record,
     Repository,
     RepositorySnapshot,
+    ResearchClaim,
+    ResearchDocument,
+    ResearchExtraction,
+    ResearchMemo,
+    SourcePassage,
     Symbol,
     SymbolEdge,
+    ApprovalRequest,
+    ExecutionWorkspace,
+    Task,
+    TaskContract,
+    TaskDiff,
+    TaskPlan,
+    TaskReview,
+    ToolCall,
     WorkflowEvent,
+    WorkflowRun,
+    WorkerJob,
 )
 from mayaworkbench.errors import DatabaseError, NotFoundError
 from mayaworkbench.ids import short_hash
@@ -97,6 +128,11 @@ def _insert_many(db: Database, table: str, rows: list[dict[str, Any]]) -> None:
         f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
         rows,
     )
+
+
+def _update_row(db: Database, table: str, row: dict[str, Any], *, key: str = "id") -> None:
+    assignments = ", ".join(f"{column} = :{column}" for column in row if column != key)
+    db.execute(f"UPDATE {table} SET {assignments} WHERE {key} = :{key}", row)
 
 
 def like_pattern(value: str) -> str:
@@ -448,6 +484,23 @@ class FileStore:
         )
         return {str(row["status"]): int(row["n"]) for row in rows}
 
+    def coverage_counts(self, snapshot_id: str) -> dict[str, int]:
+        rows = self.db.fetchall(
+            "SELECT parse_coverage, COUNT(*) AS n FROM indexed_files "
+            "WHERE snapshot_id = ? AND status <> 'SKIPPED' GROUP BY parse_coverage",
+            (snapshot_id,),
+        )
+        return {str(row["parse_coverage"]): int(row["n"]) for row in rows}
+
+    def count_by_coverage(self, snapshot_id: str) -> int:
+        """Files whose structural parse coverage is not FULL."""
+        row = self.db.fetchone(
+            "SELECT COUNT(*) AS n FROM indexed_files WHERE snapshot_id = ? "
+            "AND status <> 'SKIPPED' AND parse_coverage <> 'FULL'",
+            (snapshot_id,),
+        )
+        return int(row["n"])
+
     def language_stats(self, snapshot_id: str) -> list[dict[str, Any]]:
         rows = self.db.fetchall(
             """
@@ -753,6 +806,8 @@ class EventStore:
         snapshot_id: str | None = None,
         entity_id: str | None = None,
         event_type: str | None = None,
+        task_id: str | None = None,
+        run_id: str | None = None,
         limit: int = 100,
         after_seq: int = 0,
     ) -> list[WorkflowEvent]:
@@ -763,6 +818,8 @@ class EventStore:
             ("snapshot_id", snapshot_id),
             ("entity_id", entity_id),
             ("event_type", event_type),
+            ("task_id", task_id),
+            ("run_id", run_id),
         ):
             if value is not None:
                 clauses.append(f"{column} = ?")
@@ -770,8 +827,9 @@ class EventStore:
         params.append(limit)
         rows = self.db.fetchall(
             "SELECT event_id, occurred_at, event_type, project_id, repository_id, snapshot_id, "
-            "entity_type, entity_id, actor_kind, actor_name, correlation_id, schema_version, "
-            f"payload_json FROM workflow_events WHERE {' AND '.join(clauses)} ORDER BY seq LIMIT ?",
+            "task_id, run_id, entity_type, entity_id, actor_kind, actor_name, correlation_id, "
+            "schema_version, payload_json FROM workflow_events "
+            f"WHERE {' AND '.join(clauses)} ORDER BY seq LIMIT ?",
             params,
         )
         return [
@@ -934,6 +992,1306 @@ class QaStore:
         return int(self.db.fetchone("SELECT COUNT(*) FROM qa_records")[0])
 
 
+# -------------------------------------------------------- research documents
+class ResearchDocumentStore:
+    JSON = {
+        "authors": ("authors_json", []),
+        "extraction_warnings": ("extraction_warnings_json", []),
+        "missing_pages": ("missing_pages_json", []),
+        "metadata": ("metadata_json", {}),
+    }
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, document: ResearchDocument) -> ResearchDocument:
+        _insert(self.db, "research_documents", _model_to_row(document, json_fields=self.JSON))
+        return document
+
+    def get(self, document_id: str) -> ResearchDocument:
+        row = self.db.fetchone(
+            "SELECT * FROM research_documents WHERE id = ?", (document_id,)
+        )
+        if row is None:
+            raise NotFoundError(
+                f"Research document {document_id!r} not found",
+                hint="Run `maya research list` to see registered documents.",
+            )
+        return _row_to_model(ResearchDocument, row, json_fields=self.JSON)
+
+    def find(self, document_id: str) -> ResearchDocument | None:
+        try:
+            return self.get(document_id)
+        except NotFoundError:
+            return None
+
+    def list_by_project(self, project_id: str, limit: int = 50) -> list[ResearchDocument]:
+        rows = self.db.fetchall(
+            "SELECT * FROM research_documents WHERE project_id = ? "
+            "ORDER BY created_at DESC, version DESC LIMIT ?",
+            (project_id, limit),
+        )
+        return [_row_to_model(ResearchDocument, row, json_fields=self.JSON) for row in rows]
+
+    def list_versions(self, project_id: str, document_key: str) -> list[ResearchDocument]:
+        rows = self.db.fetchall(
+            "SELECT * FROM research_documents WHERE project_id = ? AND document_key = ? "
+            "ORDER BY version DESC",
+            (project_id, document_key),
+        )
+        return [_row_to_model(ResearchDocument, row, json_fields=self.JSON) for row in rows]
+
+    def find_by_content(
+        self, project_id: str, document_key: str, content_sha256: str
+    ) -> ResearchDocument | None:
+        row = self.db.fetchone(
+            "SELECT * FROM research_documents WHERE project_id = ? AND document_key = ? "
+            "AND content_sha256 = ? ORDER BY version DESC LIMIT 1",
+            (project_id, document_key, content_sha256),
+        )
+        return _row_to_model(ResearchDocument, row, json_fields=self.JSON) if row else None
+
+    def latest_for_key(self, project_id: str, document_key: str) -> ResearchDocument | None:
+        row = self.db.fetchone(
+            "SELECT * FROM research_documents WHERE project_id = ? AND document_key = ? "
+            "ORDER BY version DESC LIMIT 1",
+            (project_id, document_key),
+        )
+        return _row_to_model(ResearchDocument, row, json_fields=self.JSON) if row else None
+
+    def next_version(self, project_id: str, document_key: str) -> int:
+        row = self.db.fetchone(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM research_documents "
+            "WHERE project_id = ? AND document_key = ?",
+            (project_id, document_key),
+        )
+        return int(row["v"]) + 1
+
+    def update_extraction(self, document_id: str, document: ResearchDocument) -> None:
+        row = _model_to_row(document, json_fields=self.JSON)
+        _update_row(self.db, "research_documents", row)
+
+    def count(self, project_id: str | None = None) -> int:
+        if project_id is None:
+            return int(self.db.fetchone("SELECT COUNT(*) FROM research_documents")[0])
+        return int(
+            self.db.fetchone(
+                "SELECT COUNT(*) FROM research_documents WHERE project_id = ?", (project_id,)
+            )[0]
+        )
+
+
+# ---------------------------------------------------------- source passages
+class SourcePassageStore:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def insert_many(self, passages: Iterable[SourcePassage]) -> None:
+        rows = [passage.model_dump(mode="json") for passage in passages]
+        _insert_many(self.db, "source_passages", rows)
+
+    def get(self, passage_id: str) -> SourcePassage:
+        row = self.db.fetchone("SELECT * FROM source_passages WHERE id = ?", (passage_id,))
+        if row is None:
+            raise NotFoundError(f"Source passage {passage_id!r} not found")
+        return SourcePassage.model_validate(dict(row))
+
+    def find(self, passage_id: str) -> SourcePassage | None:
+        row = self.db.fetchone("SELECT * FROM source_passages WHERE id = ?", (passage_id,))
+        return SourcePassage.model_validate(dict(row)) if row else None
+
+    def list_by_document(
+        self,
+        document_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        section_prefix: str | None = None,
+    ) -> list[SourcePassage]:
+        clauses = ["document_id = ?"]
+        params: list[Any] = [document_id]
+        if section_prefix:
+            clauses.append("section_path LIKE ? ESCAPE '\\'")
+            params.append(like_pattern(section_prefix) + "%")
+        sql = (
+            f"SELECT * FROM source_passages WHERE {' AND '.join(clauses)} ORDER BY ordinal"
+        )
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        rows = self.db.fetchall(sql, params)
+        return [SourcePassage.model_validate(dict(row)) for row in rows]
+
+    def find_many(self, passage_ids: Sequence[str]) -> dict[str, SourcePassage]:
+        if not passage_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in passage_ids)
+        rows = self.db.fetchall(
+            f"SELECT * FROM source_passages WHERE id IN ({placeholders})", list(passage_ids)
+        )
+        return {str(row["id"]): SourcePassage.model_validate(dict(row)) for row in rows}
+
+    def counts_by_kind(self, document_id: str) -> dict[str, int]:
+        rows = self.db.fetchall(
+            "SELECT kind, COUNT(*) AS n FROM source_passages WHERE document_id = ? GROUP BY kind",
+            (document_id,),
+        )
+        return {str(row["kind"]): int(row["n"]) for row in rows}
+
+    def count(self, document_id: str) -> int:
+        return int(
+            self.db.fetchone(
+                "SELECT COUNT(*) FROM source_passages WHERE document_id = ?", (document_id,)
+            )[0]
+        )
+
+    def delete_for_document(self, document_id: str) -> None:
+        self.db.execute("DELETE FROM source_passages WHERE document_id = ?", (document_id,))
+
+
+# -------------------------------------------------------------- research claims
+class ResearchClaimStore:
+    JSON = {
+        "source_locations": ("source_locations_json", []),
+        "basis_passage_ids": ("basis_passage_ids_json", []),
+        "expected_code_signals": ("expected_code_signals_json", []),
+        "forbidden_code_signals": ("forbidden_code_signals_json", []),
+        "target_paths": ("target_paths_json", []),
+        "target_symbols": ("target_symbols_json", []),
+        "missing_details": ("missing_details_json", []),
+        "validation_methods": ("validation_methods_json", []),
+    }
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, claim: ResearchClaim) -> ResearchClaim:
+        _insert(self.db, "research_claims", _model_to_row(claim, json_fields=self.JSON))
+        return claim
+
+    def update(self, claim: ResearchClaim) -> ResearchClaim:
+        _update_row(self.db, "research_claims", _model_to_row(claim, json_fields=self.JSON))
+        return claim
+
+    def get(self, claim_id: str) -> ResearchClaim:
+        row = self.db.fetchone("SELECT * FROM research_claims WHERE id = ?", (claim_id,))
+        if row is None:
+            raise NotFoundError(
+                f"Claim {claim_id!r} not found",
+                hint="Run `maya research claim list` to see stored claims.",
+            )
+        return _row_to_model(ResearchClaim, row, json_fields=self.JSON)
+
+    def list(
+        self,
+        *,
+        project_id: str | None = None,
+        document_id: str | None = None,
+        claim_type: ClaimType | None = None,
+        review_status: ClaimReviewStatus | None = None,
+        limit: int = 500,
+    ) -> list[ResearchClaim]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if document_id is not None:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if claim_type is not None:
+            clauses.append("claim_type = ?")
+            params.append(claim_type.value)
+        if review_status is not None:
+            clauses.append("review_status = ?")
+            params.append(review_status.value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.db.fetchall(
+            f"SELECT * FROM research_claims {where} ORDER BY ordinal, created_at, id LIMIT ?",
+            params,
+        )
+        return [_row_to_model(ResearchClaim, row, json_fields=self.JSON) for row in rows]
+
+    def next_ordinal(self, *, project_id: str, document_id: str | None) -> int:
+        if document_id is None:
+            row = self.db.fetchone(
+                "SELECT COALESCE(MAX(ordinal), -1) AS o FROM research_claims "
+                "WHERE project_id = ? AND document_id IS NULL",
+                (project_id,),
+            )
+        else:
+            row = self.db.fetchone(
+                "SELECT COALESCE(MAX(ordinal), -1) AS o FROM research_claims WHERE document_id = ?",
+                (document_id,),
+            )
+        return int(row["o"]) + 1
+
+    def count(
+        self,
+        *,
+        project_id: str | None = None,
+        document_id: str | None = None,
+        claim_type: ClaimType | None = None,
+        review_status: ClaimReviewStatus | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if document_id is not None:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if claim_type is not None:
+            clauses.append("claim_type = ?")
+            params.append(claim_type.value)
+        if review_status is not None:
+            clauses.append("review_status = ?")
+            params.append(review_status.value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.db.fetchone(
+            f"SELECT COUNT(*) AS n FROM research_claims {where}", params
+        )
+        return int(row["n"])
+
+    def counts_by_type(self, document_id: str) -> dict[str, int]:
+        rows = self.db.fetchall(
+            "SELECT claim_type, COUNT(*) AS n FROM research_claims WHERE document_id = ? "
+            "GROUP BY claim_type",
+            (document_id,),
+        )
+        return {str(row["claim_type"]): int(row["n"]) for row in rows}
+
+    def counts_by_review(self, project_id: str) -> dict[str, int]:
+        rows = self.db.fetchall(
+            "SELECT review_status, COUNT(*) AS n FROM research_claims WHERE project_id = ? "
+            "GROUP BY review_status",
+            (project_id,),
+        )
+        return {str(row["review_status"]): int(row["n"]) for row in rows}
+
+    def delete_machine_claims(
+        self, document_id: str, *, keep: Sequence[str] = ()
+    ) -> list[str]:
+        """Delete unreviewed machine claims, preserving explicitly kept ids."""
+        clauses = [
+            "document_id = ?",
+            "created_by IN ('HEURISTIC', 'MODEL')",
+            "review_status = 'NEEDS_REVIEW'",
+        ]
+        params: list[Any] = [document_id]
+        if keep:
+            placeholders = ", ".join("?" for _ in keep)
+            clauses.append(f"id NOT IN ({placeholders})")
+            params.extend(keep)
+        rows = self.db.fetchall(
+            f"SELECT id FROM research_claims WHERE {' AND '.join(clauses)}", params
+        )
+        ids = [str(row["id"]) for row in rows]
+        for claim_id in ids:
+            self.db.execute("DELETE FROM research_claims WHERE id = ?", (claim_id,))
+        return ids
+
+    # ------------------------------------------------------------ dependencies
+    def add_dependency(self, dependency: ClaimDependency) -> ClaimDependency:
+        _insert(self.db, "claim_dependencies", dependency.model_dump(mode="json"))
+        return dependency
+
+    def clear_dependencies(self, claim_id: str) -> None:
+        self.db.execute("DELETE FROM claim_dependencies WHERE claim_id = ?", (claim_id,))
+
+    def list_dependencies(
+        self, *, project_id: str | None = None, claim_ids: Sequence[str] | None = None
+    ) -> list[ClaimDependency]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append(
+                "claim_id IN (SELECT id FROM research_claims WHERE project_id = ?)"
+            )
+            params.append(project_id)
+        if claim_ids is not None:
+            if not claim_ids:
+                return []
+            placeholders = ", ".join("?" for _ in claim_ids)
+            clauses.append(f"claim_id IN ({placeholders})")
+            params.extend(claim_ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.fetchall(f"SELECT * FROM claim_dependencies {where}", params)
+        return [ClaimDependency.model_validate(dict(row)) for row in rows]
+
+    # --------------------------------------------------------------- revisions
+    def append_revision(self, revision: ClaimRevision) -> ClaimRevision:
+        _insert(
+            self.db,
+            "claim_revisions",
+            _model_to_row(
+                revision,
+                json_fields={"before": ("before_json", {}), "after": ("after_json", {})},
+            ),
+        )
+        return revision
+
+    def list_revisions(self, claim_id: str) -> list[ClaimRevision]:
+        rows = self.db.fetchall(
+            "SELECT * FROM claim_revisions WHERE claim_id = ? ORDER BY revision", (claim_id,)
+        )
+        return [
+            _row_to_model(
+                ClaimRevision,
+                row,
+                json_fields={"before": ("before_json", {}), "after": ("after_json", {})},
+            )
+            for row in rows
+        ]
+
+    def next_revision(self, claim_id: str) -> int:
+        row = self.db.fetchone(
+            "SELECT COALESCE(MAX(revision), 0) AS r FROM claim_revisions WHERE claim_id = ?",
+            (claim_id,),
+        )
+        return int(row["r"]) + 1
+
+    # ------------------------------------------------------------ risk factors
+    def insert_risk_factors(self, factors: Iterable[ClaimRiskFactor]) -> None:
+        rows = [factor.model_dump(mode="json") for factor in factors]
+        _insert_many(self.db, "claim_risk_factors", rows)
+
+    def clear_risk_factors(self, claim_id: str) -> None:
+        self.db.execute("DELETE FROM claim_risk_factors WHERE claim_id = ?", (claim_id,))
+
+    def list_risk_factors(
+        self, claim_ids: Sequence[str] | None = None
+    ) -> list[ClaimRiskFactor]:
+        if claim_ids is not None and not claim_ids:
+            return []
+        params: list[Any] = []
+        where = ""
+        if claim_ids is not None:
+            placeholders = ", ".join("?" for _ in claim_ids)
+            where = f"WHERE claim_id IN ({placeholders})"
+            params.extend(claim_ids)
+        rows = self.db.fetchall(
+            f"SELECT * FROM claim_risk_factors {where} ORDER BY claim_id, category", params
+        )
+        return [ClaimRiskFactor.model_validate(dict(row)) for row in rows]
+
+
+# ------------------------------------------------------------ claim mappings
+class ClaimMappingStore:
+    JSON = {
+        "gaps": ("gaps_json", []),
+        "counter_evidence": ("counter_evidence_json", []),
+        "details": ("details_json", {}),
+    }
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, mapping: ClaimMapping) -> ClaimMapping:
+        _insert(self.db, "claim_mappings", _model_to_row(mapping, json_fields=self.JSON))
+        return mapping
+
+    def update(self, mapping: ClaimMapping) -> ClaimMapping:
+        _update_row(self.db, "claim_mappings", _model_to_row(mapping, json_fields=self.JSON))
+        return mapping
+
+    def get(self, mapping_id: str) -> ClaimMapping:
+        row = self.db.fetchone("SELECT * FROM claim_mappings WHERE id = ?", (mapping_id,))
+        if row is None:
+            raise NotFoundError(f"Claim mapping {mapping_id!r} not found")
+        return _row_to_model(ClaimMapping, row, json_fields=self.JSON)
+
+    def find_for_claim(self, claim_id: str, snapshot_id: str) -> ClaimMapping | None:
+        row = self.db.fetchone(
+            "SELECT * FROM claim_mappings WHERE claim_id = ? AND snapshot_id = ?",
+            (claim_id, snapshot_id),
+        )
+        return _row_to_model(ClaimMapping, row, json_fields=self.JSON) if row else None
+
+    def list_by_snapshot(self, snapshot_id: str) -> list[ClaimMapping]:
+        rows = self.db.fetchall(
+            "SELECT * FROM claim_mappings WHERE snapshot_id = ? ORDER BY claim_id",
+            (snapshot_id,),
+        )
+        return [_row_to_model(ClaimMapping, row, json_fields=self.JSON) for row in rows]
+
+    def counts_by_status(self, snapshot_id: str) -> dict[str, int]:
+        rows = self.db.fetchall(
+            "SELECT status, COUNT(*) AS n FROM claim_mappings WHERE snapshot_id = ? "
+            "GROUP BY status",
+            (snapshot_id,),
+        )
+        return {str(row["status"]): int(row["n"]) for row in rows}
+
+    # ---------------------------------------------------------------- evidence
+    def replace_evidence(self, mapping_id: str, evidence: Iterable[MappingEvidence]) -> None:
+        self.db.execute("DELETE FROM mapping_evidence WHERE mapping_id = ?", (mapping_id,))
+        rows = [
+            {
+                **item.model_dump(mode="json"),
+                "matched_signals_json": json.dumps(
+                    item.matched_signals, ensure_ascii=False, sort_keys=True
+                ),
+            }
+            for item in evidence
+        ]
+        for row in rows:
+            row.pop("matched_signals", None)
+        _insert_many(self.db, "mapping_evidence", rows)
+
+    def list_evidence(self, mapping_id: str) -> list[MappingEvidence]:
+        rows = self.db.fetchall(
+            "SELECT * FROM mapping_evidence WHERE mapping_id = ? ORDER BY path, start_line",
+            (mapping_id,),
+        )
+        return [
+            _row_to_model(
+                MappingEvidence,
+                row,
+                json_fields={"matched_signals": ("matched_signals_json", [])},
+            )
+            for row in rows
+        ]
+
+    def list_evidence_for_snapshot(self, snapshot_id: str) -> list[MappingEvidence]:
+        rows = self.db.fetchall(
+            "SELECT * FROM mapping_evidence WHERE snapshot_id = ? ORDER BY path, start_line",
+            (snapshot_id,),
+        )
+        return [
+            _row_to_model(
+                MappingEvidence,
+                row,
+                json_fields={"matched_signals": ("matched_signals_json", [])},
+            )
+            for row in rows
+        ]
+
+
+# --------------------------------------------------------- research memos
+class ResearchMemoStore:
+    JSON = {"readiness": ("readiness_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, memo: ResearchMemo) -> ResearchMemo:
+        _insert(self.db, "research_memos", _model_to_row(memo, json_fields=self.JSON))
+        return memo
+
+    def get(self, memo_id: str) -> ResearchMemo:
+        row = self.db.fetchone("SELECT * FROM research_memos WHERE id = ?", (memo_id,))
+        if row is None:
+            raise NotFoundError(f"Research memo {memo_id!r} not found")
+        return _row_to_model(ResearchMemo, row, json_fields=self.JSON)
+
+    def list(
+        self,
+        *,
+        project_id: str | None = None,
+        document_id: str | None = None,
+        snapshot_id: str | None = None,
+        limit: int = 20,
+    ) -> list[ResearchMemo]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if document_id is not None:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if snapshot_id is not None:
+            clauses.append("snapshot_id = ?")
+            params.append(snapshot_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.db.fetchall(
+            f"SELECT * FROM research_memos {where} ORDER BY created_at DESC LIMIT ?", params
+        )
+        return [_row_to_model(ResearchMemo, row, json_fields=self.JSON) for row in rows]
+
+    def latest(
+        self, *, project_id: str, document_id: str | None, snapshot_id: str | None
+    ) -> ResearchMemo | None:
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if document_id is None:
+            clauses.append("document_id IS NULL")
+        else:
+            clauses.append("document_id = ?")
+            params.append(document_id)
+        if snapshot_id is None:
+            clauses.append("snapshot_id IS NULL")
+        else:
+            clauses.append("snapshot_id = ?")
+            params.append(snapshot_id)
+        row = self.db.fetchone(
+            f"SELECT * FROM research_memos WHERE {' AND '.join(clauses)} "
+            "ORDER BY version DESC LIMIT 1",
+            params,
+        )
+        return _row_to_model(ResearchMemo, row, json_fields=self.JSON) if row else None
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM research_memos")[0])
+
+
+# ------------------------------------------------------- extraction run log
+class ResearchExtractionStore:
+    JSON = {"warnings": ("warnings_json", []), "parameters": ("parameters_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, extraction: ResearchExtraction) -> ResearchExtraction:
+        _insert(self.db, "research_extractions", _model_to_row(extraction, json_fields=self.JSON))
+        return extraction
+
+    def find_by_key(self, document_id: str, extraction_key: str) -> ResearchExtraction | None:
+        row = self.db.fetchone(
+            "SELECT * FROM research_extractions WHERE document_id = ? AND extraction_key = ?",
+            (document_id, extraction_key),
+        )
+        return _row_to_model(ResearchExtraction, row, json_fields=self.JSON) if row else None
+
+    def list_by_document(self, document_id: str, limit: int = 20) -> list[ResearchExtraction]:
+        rows = self.db.fetchall(
+            "SELECT * FROM research_extractions WHERE document_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (document_id, limit),
+        )
+        return [_row_to_model(ResearchExtraction, row, json_fields=self.JSON) for row in rows]
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM research_extractions")[0])
+
+
+# --------------------------------------------------------------- task workflow
+class TaskStore:
+    JSON = {"details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, task: Task) -> Task:
+        _insert(
+            self.db,
+            "tasks",
+            _model_to_row(task, json_fields=self.JSON),
+        )
+        return task
+
+    def get(self, task_id: str) -> Task:
+        row = self.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        if row is None:
+            raise NotFoundError(f"Task not found: {task_id}")
+        return _row_to_model(Task, row, json_fields=self.JSON)
+
+    def list(
+        self, *, project_id: str | None = None, limit: int = 100, offset: int = 0
+    ) -> list[Task]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.fetchall(
+            f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )
+        return [_row_to_model(Task, row, json_fields=self.JSON) for row in rows]
+
+    def touch(self, task_id: str) -> None:
+        self.db.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?", (to_iso(utcnow()), task_id)
+        )
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM tasks")[0])
+
+
+class ContractStore:
+    JSON = {
+        "scope": ("scope_json", {}),
+        "constraints": ("constraints_json", {}),
+        "acceptance_criteria": ("acceptance_criteria_json", []),
+        "unknowns": ("unknowns_json", []),
+        "required_approvals": ("required_approvals_json", []),
+    }
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, contract: TaskContract) -> TaskContract:
+        _insert(
+            self.db,
+            "task_contracts",
+            _model_to_row(contract, json_fields=self.JSON),
+        )
+        return contract
+
+    def get(self, contract_id: str) -> TaskContract:
+        row = self.db.fetchone("SELECT * FROM task_contracts WHERE id = ?", (contract_id,))
+        if row is None:
+            raise NotFoundError(f"Task contract not found: {contract_id}")
+        return _row_to_model(TaskContract, row, json_fields=self.JSON)
+
+    def latest(self, task_id: str) -> TaskContract:
+        row = self.db.fetchone(
+            "SELECT * FROM task_contracts WHERE task_id = ? ORDER BY version DESC LIMIT 1",
+            (task_id,),
+        )
+        if row is None:
+            raise NotFoundError(f"Task has no contract: {task_id}")
+        return _row_to_model(TaskContract, row, json_fields=self.JSON)
+
+    def list_by_task(self, task_id: str) -> list[TaskContract]:
+        rows = self.db.fetchall(
+            "SELECT * FROM task_contracts WHERE task_id = ? ORDER BY version",
+            (task_id,),
+        )
+        return [_row_to_model(TaskContract, row, json_fields=self.JSON) for row in rows]
+
+    def next_version(self, task_id: str) -> int:
+        row = self.db.fetchone(
+            "SELECT COALESCE(MAX(version), 0) AS n FROM task_contracts WHERE task_id = ?",
+            (task_id,),
+        )
+        return int(row["n"]) + 1
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM task_contracts")[0])
+
+
+class PlanStore:
+    JSON = {
+        "steps": ("steps_json", []),
+        "files": ("files_json", []),
+        "checks": ("checks_json", []),
+        "risks": ("risks_json", []),
+        "unknowns": ("unknowns_json", []),
+    }
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, plan: TaskPlan) -> TaskPlan:
+        _insert(self.db, "task_plans", _model_to_row(plan, json_fields=self.JSON))
+        return plan
+
+    def get(self, plan_id: str) -> TaskPlan:
+        row = self.db.fetchone("SELECT * FROM task_plans WHERE id = ?", (plan_id,))
+        if row is None:
+            raise NotFoundError(f"Task plan not found: {plan_id}")
+        return _row_to_model(TaskPlan, row, json_fields=self.JSON)
+
+    def latest_for_run(self, run_id: str) -> TaskPlan:
+        row = self.db.fetchone(
+            "SELECT * FROM task_plans WHERE run_id = ? ORDER BY version DESC LIMIT 1",
+            (run_id,),
+        )
+        if row is None:
+            raise NotFoundError(f"Run has no plan: {run_id}")
+        return _row_to_model(TaskPlan, row, json_fields=self.JSON)
+
+    def list_by_run(self, run_id: str) -> list[TaskPlan]:
+        rows = self.db.fetchall(
+            "SELECT * FROM task_plans WHERE run_id = ? ORDER BY version", (run_id,)
+        )
+        return [_row_to_model(TaskPlan, row, json_fields=self.JSON) for row in rows]
+
+    def next_version(self, run_id: str) -> int:
+        row = self.db.fetchone(
+            "SELECT COALESCE(MAX(version), 0) AS n FROM task_plans WHERE run_id = ?",
+            (run_id,),
+        )
+        return int(row["n"]) + 1
+
+
+class RunStore:
+    JSON = {"limitations": ("limitations_json", []), "details": ("details_json", {})}
+    BOOL = ("pause_requested", "cancel_requested")
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, run: WorkflowRun) -> WorkflowRun:
+        _insert(
+            self.db,
+            "workflow_runs",
+            _model_to_row(run, json_fields=self.JSON, bool_fields=self.BOOL),
+        )
+        return run
+
+    def get(self, run_id: str) -> WorkflowRun:
+        row = self.db.fetchone("SELECT * FROM workflow_runs WHERE id = ?", (run_id,))
+        if row is None:
+            raise NotFoundError(f"Workflow run not found: {run_id}")
+        return _row_to_model(
+            WorkflowRun, row, json_fields=self.JSON, bool_fields=self.BOOL
+        )
+
+    def list(
+        self,
+        *,
+        task_id: str | None = None,
+        project_id: str | None = None,
+        state: WorkflowState | None = None,
+        limit: int = 50,
+    ) -> list[WorkflowRun]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("task_id", task_id),
+            ("project_id", project_id),
+            ("state", state.value if state else None),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.fetchall(
+            f"SELECT * FROM workflow_runs {where} ORDER BY created_at DESC LIMIT ?",
+            [*params, limit],
+        )
+        return [
+            _row_to_model(WorkflowRun, row, json_fields=self.JSON, bool_fields=self.BOOL)
+            for row in rows
+        ]
+
+    def latest_for_task(self, task_id: str) -> WorkflowRun | None:
+        row = self.db.fetchone(
+            "SELECT * FROM workflow_runs WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        )
+        if row is None:
+            return None
+        return _row_to_model(
+            WorkflowRun, row, json_fields=self.JSON, bool_fields=self.BOOL
+        )
+
+    def compare_and_set_state(
+        self,
+        run_id: str,
+        *,
+        expected: Sequence[WorkflowState],
+        new_state: WorkflowState,
+        started: bool = False,
+        finished: bool = False,
+        error: str | None = None,
+    ) -> bool:
+        if not expected:
+            return False
+        placeholders = ", ".join("?" for _ in expected)
+        assignments = [
+            "previous_state = state",
+            "state = ?",
+            "updated_at = ?",
+        ]
+        now = to_iso(utcnow())
+        params: list[Any] = [new_state.value, now]
+        if started:
+            assignments.append("started_at = COALESCE(started_at, ?)")
+            params.append(now)
+        if finished:
+            assignments.append("finished_at = ?")
+            params.append(now)
+        if error is not None:
+            assignments.append("error = ?")
+            params.append(error[:4000])
+        params.extend([run_id, *(state.value for state in expected)])
+        cursor = self.db.execute(
+            f"UPDATE workflow_runs SET {', '.join(assignments)} WHERE id = ? AND state IN ({placeholders})",
+            params,
+        )
+        return cursor.rowcount == 1
+
+    def update_progress(
+        self,
+        run_id: str,
+        *,
+        step_count: int | None = None,
+        tool_call_count: int | None = None,
+        plan_id: str | None = None,
+        workspace_id: str | None = None,
+        model_tokens: int | None = None,
+        model_cost_usd: float | None = None,
+        finish_summary: str | None = None,
+        limitations: list[str] | None = None,
+        error: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        assignments = ["updated_at = ?"]
+        params: list[Any] = [to_iso(utcnow())]
+        for column, value in (
+            ("step_count", step_count),
+            ("tool_call_count", tool_call_count),
+            ("plan_id", plan_id),
+            ("workspace_id", workspace_id),
+            ("model_tokens", model_tokens),
+            ("model_cost_usd", model_cost_usd),
+            ("finish_summary", finish_summary),
+            ("error", error),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if limitations is not None:
+            assignments.append("limitations_json = ?")
+            params.append(_dump_json(limitations))
+        if details is not None:
+            assignments.append("details_json = ?")
+            params.append(_dump_json(details))
+        params.append(run_id)
+        self.db.execute(
+            f"UPDATE workflow_runs SET {', '.join(assignments)} WHERE id = ?", params
+        )
+
+    def set_flags(
+        self,
+        run_id: str,
+        *,
+        pause_requested: bool | None = None,
+        cancel_requested: bool | None = None,
+        add_cost_usd: float | None = None,
+        add_tokens: int | None = None,
+    ) -> None:
+        assignments = ["updated_at = ?"]
+        params: list[Any] = [to_iso(utcnow())]
+        if pause_requested is not None:
+            assignments.append("pause_requested = ?")
+            params.append(1 if pause_requested else 0)
+        if cancel_requested is not None:
+            assignments.append("cancel_requested = ?")
+            params.append(1 if cancel_requested else 0)
+        if add_cost_usd is not None:
+            assignments.append("model_cost_usd = model_cost_usd + ?")
+            params.append(add_cost_usd)
+        if add_tokens is not None:
+            assignments.append("model_tokens = model_tokens + ?")
+            params.append(add_tokens)
+        params.append(run_id)
+        self.db.execute(
+            f"UPDATE workflow_runs SET {', '.join(assignments)} WHERE id = ?", params
+        )
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM workflow_runs")[0])
+
+
+class ApprovalStore:
+    JSON = {"resource_scope": ("resource_scope_json", {}), "details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, approval: ApprovalRequest) -> ApprovalRequest:
+        _insert(
+            self.db, "approval_requests", _model_to_row(approval, json_fields=self.JSON)
+        )
+        return approval
+
+    def get(self, approval_id: str) -> ApprovalRequest:
+        row = self.db.fetchone("SELECT * FROM approval_requests WHERE id = ?", (approval_id,))
+        if row is None:
+            raise NotFoundError(f"Approval not found: {approval_id}")
+        return _row_to_model(ApprovalRequest, row, json_fields=self.JSON)
+
+    def find_pending(self, run_id: str, action: str | None = None) -> list[ApprovalRequest]:
+        clauses = ["run_id = ?", "status = 'PENDING'"]
+        params: list[Any] = [run_id]
+        if action is not None:
+            clauses.append("action = ?")
+            params.append(action)
+        rows = self.db.fetchall(
+            f"SELECT * FROM approval_requests WHERE {' AND '.join(clauses)} "
+            "ORDER BY requested_at",
+            params,
+        )
+        return [_row_to_model(ApprovalRequest, row, json_fields=self.JSON) for row in rows]
+
+    def list(
+        self,
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        status: ApprovalStatus | None = None,
+        limit: int = 100,
+    ) -> list[ApprovalRequest]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("run_id", run_id),
+            ("task_id", task_id),
+            ("status", status.value if status else None),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.db.fetchall(
+            f"SELECT * FROM approval_requests {where} ORDER BY requested_at DESC LIMIT ?",
+            [*params, limit],
+        )
+        return [_row_to_model(ApprovalRequest, row, json_fields=self.JSON) for row in rows]
+
+    def decide(
+        self,
+        approval_id: str,
+        *,
+        approve: bool,
+        actor: str,
+        reason: str | None,
+    ) -> bool:
+        cursor = self.db.execute(
+            "UPDATE approval_requests SET status = ?, decided_at = ?, decided_by = ?, "
+            "reason = ? WHERE id = ? AND status = 'PENDING'",
+            (
+                ApprovalStatus.APPROVED.value if approve else ApprovalStatus.DENIED.value,
+                to_iso(utcnow()),
+                actor,
+                reason,
+                approval_id,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def consume(
+        self, approval_id: str, *, spec_sha256: str, nonce: str, now_iso: str
+    ) -> ApprovalRequest | None:
+        cursor = self.db.execute(
+            "UPDATE approval_requests SET status = 'CONSUMED', consumed_at = ? "
+            "WHERE id = ? AND status = 'APPROVED' AND spec_sha256 = ? AND nonce = ? "
+            "AND datetime(expires_at) > datetime(?)",
+            (now_iso, approval_id, spec_sha256, nonce, now_iso),
+        )
+        if cursor.rowcount != 1:
+            return None
+        return self.get(approval_id)
+
+    def expire(self, *, now_iso: str) -> int:
+        cursor = self.db.execute(
+            "UPDATE approval_requests SET status = 'EXPIRED' "
+            "WHERE status = 'PENDING' AND datetime(expires_at) <= datetime(?)",
+            (now_iso,),
+        )
+        return cursor.rowcount
+
+    def expire_one(self, approval_id: str, *, now_iso: str) -> bool:
+        cursor = self.db.execute(
+            "UPDATE approval_requests SET status = 'EXPIRED' "
+            "WHERE id = ? AND status = 'PENDING' AND datetime(expires_at) <= datetime(?)",
+            (approval_id, now_iso),
+        )
+        return cursor.rowcount == 1
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM approval_requests")[0])
+
+
+class WorkspaceStore:
+    JSON = {"details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, workspace: ExecutionWorkspace) -> ExecutionWorkspace:
+        _insert(
+            self.db,
+            "execution_workspaces",
+            _model_to_row(workspace, json_fields=self.JSON),
+        )
+        return workspace
+
+    def get(self, workspace_id: str) -> ExecutionWorkspace:
+        row = self.db.fetchone(
+            "SELECT * FROM execution_workspaces WHERE id = ?", (workspace_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Workspace not found: {workspace_id}")
+        return _row_to_model(ExecutionWorkspace, row, json_fields=self.JSON)
+
+    def get_by_run(self, run_id: str) -> ExecutionWorkspace | None:
+        row = self.db.fetchone(
+            "SELECT * FROM execution_workspaces WHERE run_id = ?", (run_id,)
+        )
+        return None if row is None else _row_to_model(
+            ExecutionWorkspace, row, json_fields=self.JSON
+        )
+
+    def update(
+        self,
+        workspace_id: str,
+        *,
+        status: Any | None = None,
+        patch_artifact_id: str | None = None,
+        diff_sha256: str | None = None,
+        file_count: int | None = None,
+        details: dict[str, Any] | None = None,
+        finalized: bool = False,
+        removed: bool = False,
+    ) -> None:
+        assignments = []
+        params: list[Any] = []
+        for column, value in (
+            ("status", status.value if status is not None else None),
+            ("patch_artifact_id", patch_artifact_id),
+            ("diff_sha256", diff_sha256),
+            ("file_count", file_count),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if details is not None:
+            assignments.append("details_json = ?")
+            params.append(_dump_json(details))
+        if finalized:
+            assignments.append("finalized_at = ?")
+            params.append(to_iso(utcnow()))
+        if removed:
+            assignments.append("removed_at = ?")
+            params.append(to_iso(utcnow()))
+        if not assignments:
+            return
+        params.append(workspace_id)
+        self.db.execute(
+            f"UPDATE execution_workspaces SET {', '.join(assignments)} WHERE id = ?",
+            params,
+        )
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM execution_workspaces")[0])
+
+
+class ToolCallStore:
+    JSON = {"arguments": ("arguments_json", {}), "details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, call: ToolCall) -> ToolCall:
+        _insert(self.db, "tool_invocations", _model_to_row(call, json_fields=self.JSON))
+        return call
+
+    def get(self, call_id: str) -> ToolCall:
+        row = self.db.fetchone("SELECT * FROM tool_invocations WHERE id = ?", (call_id,))
+        if row is None:
+            raise NotFoundError(f"Tool call not found: {call_id}")
+        return _row_to_model(ToolCall, row, json_fields=self.JSON)
+
+    def complete(
+        self,
+        call_id: str,
+        *,
+        status: Any,
+        exit_code: int | None = None,
+        duration_ms: int | None = None,
+        error: str | None = None,
+        output_artifact_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        assignments = ["status = ?", "completed_at = ?"]
+        params: list[Any] = [status.value, to_iso(utcnow())]
+        for column, value in (
+            ("exit_code", exit_code),
+            ("duration_ms", duration_ms),
+            ("error", error),
+            ("output_artifact_id", output_artifact_id),
+        ):
+            if value is not None:
+                assignments.append(f"{column} = ?")
+                params.append(value)
+        if details is not None:
+            assignments.append("details_json = ?")
+            params.append(_dump_json(details))
+        params.append(call_id)
+        self.db.execute(
+            f"UPDATE tool_invocations SET {', '.join(assignments)} WHERE id = ?", params
+        )
+
+    def note(self, call_id: str, *, details: dict[str, Any]) -> None:
+        self.db.execute(
+            "UPDATE tool_invocations SET details_json = ? WHERE id = ?",
+            (_dump_json(details), call_id),
+        )
+
+    def list_by_run(self, run_id: str, *, limit: int = 500) -> list[ToolCall]:
+        rows = self.db.fetchall(
+            "SELECT * FROM tool_invocations WHERE run_id = ? ORDER BY started_at LIMIT ?",
+            (run_id, limit),
+        )
+        return [_row_to_model(ToolCall, row, json_fields=self.JSON) for row in rows]
+
+    def count_by_run(self, run_id: str) -> int:
+        return int(
+            self.db.fetchone(
+                "SELECT COUNT(*) FROM tool_invocations WHERE run_id = ?", (run_id,)
+            )[0]
+        )
+
+
+class DiffStore:
+    JSON = {
+        "files": ("files_json", []),
+        "scope_violations": ("scope_violations_json", []),
+        "warnings": ("warnings_json", []),
+    }
+    BOOL = ("original_checkout_unchanged",)
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, diff: TaskDiff) -> TaskDiff:
+        _insert(
+            self.db,
+            "task_diffs",
+            _model_to_row(diff, json_fields=self.JSON, bool_fields=self.BOOL),
+        )
+        return diff
+
+    def get_by_run(self, run_id: str) -> TaskDiff | None:
+        row = self.db.fetchone("SELECT * FROM task_diffs WHERE run_id = ?", (run_id,))
+        return (
+            None
+            if row is None
+            else _row_to_model(
+                TaskDiff, row, json_fields=self.JSON, bool_fields=self.BOOL
+            )
+        )
+
+
+class ReviewStore:
+    JSON = {
+        "tests_modified": ("tests_modified_json", []),
+        "dependency_changes": ("dependency_changes_json", []),
+        "findings": ("findings_json", []),
+    }
+    BOOL = ("scope_ok", "secrets_found")
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, review: TaskReview) -> TaskReview:
+        _insert(
+            self.db,
+            "task_reviews",
+            _model_to_row(review, json_fields=self.JSON, bool_fields=self.BOOL),
+        )
+        return review
+
+    def get_by_run(self, run_id: str) -> TaskReview | None:
+        row = self.db.fetchone("SELECT * FROM task_reviews WHERE run_id = ?", (run_id,))
+        return (
+            None
+            if row is None
+            else _row_to_model(
+                TaskReview, row, json_fields=self.JSON, bool_fields=self.BOOL
+            )
+        )
+
+
+class WorkerJobStore:
+    JSON = {"details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def enqueue(self, job: WorkerJob) -> WorkerJob:
+        existing = self.db.fetchone(
+            "SELECT * FROM worker_jobs WHERE run_id = ? AND status IN ('QUEUED','LEASED')",
+            (job.run_id,),
+        )
+        if existing is not None:
+            return _row_to_model(WorkerJob, existing, json_fields=self.JSON)
+        _insert(self.db, "worker_jobs", _model_to_row(job, json_fields=self.JSON))
+        return job
+
+    def get(self, job_id: str) -> WorkerJob:
+        row = self.db.fetchone("SELECT * FROM worker_jobs WHERE id = ?", (job_id,))
+        if row is None:
+            raise NotFoundError(f"Worker job not found: {job_id}")
+        return _row_to_model(WorkerJob, row, json_fields=self.JSON)
+
+    def get_by_run(self, run_id: str) -> WorkerJob | None:
+        row = self.db.fetchone(
+            "SELECT * FROM worker_jobs WHERE run_id = ? ORDER BY enqueued_at DESC LIMIT 1",
+            (run_id,),
+        )
+        return None if row is None else _row_to_model(WorkerJob, row, json_fields=self.JSON)
+
+    def claim(
+        self, *, owner: str, lease_seconds: int = 120, run_id: str | None = None
+    ) -> WorkerJob | None:
+        now = utcnow()
+        now_iso = to_iso(now)
+        expires = to_iso(now + timedelta(seconds=lease_seconds))
+        run_clause = " AND run_id = ?" if run_id is not None else ""
+        with self.db.transaction():
+            row = self.db.fetchone(
+                "SELECT * FROM worker_jobs WHERE (status = 'QUEUED' OR "
+                "(status = 'LEASED' AND lease_expires_at < ?))"
+                + run_clause
+                + " ORDER BY enqueued_at LIMIT 1",
+                (now_iso, *([run_id] if run_id is not None else [])),
+            )
+            if row is None:
+                return None
+            job = _row_to_model(WorkerJob, row, json_fields=self.JSON)
+            cursor = self.db.execute(
+                "UPDATE worker_jobs SET status = 'LEASED', lease_owner = ?, "
+                "lease_expires_at = ?, attempts = attempts + 1, "
+                "started_at = COALESCE(started_at, ?) WHERE id = ? AND "
+                "(status = 'QUEUED' OR (status = 'LEASED' AND lease_expires_at < ?))",
+                (owner, expires, now_iso, job.id, now_iso),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = self.get(job.id)
+        return claimed
+
+    def heartbeat(self, job_id: str, *, owner: str, lease_seconds: int = 120) -> bool:
+        now = utcnow()
+        cursor = self.db.execute(
+            "UPDATE worker_jobs SET lease_expires_at = ? WHERE id = ? AND "
+            "status = 'LEASED' AND lease_owner = ?",
+            (
+                to_iso(now + timedelta(seconds=lease_seconds)),
+                job_id,
+                owner,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    def finish(
+        self,
+        job_id: str,
+        *,
+        status: WorkerJobStatus,
+        error: str | None = None,
+    ) -> None:
+        self.db.execute(
+            "UPDATE worker_jobs SET status = ?, finished_at = ?, error = ?, "
+            "lease_owner = NULL, lease_expires_at = NULL WHERE id = ?",
+            (status.value, to_iso(utcnow()), error, job_id),
+        )
+
+    def list(self, *, status: WorkerJobStatus | None = None, limit: int = 100) -> list[WorkerJob]:
+        if status is None:
+            rows = self.db.fetchall(
+                "SELECT * FROM worker_jobs ORDER BY enqueued_at DESC LIMIT ?", (limit,)
+            )
+        else:
+            rows = self.db.fetchall(
+                "SELECT * FROM worker_jobs WHERE status = ? ORDER BY enqueued_at LIMIT ?",
+                (status.value, limit),
+            )
+        return [_row_to_model(WorkerJob, row, json_fields=self.JSON) for row in rows]
+
+
 __all__ = [
     "ProjectStore",
     "RepositoryStore",
@@ -944,5 +2302,21 @@ __all__ = [
     "EventStore",
     "InvocationStore",
     "QaStore",
+    "ResearchDocumentStore",
+    "SourcePassageStore",
+    "ResearchClaimStore",
+    "ClaimMappingStore",
+    "ResearchMemoStore",
+    "ResearchExtractionStore",
+    "TaskStore",
+    "ContractStore",
+    "PlanStore",
+    "RunStore",
+    "ApprovalStore",
+    "WorkspaceStore",
+    "ToolCallStore",
+    "DiffStore",
+    "ReviewStore",
+    "WorkerJobStore",
     "like_pattern",
 ]

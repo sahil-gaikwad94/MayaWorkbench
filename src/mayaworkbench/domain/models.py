@@ -24,17 +24,38 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from mayaworkbench.clock import utcnow
 from mayaworkbench.domain.enums import (
     ActorKind,
+    ApprovalAction,
+    ApprovalStatus,
     ArtifactKind,
+    ClaimAuthor,
+    ClaimConfidence,
+    ClaimMappingStatus,
+    ClaimReviewStatus,
+    ClaimType,
+    DocumentMediaKind,
+    DocumentOrigin,
     EdgeConfidence,
     EdgeType,
     EventType,
+    EvidenceStrength,
+    ExtractionStatus,
     FileStatus,
     IssueKind,
     IssueSeverity,
+    MappingAuthor,
+    MappingEvidenceRelation,
     ParseCoverage,
+    PassageKind,
     QaStatus,
     RetentionClass,
+    RiskCategory,
+    RiskSeverity,
     SnapshotKind,
+    TaskType,
+    ToolCallStatus,
+    WorkflowState,
+    WorkerJobStatus,
+    WorkspaceStatus,
     SnapshotStatus,
     SymbolKind,
 )
@@ -210,6 +231,8 @@ class WorkflowEvent(Record):
     project_id: str
     repository_id: str | None = None
     snapshot_id: str | None = None
+    task_id: str | None = None
+    run_id: str | None = None
     entity_type: str
     entity_id: str
     actor_kind: ActorKind = ActorKind.SYSTEM
@@ -285,6 +308,567 @@ class QaRecord(Record):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+# ------------------------------------------------------------------- research
+class SourceLocation(Record):
+    """A verified pointer into one source passage.
+
+    ``quote_hash`` is the SHA-256 of the whitespace-normalised quote, and the
+    quote must appear verbatim inside the referenced passage. Verification
+    re-reads the stored document text rather than trusting this record.
+    """
+
+    passage_id: str
+    quote_hash: str
+    page: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+    section: str = ""
+    equation: str | None = None
+    quote: str = ""
+
+    @property
+    def label(self) -> str:
+        where = f"p.{self.page}" if self.page else "no page"
+        if self.section:
+            return f"{where} · {self.section}"
+        return where
+
+
+class ResearchDocument(Record):
+    """One immutable content version of a research document.
+
+    Versions of the same paper share a ``document_key`` and increment
+    ``version``; ``supersedes_document_id`` links the chain. Extraction metadata
+    is recorded so a memo can state which tool produced its quotes.
+    """
+
+    id: str
+    project_id: str
+    document_key: str
+    version: int = Field(default=1, ge=1)
+    supersedes_document_id: str | None = None
+    title: str = Field(min_length=1, max_length=400)
+    authors: list[str] = Field(default_factory=list)
+    organization: str | None = None
+    published_at: str | None = None
+    media_kind: DocumentMediaKind
+    origin: DocumentOrigin
+    origin_uri: str | None = None
+    source_url: str | None = None
+    doi: str | None = None
+    license: str | None = None
+    content_sha256: str
+    size_bytes: int = Field(ge=0)
+    document_artifact_id: str | None = None
+    text_artifact_id: str | None = None
+    extraction_artifact_id: str | None = None
+    extraction_status: ExtractionStatus = ExtractionStatus.REGISTERED
+    extraction_tool: str = ""
+    extraction_version: str = ""
+    extraction_warnings: list[str] = Field(default_factory=list)
+    missing_pages: list[int] = Field(default_factory=list)
+    page_count: int | None = Field(default=None, ge=1)
+    section_count: int = 0
+    passage_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+    extracted_at: datetime | None = None
+
+    @property
+    def identity_label(self) -> str:
+        return f"v{self.version} · {self.content_sha256[:12]}"
+
+
+class SourcePassage(Record):
+    """A citable chunk of extracted document text.
+
+    ``char_start``/``char_end`` index the stored extracted-text artifact, so a
+    quote can be re-verified against the exact bytes the extractor produced.
+    """
+
+    id: str
+    document_id: str
+    ordinal: int = Field(ge=0)
+    kind: PassageKind
+    page: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+    section_path: str = ""
+    section_title: str | None = None
+    heading_level: int | None = Field(default=None, ge=1, le=6)
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    char_start: int = Field(ge=0)
+    char_end: int = Field(ge=0)
+    text: str = Field(min_length=1)
+    text_sha256: str
+    quote_hash: str
+    equation_label: str | None = None
+    chunk_index: int = Field(default=0, ge=0)
+
+    @field_validator("char_end")
+    @classmethod
+    def _char_order(cls, value: int, info: Any) -> int:
+        start = info.data.get("char_start")
+        if start is not None and value < start:
+            raise ValueError("char_end must be >= char_start")
+        return value
+
+    @property
+    def label(self) -> str:
+        parts = []
+        if self.page:
+            parts.append(f"p.{self.page}")
+        if self.section_path:
+            parts.append(self.section_path.split(" > ")[-1])
+        parts.append(f"#{self.ordinal}")
+        return " · ".join(parts)
+
+
+class ResearchClaim(Record):
+    """One claim node in the research DAG (§9.3).
+
+    Categories are never merged. ``EXPLICIT_SOURCE_CLAIM`` must carry at least
+    one verified source location; inferred and decision claims must carry a
+    derivation note and use ``basis_passage_ids`` instead of quoting the paper as
+    if it stated them.
+    """
+
+    id: str
+    project_id: str
+    document_id: str | None = None
+    parent_claim_id: str | None = None
+    ordinal: int = 0
+    claim_type: ClaimType
+    title: str = Field(min_length=1, max_length=300)
+    statement: str = Field(min_length=1, max_length=8000)
+    implementation_requirement: str = ""
+    source_locations: list[SourceLocation] = Field(default_factory=list)
+    basis_passage_ids: list[str] = Field(default_factory=list)
+    expected_code_signals: list[str] = Field(default_factory=list)
+    forbidden_code_signals: list[str] = Field(default_factory=list)
+    target_paths: list[str] = Field(default_factory=list)
+    target_symbols: list[str] = Field(default_factory=list)
+    missing_details: list[str] = Field(default_factory=list)
+    validation_methods: list[str] = Field(default_factory=list)
+    derivation_note: str = ""
+    created_by: ClaimAuthor = ClaimAuthor.USER
+    created_by_detail: str = ""
+    confidence: ClaimConfidence = ClaimConfidence.MEDIUM
+    review_status: ClaimReviewStatus = ClaimReviewStatus.NEEDS_REVIEW
+    review_note: str | None = None
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+    def is_reviewed(self) -> bool:
+        return self.review_status != ClaimReviewStatus.NEEDS_REVIEW
+
+
+class ClaimDependency(Record):
+    """A directed ``claim_id requires depends_on_claim_id`` edge.
+
+    Dependencies order implementation work. They are validated as a DAG; a cycle
+    is reported as a modelling issue and never silently broken.
+    """
+
+    id: str
+    claim_id: str
+    depends_on_claim_id: str
+    note: str = ""
+
+
+class ResearchExtraction(Record):
+    """One claim-extraction run over one immutable document version."""
+
+    id: str
+    document_id: str
+    method: str
+    algorithm_version: str
+    extraction_key: str
+    model_invocation_id: str | None = None
+    claims_created: int = 0
+    claims_preserved: int = 0
+    claims_dropped: int = 0
+    artifact_id: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ClaimRevision(Record):
+    """Append-only record of a manual correction to a claim."""
+
+    id: str
+    claim_id: str
+    revision: int = Field(ge=1)
+    changed_at: datetime = Field(default_factory=utcnow)
+    changed_by: str = "local-user"
+    reason: str = ""
+    before: dict[str, Any] = Field(default_factory=dict)
+    after: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClaimRiskFactor(Record):
+    """An explicit, categorised reproduction risk recorded against a claim."""
+
+    id: str
+    claim_id: str
+    category: RiskCategory
+    detail: str = Field(min_length=1, max_length=2000)
+    severity: RiskSeverity = RiskSeverity.WARNING
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class MappingEvidence(Record):
+    """One exact code span offered as evidence for a claim mapping.
+
+    ``excerpt`` is the verbatim text of ``path:start_line-end_line``; re-reading
+    the pinned index must reproduce ``excerpt_sha256`` exactly.
+    """
+
+    id: str
+    mapping_id: str
+    snapshot_id: str
+    file_id: str | None = None
+    symbol_id: str | None = None
+    qualified_name: str | None = None
+    path: str
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    relation: MappingEvidenceRelation = MappingEvidenceRelation.IMPLEMENTS
+    strength: EvidenceStrength = EvidenceStrength.WEAK
+    excerpt: str
+    excerpt_sha256: str
+    explanation: str = ""
+    source: str = "AST"
+    matched_signals: list[str] = Field(default_factory=list)
+
+    @field_validator("end_line")
+    @classmethod
+    def _range_order(cls, value: int, info: Any) -> int:
+        start = info.data.get("start_line")
+        if start is not None and value < start:
+            raise ValueError("end_line must be >= start_line")
+        return value
+
+    @property
+    def location(self) -> str:
+        return f"{self.path}:{self.start_line}-{self.end_line}"
+
+
+class ClaimMapping(Record):
+    """The current claim-to-code verdict for one claim and one snapshot."""
+
+    id: str
+    project_id: str
+    claim_id: str
+    snapshot_id: str
+    status: ClaimMappingStatus
+    status_reason: str = ""
+    rationale: str = ""
+    gaps: list[str] = Field(default_factory=list)
+    counter_evidence: list[str] = Field(default_factory=list)
+    validation_method: str = ""
+    rule_pack_version: str
+    created_by: MappingAuthor = MappingAuthor.DETERMINISTIC
+    model_invocation_id: str | None = None
+    review_status: ClaimReviewStatus = ClaimReviewStatus.NEEDS_REVIEW
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class ResearchMemo(Record):
+    """A versioned research memo. Earlier versions are never rewritten."""
+
+    id: str
+    project_id: str
+    document_id: str | None = None
+    snapshot_id: str | None = None
+    version: int = Field(default=1, ge=1)
+    supersedes_memo_id: str | None = None
+    title: str
+    body_markdown: str
+    artifact_id: str | None = None
+    source_interpretation_sha256: str
+    readiness: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------- task workflow
+class Task(Record):
+    """A user's requested objective and its current state pointer."""
+
+    id: str
+    project_id: str
+    title: str = Field(min_length=1, max_length=300)
+    task_type: TaskType
+    goal: str = Field(min_length=1, max_length=20_000)
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class TaskScope(Record):
+    """The repository slice a run may change.
+
+    Paths are repository-relative POSIX paths. Absolute paths, ``..`` and null
+    bytes are rejected here, and again by the workspace policy layer, which also
+    resolves symlinks before any read or write.
+    """
+
+    allowed_paths: list[str] = Field(min_length=1)
+    excluded_paths: list[str] = Field(default_factory=list)
+    base_commit_sha: str = Field(min_length=40, max_length=40, pattern=r"^[0-9a-f]{40}$")
+    include_working_tree_patch: bool = False
+
+    @field_validator("allowed_paths", "excluded_paths")
+    @classmethod
+    def _path_shape(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            if not value or "\x00" in value:
+                raise ValueError("scope paths must be non-empty and contain no null bytes")
+            if value.startswith("/") or value.startswith("\\"):
+                raise ValueError(f"scope paths must be repository-relative: {value!r}")
+            parts = value.replace("\\", "/").split("/")
+            if any(part in {"", "."} for part in parts):
+                raise ValueError(f"scope path is not normalised: {value!r}")
+            if any(part == ".." for part in parts):
+                raise ValueError(f"scope paths must not escape the repository: {value!r}")
+            cleaned.append("/".join(parts))
+        return cleaned
+
+
+class TaskConstraints(Record):
+    """Budgets and permissions a run may not exceed."""
+
+    network_access: str = "DENY_BY_DEFAULT"
+    dependency_install: str = "APPROVAL_REQUIRED"
+    compute_profile: str = "CPU_SMOKE"
+    max_runtime_seconds: int = Field(default=1800, ge=30, le=86_400)
+    max_model_tokens: int = Field(default=50_000, ge=1_000, le=2_000_000)
+    max_model_cost_usd: float = Field(default=0.0, ge=0.0)
+    max_repair_attempts: int = Field(default=2, ge=0, le=10)
+    max_steps: int = Field(default=30, ge=1, le=200)
+    max_tool_calls: int = Field(default=120, ge=1, le=1000)
+    max_output_bytes: int = Field(default=200_000, ge=1024, le=10_000_000)
+    allow_file_deletion: bool = False
+
+
+class TaskContract(Record):
+    """Immutable, hash-addressed authorization for one task objective."""
+
+    id: str
+    task_id: str
+    project_id: str
+    version: int = Field(ge=1)
+    task_type: TaskType
+    goal: str
+    repository_id: str
+    snapshot_id: str
+    scope: TaskScope
+    constraints: TaskConstraints = Field(default_factory=TaskConstraints)
+    acceptance_criteria: list[str] = Field(min_length=1)
+    unknowns: list[str] = Field(default_factory=list)
+    required_approvals: list[ApprovalAction] = Field(
+        default_factory=lambda: [ApprovalAction.WRITE_ACCESS, ApprovalAction.COMMAND_EXECUTION]
+    )
+    contract_version: str = "1.0"
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_by: str = "local-user"
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class PlanStep(Record):
+    description: str = Field(min_length=1, max_length=4000)
+    files: list[str] = Field(default_factory=list)
+    checks: list[str] = Field(default_factory=list)
+
+
+class TaskPlan(Record):
+    """A reviewable implementation plan. It authorizes nothing by itself."""
+
+    id: str
+    task_id: str
+    run_id: str
+    project_id: str
+    version: int = Field(ge=1)
+    summary: str = Field(min_length=1, max_length=8000)
+    steps: list[PlanStep] = Field(min_length=1)
+    files: list[str] = Field(default_factory=list)
+    checks: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+    estimated_steps: int = Field(default=1, ge=1, le=200)
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_invocation_id: str | None = None
+    artifact_id: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class WorkflowRun(Record):
+    """One execution attempt for a task. Terminal runs are never reopened."""
+
+    id: str
+    task_id: str
+    contract_id: str
+    project_id: str
+    repository_id: str
+    snapshot_id: str
+    state: WorkflowState = WorkflowState.CREATED
+    previous_state: WorkflowState | None = None
+    base_commit_sha: str
+    plan_id: str | None = None
+    workspace_id: str | None = None
+    step_count: int = 0
+    tool_call_count: int = 0
+    model_tokens: int = 0
+    model_cost_usd: float = 0.0
+    pause_requested: bool = False
+    cancel_requested: bool = False
+    finish_summary: str | None = None
+    limitations: list[str] = Field(default_factory=list)
+    error: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class ApprovalRequest(Record):
+    """A durable, scoped, single-use human authorization."""
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    action: ApprovalAction
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    resource_scope: dict[str, Any] = Field(default_factory=dict)
+    spec_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    nonce: str = Field(min_length=16, max_length=128)
+    requested_at: datetime = Field(default_factory=utcnow)
+    expires_at: datetime
+    decided_at: datetime | None = None
+    decided_by: str | None = None
+    consumed_at: datetime | None = None
+    reason: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionWorkspace(Record):
+    """A task-owned isolated Git worktree."""
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    path: str
+    base_commit_sha: str
+    status: WorkspaceStatus = WorkspaceStatus.CREATING
+    patch_artifact_id: str | None = None
+    diff_sha256: str | None = None
+    file_count: int = 0
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+    finalized_at: datetime | None = None
+    removed_at: datetime | None = None
+
+
+class ToolCall(Record):
+    """Audit record for one gateway invocation."""
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: ToolCallStatus = ToolCallStatus.STARTED
+    approval_id: str | None = None
+    output_artifact_id: str | None = None
+    exit_code: int | None = None
+    duration_ms: int | None = None
+    error: str | None = None
+    started_at: datetime = Field(default_factory=utcnow)
+    completed_at: datetime | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class DiffFile(Record):
+    path: str
+    status: str = "modified"
+    additions: int = 0
+    deletions: int = 0
+    binary: bool = False
+
+
+class TaskDiff(Record):
+    """The complete candidate patch, including untracked files."""
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    workspace_id: str
+    base_commit_sha: str
+    patch_artifact_id: str
+    patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    files: list[DiffFile] = Field(default_factory=list)
+    additions: int = 0
+    deletions: int = 0
+    scope_violations: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    original_checkout_unchanged: bool = True
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ReviewFinding(Record):
+    severity: str = "INFO"
+    code: str
+    message: str
+    path: str | None = None
+    line: int | None = None
+
+
+class TaskReview(Record):
+    """Deterministic diff review for Phase 3. Not a verification decision."""
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    diff_id: str
+    scope_ok: bool
+    secrets_found: bool
+    tests_modified: list[str] = Field(default_factory=list)
+    dependency_changes: list[str] = Field(default_factory=list)
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    report_artifact_id: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class WorkerJob(Record):
+    """Durable queue entry for the separate local worker process."""
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    status: WorkerJobStatus = WorkerJobStatus.QUEUED
+    attempts: int = 0
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    enqueued_at: datetime = Field(default_factory=utcnow)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 __all__ = [
     "Record",
     "Project",
@@ -299,7 +883,35 @@ __all__ = [
     "ModelInvocation",
     "Citation",
     "QaRecord",
+    "SourceLocation",
+    "ResearchDocument",
+    "SourcePassage",
+    "ResearchClaim",
+    "ClaimDependency",
+    "ResearchExtraction",
+    "ClaimRevision",
+    "ClaimRiskFactor",
+    "MappingEvidence",
+    "ClaimMapping",
+    "ResearchMemo",
+    "Task",
+    "TaskScope",
+    "TaskConstraints",
+    "TaskContract",
+    "PlanStep",
+    "TaskPlan",
+    "WorkflowRun",
+    "ApprovalRequest",
+    "ExecutionWorkspace",
+    "ToolCall",
+    "DiffFile",
+    "TaskDiff",
+    "ReviewFinding",
+    "TaskReview",
+    "WorkerJob",
     "ArtifactKind",
     "EventType",
     "QaStatus",
+    "ClaimMappingStatus",
+    "ClaimType",
 ]

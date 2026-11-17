@@ -18,23 +18,49 @@ from mayaworkbench.errors import ConflictError, UsageError
 from mayaworkbench.ids import new_ulid
 from mayaworkbench.indexing.indexer import Indexer
 from mayaworkbench.indexing.map import RepositoryMapService
+from mayaworkbench.mapping.service import ClaimMappingService
+from mayaworkbench.tasks.approvals import ApprovalService
+from mayaworkbench.tasks.plans import PlanService
+from mayaworkbench.tasks.review import ReviewService
+from mayaworkbench.tasks.service import TaskService
+from mayaworkbench.tasks.workflow import WorkflowService
+from mayaworkbench.workspace.worktree import WorktreeManager
 from mayaworkbench.models.gateway import ModelGateway, ProviderFactory
 from mayaworkbench.qa.service import AskService
 from mayaworkbench.repositories.snapshots import RepositoryService
+from mayaworkbench.research.claims import ClaimService
+from mayaworkbench.research.ingestion import DocumentIngestionService
+from mayaworkbench.research.memo import MemoService
 from mayaworkbench.retrieval.context import ContextPacker
 from mayaworkbench.retrieval.search import SearchService
 from mayaworkbench.retrieval.service import RetrievalService
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.db import Database
 from mayaworkbench.storage.stores import (
+    ApprovalStore,
+    ClaimMappingStore,
+    ContractStore,
+    DiffStore,
     EventStore,
+    PlanStore,
+    ReviewStore,
+    RunStore,
+    TaskStore,
+    ToolCallStore,
+    WorkerJobStore,
+    WorkspaceStore,
     FileStore,
     InvocationStore,
     IssueStore,
     ProjectStore,
     QaStore,
     RepositoryStore,
+    ResearchClaimStore,
+    ResearchDocumentStore,
+    ResearchExtractionStore,
+    ResearchMemoStore,
     SnapshotStore,
+    SourcePassageStore,
     SymbolStore,
 )
 
@@ -68,6 +94,32 @@ class Services:
     gateway: ModelGateway
     ask: AskService
     maps: RepositoryMapService
+    documents: ResearchDocumentStore
+    passages: SourcePassageStore
+    claims: ResearchClaimStore
+    mappings: ClaimMappingStore
+    memos: ResearchMemoStore
+    extractions: ResearchExtractionStore
+    ingestion: DocumentIngestionService
+    claim_service: ClaimService
+    mapping_service: ClaimMappingService
+    memo_service: MemoService
+    task_store: TaskStore
+    contracts: ContractStore
+    task_plans: PlanStore
+    workflow_runs: RunStore
+    task_approvals: ApprovalStore
+    execution_workspaces: WorkspaceStore
+    tool_calls: ToolCallStore
+    task_diffs: DiffStore
+    task_reviews: ReviewStore
+    jobs: WorkerJobStore
+    plan_service: PlanService
+    approval_service: ApprovalService
+    workflow: WorkflowService
+    review_service: ReviewService
+    worktrees: WorktreeManager
+    task_service: TaskService
 
     @classmethod
     def open(
@@ -136,6 +188,129 @@ class Services:
             symbols=symbols,
             issues=issues,
         )
+        documents = ResearchDocumentStore(db)
+        passages = SourcePassageStore(db)
+        claims = ResearchClaimStore(db)
+        mappings = ClaimMappingStore(db)
+        memos = ResearchMemoStore(db)
+        extractions = ResearchExtractionStore(db)
+        ingestion = DocumentIngestionService(
+            db,
+            projects=projects,
+            documents=documents,
+            passages=passages,
+            claims=claims,
+            artifacts=artifacts,
+            events=events,
+            settings=settings,
+        )
+        claim_service = ClaimService(
+            db,
+            projects=projects,
+            documents=documents,
+            passages=passages,
+            claims=claims,
+            extractions=extractions,
+            artifacts=artifacts,
+            events=events,
+            gateway=gateway,
+            settings=settings,
+        )
+        mapping_service = ClaimMappingService(
+            db,
+            projects=projects,
+            repositories=repositories,
+            snapshots=snapshots,
+            files=files,
+            symbols=symbols,
+            claims=claims,
+            mappings=mappings,
+            search=search,
+            gateway=gateway,
+            artifacts=artifacts,
+            events=events,
+            settings=settings,
+        )
+        memo_service = MemoService(
+            db,
+            projects=projects,
+            documents=documents,
+            passages=passages,
+            claims=claims,
+            memos=memos,
+            snapshots=snapshots,
+            files=files,
+            issues=issues,
+            mappings=mappings,
+            mapping_service=mapping_service,
+            artifacts=artifacts,
+            events=events,
+            settings=settings,
+        )
+
+        task_store = TaskStore(db)
+        contracts = ContractStore(db)
+        task_plans = PlanStore(db)
+        workflow_runs = RunStore(db)
+        task_approvals = ApprovalStore(db)
+        execution_workspaces = WorkspaceStore(db)
+        tool_calls = ToolCallStore(db)
+        task_diffs = DiffStore(db)
+        task_reviews = ReviewStore(db)
+        jobs = WorkerJobStore(db)
+        plan_service = PlanService(
+            settings=settings,
+            gateway=gateway,
+            plans=task_plans,
+            runs=workflow_runs,
+            files=files,
+            artifacts=artifacts,
+            events=events,
+        )
+        workflow = WorkflowService(workflow_runs, events)
+        approval_service = ApprovalService(
+            task_approvals, workflow_runs, task_plans, events
+        )
+        review_service = ReviewService(
+            diffs=task_diffs, reviews=task_reviews, artifacts=artifacts, events=events
+        )
+        worktrees = WorktreeManager(
+            home=paths.home,
+            db=db,
+            repositories=repositories,
+            snapshots=snapshots,
+            files=files,
+            artifacts=artifacts,
+            workspaces=execution_workspaces,
+            events=events,
+        )
+        task_service = TaskService(
+            paths=paths,
+            settings=settings,
+            db=db,
+            projects=projects,
+            repositories=repositories,
+            snapshots=snapshots,
+            repository_service=repository_service,
+            tasks=task_store,
+            contracts=contracts,
+            plans=task_plans,
+            runs=workflow_runs,
+            approvals=task_approvals,
+            workspaces=execution_workspaces,
+            calls=tool_calls,
+            diffs=task_diffs,
+            reviews=task_reviews,
+            jobs=jobs,
+            artifacts=artifacts,
+            events=events,
+            gateway=gateway,
+            plan_service=plan_service,
+            approval_service=approval_service,
+            workflow=workflow,
+            review_service=review_service,
+            worktrees=worktrees,
+        )
         return cls(
             paths=paths,
             settings=settings,
@@ -158,7 +333,67 @@ class Services:
             gateway=gateway,
             ask=ask,
             maps=maps,
+            documents=documents,
+            passages=passages,
+            claims=claims,
+            mappings=mappings,
+            memos=memos,
+            extractions=extractions,
+            ingestion=ingestion,
+            claim_service=claim_service,
+            mapping_service=mapping_service,
+            memo_service=memo_service,
+            task_store=task_store,
+            contracts=contracts,
+            task_plans=task_plans,
+            workflow_runs=workflow_runs,
+            task_approvals=task_approvals,
+            execution_workspaces=execution_workspaces,
+            tool_calls=tool_calls,
+            task_diffs=task_diffs,
+            task_reviews=task_reviews,
+            jobs=jobs,
+            plan_service=plan_service,
+            approval_service=approval_service,
+            workflow=workflow,
+            review_service=review_service,
+            worktrees=worktrees,
+            task_service=task_service,
         )
+
+    # Short aliases used by the worker/agent layer; the dataclass fields keep
+    # explicit names so the storage boundary stays obvious.
+    @property
+    def tasks(self) -> TaskStore:
+        return self.task_store
+
+    @property
+    def plans(self) -> PlanStore:
+        return self.task_plans
+
+    @property
+    def runs(self) -> RunStore:
+        return self.workflow_runs
+
+    @property
+    def approvals(self) -> ApprovalStore:
+        return self.task_approvals
+
+    @property
+    def workspaces(self) -> WorkspaceStore:
+        return self.execution_workspaces
+
+    @property
+    def calls(self) -> ToolCallStore:
+        return self.tool_calls
+
+    @property
+    def diffs(self) -> DiffStore:
+        return self.task_diffs
+
+    @property
+    def reviews(self) -> ReviewStore:
+        return self.task_reviews
 
     def close(self) -> None:
         self.db.close()

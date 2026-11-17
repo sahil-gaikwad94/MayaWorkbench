@@ -162,6 +162,31 @@ class IndexingSettings(BaseModel):
     store_file_content: bool = True
 
 
+class ResearchSettings(BaseModel):
+    """Limits for document ingestion, claim extraction and code mapping.
+
+    Every bound is explicit because each one is a place where the workbench
+    could otherwise silently truncate evidence. Overruns raise or are recorded
+    as extraction warnings instead of being dropped without a trace.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_document_bytes: int = Field(default=25_000_000, ge=1024)
+    max_passage_chars: int = Field(default=4000, ge=200, le=200_000)
+    min_passage_chars: int = Field(default=24, ge=1, le=10_000)
+    max_passages_per_document: int = Field(default=50_000, ge=10)
+    max_claims_per_extraction: int = Field(default=200, ge=1, le=20_000)
+    extraction_token_budget: int = Field(default=12_000, ge=500, le=200_000)
+    max_evidence_spans: int = Field(default=8, ge=1, le=50)
+    max_evidence_span_lines: int = Field(default=80, ge=5, le=2000)
+    max_candidate_seeds: int = Field(default=6, ge=1, le=50)
+    fetch_timeout_seconds: int = Field(default=30, ge=5, le=120)
+    max_fetch_bytes: int = Field(default=25_000_000, ge=1024)
+    fetch_max_redirects: int = Field(default=4, ge=0, le=10)
+    allow_private_network_fetch: bool = False
+
+
 class Settings(BaseModel):
     """Root settings document persisted at ``$MAYA_HOME/config.json``."""
 
@@ -172,6 +197,7 @@ class Settings(BaseModel):
     model: ModelSettings = Field(default_factory=ModelSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     indexing: IndexingSettings = Field(default_factory=IndexingSettings)
+    research: ResearchSettings = Field(default_factory=ResearchSettings)
 
     def allows_remote_model(self) -> bool:
         return self.data_policy == "BYOK_REMOTE_MODEL"
@@ -360,6 +386,7 @@ def redacted_settings_view(paths: AppPaths, settings: Settings) -> dict:
         },
         "retrieval": settings.retrieval.model_dump(),
         "indexing": settings.indexing.model_dump(),
+        "research": settings.research.model_dump(),
     }
 
 
@@ -369,6 +396,7 @@ __all__ = [
     "ModelSettings",
     "RetrievalSettings",
     "IndexingSettings",
+    "ResearchSettings",
     "DataPolicy",
     "SETTINGS_SCHEMA_VERSION",
     "load_settings",

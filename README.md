@@ -6,10 +6,11 @@ could and could not understand, and answers questions using only retrieved
 evidence from that snapshot — with every claim traceable to a file, line range
 and verified quote.
 
-Phase 0 (product/architecture contracts) and Phase 1 (repository intelligence)
-are implemented and covered by tests. Later phases (task contracts, isolated
-worktrees, patch verification, evaluation harness for agent runs) are designed
-but deliberately not stubbed — see
+Phase 0 (product/architecture contracts), Phase 1 (repository intelligence) and
+Phase 2 (research intelligence and claim-to-code mapping) are implemented and
+covered by tests. Later phases (task contracts, isolated worktrees, patch
+verification, evaluation harness for agent runs) are designed but deliberately
+not stubbed — see
 [docs/implementation-gap-analysis.md](docs/implementation-gap-analysis.md).
 
 ## The problem
@@ -74,6 +75,26 @@ export MAYA_MODEL_API_KEY=...      # never stored in the config file
 maya model status                  # shows whether calls are permitted
 ```
 
+Turn a paper into reviewed, mapped claims:
+
+```bash
+maya research add paper.pdf          # or .md/.txt, --url or --doi
+maya research extract <document>     # deterministic; --model is explicit
+maya research claim review <claim> --accept
+maya research claim add --type USER_REQUIREMENT --title "..." \
+  --expected-signal triu --expected-signal masked_fill
+maya repo add /path/to/repository && maya snapshot create && maya index
+maya map                             # claim-to-code matrix with verified spans
+maya research readiness --code       # weighted risk, or INSUFFICIENT_INFORMATION
+maya research memo create --code --out memo.md
+```
+
+Every explicit claim quote is re-verified against the stored extracted text;
+`PRESENT` requires the claim's declared signals in executable code inside a
+definition-level span. A model, if enabled, may only adjudicate among discovered
+spans, and invalid verdicts are refused. See
+[docs/phase-2-report.md](docs/phase-2-report.md).
+
 Include uncommitted work on purpose:
 
 ```bash
@@ -108,6 +129,13 @@ logs/                    optional structured logs
 | `maya symbol show` | Source, signature, docstring and relationships |
 | `maya ask` | Grounded answer or evidence digest; `--no-model`, `--budget` |
 | `maya qa list\|show` | Stored question/answer records and citations |
+| `maya research add\|list\|show` | Register document versions; inspect passages and claims |
+| `maya research extract` | Deterministic claim extraction; `--model`, `--section`, `--force` |
+| `maya research claim add\|list\|show\|edit\|review` | Author, inspect, correct and review claims |
+| `maya research dag` | Validate claim dependencies (cycles, missing edges) |
+| `maya research readiness` | Reproduction risk factors; `--code`, `--snapshot` |
+| `maya research memo create\|list\|show` | Versioned memo; `--append`, `--deviation`, `--out` |
+| `maya map [run\|set\|show]` | Map claims to code evidence, override manually, show the matrix |
 | `maya issues` | Index issues filtered by kind or severity |
 | `maya events` | Append-only workflow event log |
 | `maya config show\|defaults\|set` | Inspect or change configuration |
@@ -165,6 +193,14 @@ features:
   files are reported, never silently dropped.
 - **Single-user, local-only.** There is no authentication, multi-tenancy or
   network service; the database is a local file.
+- **PDF text depends on a text layer.** The builtin extractor handles classic and
+  Flate content streams; scanned pages are reported as missing, never OCR'd.
+  Install `pypdf` for better font/`ToUnicode` handling.
+- **Mapping is scoped to one snapshot.** `ABSENT` means "not found in the
+  inspected scope" and is downgraded to `UNCERTAIN` when parser coverage or
+  discovery is incomplete.
+- **Readiness is a heuristic, not a probability.** Factors with no recorded facts
+  stay `UNKNOWN`, and an overall value is withheld below 75% known weight.
 
 ## Repository layout
 
@@ -178,10 +214,12 @@ src/mayaworkbench/
   retrieval/           lexical/exact/regex/symbol search, context packing
   models/              provider-neutral gateway and OpenAI-compatible adapter
   qa/                  prompts, deterministic citation validation, answer pipeline
+  research/            documents, passages, claims, DAG, readiness, memos
+  mapping/             signals, evidence discovery, rule pack, adjudication
   app/container.py     composition root
   cli/                 argparse CLI and human/JSON renderers
-tests/                 pytest suite (storage, snapshots, indexing, retrieval, QA, CLI)
-docs/                  Phase 0 documents and the Phase 1 report
+tests/                 pytest suite (storage, snapshots, indexing, retrieval, QA, research, mapping, CLI)
+docs/                  Phase 0 contracts and the Phase 1/2 reports
 ```
 
 ## Testing
@@ -208,4 +246,6 @@ the previous index intact, invalid citations withhold the answer, and
 - [CLI and UI flow](docs/ui-flow.md)
 - [Implementation gap analysis](docs/implementation-gap-analysis.md)
 - [Phase 1 report](docs/phase-1-report.md)
+- [Phase 2 report](docs/phase-2-report.md)
+- [ADR 0007 — claims, mapping and readiness](docs/adr/0007-claims-mapping-and-readiness.md)
 - [Architecture decision records](docs/adr/)

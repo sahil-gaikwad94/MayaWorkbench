@@ -1,6 +1,6 @@
 # Product freeze (Phase 0)
 
-Status: frozen for Phase 0/1. Changes require a documented decision record in
+Status: frozen for Phase 0/1/2. Changes require a documented decision record in
 [docs/adr/](adr/) and an update to the affected contract schemas.
 
 ## 1. Who this is for
@@ -26,8 +26,9 @@ dashboards, or automated merge bots.
 | J3 | "Answer my question using this exact revision, and cite it." | Model answers grounded in nothing, or in a different checkout |
 | J4 | "Include my uncommitted work deliberately, not by accident." | Agents editing/reading a dirty tree while claiming committed state |
 | J5 | "Tell me what you could not analyse." | Coverage claims that are really hopes |
+| J6 | "What does this paper require, and how much of it does the code actually implement?" | Summaries that merge the paper, guesses and code into one confident story |
 
-Later phases add J6–J9 (task contracts, isolated worktrees, verified patches,
+Later phases add J7–J9 (task contracts, isolated worktrees, verified patches,
 evaluation runs); those are specified but not implemented.
 
 ## 3. Product principles (non-negotiable)
@@ -84,7 +85,30 @@ contract schemas, evaluation plan, CLI/UI flow, gap analysis, ADRs.
   `search`, `symbol`, `ask`, `qa`, `issues`, `events`, `config`, `model`,
   `schemas`, `db`.
 
-### Explicitly out of scope for Phase 1
+### Phase 2 — research intelligence and claim mapping (implemented)
+
+- Document registration and immutable versioning for Markdown, plain text and
+  PDFs, from a file, an http(s) URL or a DOI, with guarded retrieval.
+- Page/section/chunk-aware passages with exact character spans, quote hashes and
+  PDF missing-page reporting.
+- Claim extraction (deterministic by default, optional model with no silent
+  fallback) into four separate categories, with manual authoring, correction,
+  review and append-only revisions.
+- Claim DAG validation (cycles, missing dependencies, cross-document edges).
+- Claim-to-code mapping against a pinned snapshot: `PRESENT`, `PARTIAL`,
+  `ABSENT`, `UNCERTAIN`, `CONFLICTING` and manual `NOT_APPLICABLE`, each with
+  verified evidence spans; `PRESENT` requires declared signals in executable
+  code inside a definition-level span.
+- Optional model adjudication restricted to supplied spans, with deterministic
+  re-verification and refusal of invalid verdicts.
+- Reproduction Readiness / Risk Assessment with explicit `UNKNOWN` factors and
+  `INSUFFICIENT_INFORMATION` instead of a confident score.
+- Versioned research memo with an immutable, hash-verified source
+  interpretation and appended deviations.
+- CLI: `research add|list|show|extract|dag|readiness|memo`, `research claim
+  add|list|show|edit|review`, and `map [run|set|show]`.
+
+### Explicitly out of scope for Phases 1–2 (deferred to Phases 3–4)
 
 Task contracts, approval gates, worktrees/branches for agents, patch
 verification, test execution, multi-repository reasoning, embeddings/vector
@@ -105,6 +129,17 @@ search, hosted service, authentication, UI beyond the CLI.
 
 The 10k-file timing target is a design budget; the Phase 1 report records the
 measured numbers on the fixture repository rather than extrapolating.
+
+### Phase 2 success criteria
+
+| Criterion | Target | Verified by |
+| --- | --- | --- |
+| Quote integrity | every explicit claim quote matches a stored passage | `verify_sources`, `test_claims.py` |
+| No name-only `PRESENT` | `PRESENT` requires every declared signal in executable, definition-level code | rule tests, `test_mapping.py` |
+| Model cannot overrule evidence | invalid `PRESENT`/`ABSENT`/`CONFLICTING` is refused and recorded | adjudication refusal tests |
+| Absence is bounded | `ABSENT` is withheld when coverage/discovery is limited | rule tests, `UNCERTAIN` paths |
+| Memo history | appended versions reproduce the earlier interpretation byte for byte | hash and tamper tests |
+| Honest readiness | unknown factors stay unknown and suppress an overall value below 75% known weight | `test_readiness_memo.py` |
 
 ## 6. Constraints and decisions already made
 

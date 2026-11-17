@@ -30,7 +30,7 @@ Every workflow event is stored in `workflow_events` and exposed by
 Events are append-only: there is no update/delete API. `maya events` renders the
 payload as compact JSON.
 
-## 2. Event catalogue (Phase 1)
+## 2. Event catalogue (Phases 1–2)
 
 | Type | Emitted when | Payload (implemented keys) |
 | --- | --- | --- |
@@ -47,8 +47,24 @@ payload as compact JSON.
 | `QA_EVIDENCE_ONLY` | `NO_MODEL` digest stored | same shape as above, `status = NO_MODEL` |
 | `QA_REJECTED` | insufficient evidence, rejected citations, model failure, unavailable | `qa_record_id`, `status`, `citations`, `valid_citations`, `reason` |
 
-Events for tasks, approvals, patches and runs are specified for later phases but
-are intentionally not in the enum until those transitions exist (no empty
+Phase 2 adds the research transitions:
+
+| Type | Emitted when | Payload (implemented keys) |
+| --- | --- | --- |
+| `SOURCE_INGESTED` | a document version is registered and extracted | `document_key`, `version`, `title`, `media_kind`, `content_sha256`, `passages`, `sections`, `page_count`, `warnings`, `extraction_tool`, `extraction_version`, `supersedes` |
+| `SOURCE_EXTRACTION_FAILED` | bytes could not be turned into text; a `FAILED` version row is kept | `document_key`, `version`, `filename`, `media_kind`, `error` |
+| `CLAIMS_EXTRACTED` | a deterministic or model extraction run is stored | `extraction_id`, `method`, `algorithm_version`, `claims_created`, `claims_preserved`, `claims_dropped`, `warnings`, `artifact_id` |
+| `CLAIM_CREATED` | a claim is authored by hand | `claim_type`, `title`, `document_id`, `review_status`, `dependencies`, `source_locations` |
+| `CLAIM_UPDATED` | a manual correction appends a revision | `revision`, `changed_fields`, `dependencies_replaced`, `risk_factors_replaced`, `reason` |
+| `CLAIM_REVIEWED` | a claim is accepted or rejected | `review_status`, `note` |
+| `CLAIM_DAG_VALIDATED` | `maya research dag` validates a claim graph | `claim_count`, `edge_count`, `errors`, `warnings`, `cycles` |
+| `CLAIM_MAPPING_CREATED` | first mapping for a claim and snapshot | `claim_id`, `snapshot_id`, `status`, `author`, `rule_pack_version`, `evidence_spans`, `model_invocation_id`, `gaps` |
+| `CLAIM_MAPPING_UPDATED` | a mapping is replaced (rules, manual or model) | `previous_status`, `status`, `author`, `evidence_spans`, `reason` |
+| `CLAIM_MAPPING_REJECTED` | model adjudication was refused and the rule verdict kept | `claim_id`, `snapshot_id`, `reason`, `model_invocation_id` |
+| `RESEARCH_MEMO_CREATED` | a memo version is stored | `version`, `document_id`, `snapshot_id`, `claims`, `readiness_label`, `readiness_score_version`, `artifact_id`, `appended` |
+
+Events for tasks, approvals, patches and runs are specified for later phases and
+are intentionally absent from the enum until those transitions exist (no empty
 scaffolding).
 
 ## 3. Snapshot contract
@@ -139,7 +155,59 @@ the FTS expression actually used, candidate counts, mode and free-form notes
 (e.g. "context was truncated to a 600-token budget"). It is stored in the answer
 artifact so ranking decisions can be audited.
 
-## 6. Export and versioning
+## 6. Research contracts (Phase 2)
+
+`ResearchDocument` carries identity (`document_key`, `version`,
+supersedes), bibliographic fields, media/origin, content hash, the three
+artifact ids, extraction status/tool/version/warnings/missing pages and
+`metadata`. `metadata.sources` is the provenance map; consumers must treat a
+field whose source is `filename` or `cli` as supplied, not as stated by the
+paper.
+
+`SourcePassage` carries `page`/`page_end`, `section_path`, `section_title`,
+`heading_level`, `line_start`/`line_end`, `char_start`/`char_end`, `text`,
+`text_sha256`, `quote_hash`, `equation_label` and `chunk_index`. The invariant is
+machine-checked at ingestion:
+
+```
+stored_text[char_start:char_end] == passage.text
+quote_hash == sha256(normalise(passage.text))
+```
+
+`ResearchClaim` carries the category, title/statement,
+`implementation_requirement`, verified `source_locations`, `basis_passage_ids`,
+declared/forbidden code signals, target paths/symbols, `missing_details`,
+`validation_methods`, `derivation_note`, author/confidence and review state.
+The model-extraction payload is a separate schema (`ClaimExtractionPayload`)
+whose claims may only be `EXPLICIT_SOURCE_CLAIM` or `INFERRED_REQUIREMENT`;
+a model may not mint user requirements or engineering decisions.
+
+`ClaimDagValidation` reports `issues` (typed codes with severity), `cycles`,
+`topological_order`, `unorderable`, `depth`, `roots` and `leaves`. The JSON
+serialisation also exposes `valid` through the CLI, derived from the issues.
+
+`ClaimToCodeMatrix` is the review surface: one row per claim with its status,
+reason, gaps, counter-evidence, rule pack, author and verified evidence spans
+(`VerifiedEvidence` = evidence + `verified` + `verification` reason). The
+matrix is written as a `CLAIM_MATRIX` artifact on every run.
+
+`ReadinessAssessment` carries `score_version`, the weight map, per-factor
+state/risk/explanation/evidence, `overall_risk` (nullable),
+`label`, blockers, assumptions, limitations, claim/mapping counts,
+`known_weight` and `is_probability = false`.
+
+Memos use explicit markers:
+
+```
+<!-- maya:interpretation:start --> … <!-- maya:interpretation:end -->
+<!-- maya:deviations:start --> … <!-- maya:deviations:end -->
+```
+
+`source_interpretation_sha256` is the SHA-256 of the interpretation block's
+inner text. A later version must reproduce that block byte for byte or the
+append is refused.
+
+## 7. Export and versioning
 
 ```bash
 maya schemas export ./schemas
@@ -154,7 +222,16 @@ writes one `<Model>.schema.json` per contract plus `schemas.json`:
 Exported models include `Project`, `Repository`, `RepositorySnapshot`,
 `IndexedFile`, `Symbol`, `SymbolEdge`, `IndexIssue`, `Artifact`,
 `WorkflowEvent`, `ModelInvocation`, `Citation`, `QaRecord`, `ContextPack`,
-`ContextItem`, `RetrievalDiagnostics`, `RepositoryMap` and `IndexReport`.
+`ContextItem`, `RetrievalDiagnostics`, `RepositoryMap`, `IndexReport`,
+`ResearchDocument`, `SourcePassage`, `ResearchClaim`, `ClaimDependency`,
+`ClaimRevision`, `ClaimRiskFactor`, `MappingEvidence`, `ClaimMapping`,
+`ResearchExtraction`, `ResearchMemo`, `ExtractionReport`,
+`ClaimExtractionSummary`, `ClaimExtractionPayload`, `ClaimDagValidation`,
+`ClaimToCodeMatrix`, `ReadinessAssessment`, `MappingAdjudicationPayload` and
+`ModelEvidence`.
+
+The bundle version is `1.1` (Phase 2 added schemas; no Phase 1 schema changed
+shape), while the event envelope stays at `1.0`.
 
 Versioning policy:
 
@@ -164,4 +241,32 @@ Versioning policy:
 - **Enum members** — adding is additive; removing requires a migration that
   rewrites stored rows.
 - `schema_version` on settings (`"1"`), events (`"1.0"`) and the schema bundle
-  are independent and recorded alongside the data they describe.
+  are independent and are recorded separately from the data they describe.
+
+## 8. Task and workspace contracts (Phase 3)
+
+Every task event carries the project id and, where relevant, `task_id` and
+`run_id`; the event envelope is unchanged. Phase 3 adds:
+
+`TASK_CREATED`, `CONTRACT_CREATED`, `PLAN_CREATED`, `PLAN_APPROVED`,
+`APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `APPROVAL_EXPIRED`,
+`APPROVAL_CONSUMED`, `TASK_STATE_CHANGED`, `TASK_PAUSED`, `TASK_RESUMED`,
+`TASK_COMPLETED`, `TASK_FAILED`, `TASK_BLOCKED`, `TASK_CANCELLED`,
+`WORKTREE_CREATED`, `WORKTREE_REMOVED`, `PATCH_APPLIED`, `TOOL_INVOKED`,
+`TOOL_BLOCKED`, `COMMAND_STARTED`, `COMMAND_COMPLETED`, `COMMAND_TIMED_OUT`,
+`COMMAND_BLOCKED`, `DIFF_CAPTURED`, `DIFF_REVIEWED`, `WORKER_STARTED`,
+`WORKER_LEASE_ACQUIRED`, `WORKER_LEASE_LOST` and `WORKER_FINISHED`.
+
+Exported JSON Schemas (bundle `1.2`) cover `Task`, `TaskContract`, `TaskPlan`,
+`WorkflowRun`, `ApprovalRequest`, `ExecutionWorkspace`, `ToolCall`, `TaskDiff`,
+`TaskReview` and `WorkerJob`. `AgentAction` and `PlanPayload` are the structured
+model contracts used by the worker; they are internal but versioned with
+`TASK_PROTOCOL_VERSION`.
+
+Safety-relevant payload rules:
+
+- approval events contain the action, spec hash, expiry and scope, never a
+  command's argv, file content or nonce;
+- tool-call rows store argument hashes and redacted summaries for edits, plus
+  argv for commands; output lives in artifacts;
+- a `DIFF_REVIEWED` event carries counts and booleans, not an acceptance claim.

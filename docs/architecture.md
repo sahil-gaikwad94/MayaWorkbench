@@ -11,6 +11,8 @@ CLI (argparse, rendering)
         ├── indexing/      parsing, edge resolution, map
         ├── retrieval/     search, context packing
         ├── qa/            prompts, citation validation, answer pipeline
+        ├── research/      documents, passages, claims, DAG, readiness, memos
+        ├── mapping/       claim signals, evidence discovery, rule pack
         ├── models/        provider gateway and adapters
         └── storage/       SQLite, stores, artifact store
               └── domain/  enums and persisted models (no I/O)
@@ -46,6 +48,16 @@ together, which is what makes the providers replaceable in tests.
 | `models/gateway.py` | Policy, invocation accounting, events | `LOCAL_ONLY` refuses before adapter construction |
 | `qa/citations.py` | Deterministic citation verification | No model judgement involved |
 | `qa/service.py` | Question → context → answer → record | No evidence ⇒ no answer |
+| `research/pdf.py` | PDF text extraction | Missing text is reported, never guessed |
+| `research/fetch.py` | URL/DOI retrieval | http(s) only, public addresses only, bounded |
+| `research/ingestion.py` | Document versions, artifacts, passages | A version is immutable; quotes index stored text |
+| `research/claims.py` | Extraction, authoring, review, revisions | Explicit claims carry verified quotes only |
+| `research/dag.py` | Claim graph validation | Cycles and missing edges are reported |
+| `research/readiness.py` | Reproduction risk assessment | Unknown factors stay unknown |
+| `research/memo.py` | Versioned memo generation | Prior interpretation is reused verbatim |
+| `mapping/signals.py` | Whole-token behavioural signals | Prose never counts as code evidence |
+| `mapping/rules.py` | Deterministic mapping rule pack | `PRESENT` needs definition-level code evidence |
+| `mapping/service.py` | Mapping persistence, evidence, adjudication | Evidence is re-verified against the snapshot |
 
 ## 3. Lifecycles
 
@@ -140,6 +152,15 @@ was not given, and cannot widen a line range beyond the span it received.
 9. **I9 — Durable evidence.** Answers, contexts, invocations and events survive
    process exit and are inspectable later.
 10. **I10 — No fabricated relevance.** Empty retrieval returns empty evidence.
+11. **I11 — Exact paper quotes.** An explicit claim's quote appears verbatim in
+    a stored passage; the quote hash is re-derived, never trusted.
+12. **I12 — Mechanical mapping.** `PRESENT` requires every declared signal in
+    executable code, at least one in a definition-level span with full parser
+    coverage, and no forbidden signal. Derived signals cannot produce it.
+13. **I13 — Unknowns stay unknown.** A readiness factor with no recorded facts is
+    `UNKNOWN`; no overall value is reported below 75% known weight.
+14. **I14 — Immutable interpretations.** A memo version reuses the earlier
+    source interpretation byte for byte or the append is refused.
 
 ## 5. Failure behaviour
 
@@ -177,11 +198,42 @@ was not given, and cannot widen a line range beyond the span it received.
   register it in the gateway factory; the domain contract does not change.
 - **New search mode**: add a mode to `retrieval/search.py` and expose it in the
   CLI; retrieval scoring already merges multiple candidate sources.
-- **Phase 3 worktrees/tasks**: the snapshot, event and artifact contracts are
-  designed to carry task/run IDs; the tables are intentionally absent until the
-  behaviour exists.
+- **Phase 4 verification**: consume `workflow_runs`, `tool_invocations`,
+  `task_diffs` and command output artifacts; add a check registry and evidence
+  graph without changing the task/approval contracts.
 
-## 8. Deliberate non-architecture
+## 8. Task execution (Phase 3)
+
+```text
+CLI task create/start          CLI task run
+      |                             |
+      v                             v
+TaskService  ---> WorkflowService (state machine + events)
+      |                             ^
+      +--> ApprovalService ---------+
+      +--> PlanService (model/JSON)
+      +--> WorktreeManager --------> detached Git worktree
+      +--> WorkerJobStore ---------> separate `mayaworkbench.worker` process
+                                           |
+                                           v
+                                    ControlledAgent
+                                           |
+                                    ToolGateway -----> CommandRunner
+                                           |            (argv, timeout, caps)
+                                           v
+                                    artifacts + tool_invocations
+```
+
+Note: in Phase 3 the diagram reads top-to-bottom as an architectural map, not
+as a live pipeline. Control flow is single-threaded per run: the CLI enqueues,
+the worker owns the state machine and agent loop, and the CLI only observes.
+
+The CLI never executes repository code. It creates durable task/run records,
+starts the worker and then polls the database. The worker owns the agent loop
+and closes the run with a state transition; only `WorkflowService` calls
+`compare_and_set_state`.
+
+## 9. Deliberate non-architecture
 
 - No plugin loading from repositories (would execute untrusted code).
 - No daemon, no background indexing, no file watcher (Phase 1 is explicit

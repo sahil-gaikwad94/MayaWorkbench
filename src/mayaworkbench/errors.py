@@ -124,6 +124,51 @@ class CitationError(MayaError):
     code = "CITATION_ERROR"
 
 
+class ExtractionError(MayaError):
+    """A research document could not be converted into citable passages."""
+
+    code = "EXTRACTION_ERROR"
+
+
+class FetchError(MayaError):
+    """A controlled document fetch was refused or failed."""
+
+    code = "FETCH_ERROR"
+
+
+class TaskError(MayaError):
+    """A task, workflow or plan operation was refused."""
+
+    code = "TASK_ERROR"
+
+
+class ApprovalError(MayaError):
+    """An approval is missing, expired, mismatched or already used."""
+
+    code = "APPROVAL_ERROR"
+    exit_code = 3
+
+
+class WorkspaceError(MayaError):
+    """An isolated worktree could not be created, verified or removed."""
+
+    code = "WORKSPACE_ERROR"
+
+
+class ToolError(MayaError):
+    """A tool invocation was refused or failed."""
+
+    code = "TOOL_ERROR"
+    exit_code = 3
+
+
+class BudgetError(MayaError):
+    """A task budget (time, tokens, cost, steps or output) was exhausted."""
+
+    code = "BUDGET_ERROR"
+    exit_code = 3
+
+
 __all__ = [
     "MayaError",
     "UsageError",
@@ -138,4 +183,11 @@ __all__ = [
     "PolicyError",
     "ModelError",
     "CitationError",
+    "ExtractionError",
+    "FetchError",
+    "TaskError",
+    "ApprovalError",
+    "WorkspaceError",
+    "ToolError",
+    "BudgetError",
 ]

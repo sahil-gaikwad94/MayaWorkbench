@@ -140,6 +140,16 @@ projects 1─* qa_records *─1 repository_snapshots
 artifacts 1─? repository_snapshots (patch, manifest)
 artifacts 1─? qa_records (answer)
 artifacts 1─? indexed_files (content)
+projects 1─* research_documents 1─* source_passages
+projects 1─* research_claims *─? research_documents
+research_claims *─* research_claims (claim_dependencies, parent_claim_id)
+research_claims 1─* claim_revisions / claim_risk_factors
+research_claims 1─* claim_mappings 1─* mapping_evidence
+projects 1─* research_memos *─? research_documents / repository_snapshots
+artifacts 1─? research_documents (source, text, extraction report)
+artifacts 1─? research_claims extractions (claim set)
+artifacts 1─? claim_mappings (matrix artifact)
+artifacts 1─? research_memos (memo body)
 ```
 
 Deleting a project cascades to repositories, snapshots, files, lines, symbols,
@@ -160,10 +170,28 @@ via a temp file + atomic rename, deduplicated by `(sha256, kind)`.
 | `INDEX_MAP` | Repository map exported by `maya inspect --save` |
 | `CONTEXT_PACK` | Full retrieval context handed to the model (or digest) |
 | `QA_ANSWER` | Answer record payload, including rejected model text |
+| `SOURCE_DOCUMENT` | Exact bytes of a registered research document version |
+| `SOURCE_TEXT` | Extracted text a passage's `char_start`/`char_end` index into |
+| `EXTRACTION_REPORT` | Tool, version, hashes, warnings, missing pages, metadata provenance |
+| `CLAIM_SET` | Validated claims (plus dependencies and risks) from one extraction run |
+| `CLAIM_MATRIX` | Claim-to-code matrix for one snapshot, including verified evidence |
+| `RESEARCH_MEMO` | Rendered memo body (source interpretation + appended deviations) |
 
 Every read re-hashes the bytes and raises `ConflictError` on mismatch; a missing
 blob raises `NotFoundError`. Writes are fsync'd before the row is committed, so
 a committed artifact row always has bytes on disk.
+
+Versioning policy:
+
+- The task workflow/approval/plan protocol is versioned as `TASK_PROTOCOL_VERSION`;
+  the typed tool/command contract as `TOOL_GATEWAY_VERSION`.
+- **Additive fields with defaults** — allowed in a minor bundle version.
+- **Renamed/removed/retyped fields** — require a migration and a major bundle
+  version; old artifacts remain readable or are explicitly marked legacy.
+- **Enum members** — adding is additive; removing requires a migration that
+  rewrites stored rows.
+- `schema_version` on settings (`"1"`), events (`"1.0"`) and the schema bundle
+  are independent and are recorded separately from the data they describe.
 
 ## 4. Migrations
 
@@ -176,9 +204,11 @@ On startup:
 3. refuse to run on mismatch (`DatabaseError`);
 4. apply pending migrations inside one transaction per file.
 
-`schema_version` (currently `1`) is stored in `PRAGMA user_version` and exposed
+`schema_version` (currently `2`) is stored in `PRAGMA user_version` and exposed
 by `maya db info` / `maya doctor`. Editing a released migration is not allowed;
-behaviour changes require a new file.
+behaviour changes require a new file. `0002_research_and_claims.sql` is
+purely additive: it creates the research tables and leaves Phase 1 rows
+untouched.
 
 ## 5. Retention
 
@@ -187,3 +217,134 @@ future cleanup command can be safe. Phase 1 has no deletion command: removing
 `$MAYA_HOME` is the documented way to delete local data. Patches, manifests and
 file content can be large; a 96 MB total discovery budget bounds how much a
 single snapshot can pull into the index.
+
+## 6. Research and claims (schema 2)
+
+### `research_documents`
+
+One immutable content version of a paper or note. Versions share
+`document_key` and increment `version`; `supersedes_document_id` links the
+chain, so an earlier quote remains citable after a new version is registered.
+Columns cover bibliographic identity (`title`, `authors_json`,
+`organization`, `published_at`, `doi`, `license`), origin (`media_kind`,
+`origin`, `origin_uri`, `source_url`), content (`content_sha256`,
+`size_bytes`), the three artifacts (source bytes, extracted text, extraction
+report), extraction state (`extraction_status`, `extraction_tool`,
+`extraction_version`, `extraction_warnings_json`, `missing_pages_json`,
+`page_count`, `section_count`, `passage_count`) and `metadata_json`.
+
+`metadata_json` records per-field provenance in `sources` (for example
+`title: front_matter`, `title: filename`, `title: cli`) plus `extra` (such as a
+PDF creation date) and retrieval facts. A filename stem used as a display title
+is always flagged `TITLE_NOT_IN_SOURCE` in `extraction_warnings`.
+
+### `source_passages`
+
+Citable chunks of the extracted text. `char_start`/`char_end` index the
+`SOURCE_TEXT` artifact; `text_sha256` hashes the raw slice and `quote_hash`
+hashes the whitespace-normalised text. `page`/`page_end` are 1-based PDF pages
+(null for Markdown/text). `section_path` is the heading trail, `heading_level`,
+`line_start`/`line_end` and `equation_label` add structure. Kinds are
+`HEADING`, `PARAGRAPH`, `LIST`, `TABLE`, `CODE`, `EQUATION`, `CAPTION` and
+`CHUNK`; `chunk_index` marks oversize blocks split at sentence/word boundaries.
+
+### `research_extractions`
+
+One audit record per extraction run: `document_id`, `method`
+(`DETERMINISTIC`/`MODEL`), `algorithm_version`, `extraction_key` (method,
+parameters and content hash), optional `model_invocation_id`, claim counts,
+`artifact_id` (the `CLAIM_SET`) and `parameters`.
+
+### `research_claims`
+
+One claim node. `claim_type` is never merged: `EXPLICIT_SOURCE_CLAIM`,
+`INFERRED_REQUIREMENT`, `USER_REQUIREMENT` or `IMPLEMENTATION_DECISION`.
+`source_locations_json` holds verified quotes (`passage_id`, `quote`,
+`quote_hash`, page/section/equation); `basis_passage_ids_json` holds the
+passages a non-explicit claim derives from. `expected_code_signals_json` and
+`forbidden_code_signals_json` are the machine-checkable acceptance criteria;
+`target_paths_json`/`target_symbols_json` narrow discovery. `missing_details_json`
+records what the paper does not state (never filled in), and
+`validation_methods_json` records how the claim would be tested. Author
+(`HEURISTIC`/`MODEL`/`USER`), confidence and review state
+(`NEEDS_REVIEW`/`ACCEPTED`/`REJECTED`) are separate fields; `reviewed_by`/
+`reviewed_at` make the human decision auditable.
+
+### `claim_dependencies`
+
+Edges of `claim_id requires depends_on_claim_id`, unique per pair. Cycles,
+missing targets, self-edges and cross-document edges are reported by
+`validate_claim_dag` as issues; they are never silently repaired.
+
+### `claim_revisions`
+
+Append-only manual corrections: `revision`, `changed_by`, `reason` and
+`before_json`/`after_json` snapshots of the claim. Editing a claim never
+destroys the previous state.
+
+### `claim_risk_factors`
+
+Explicit reproduction risks attached to a claim: `category` (`DATA_ACCESS`,
+`COMPUTE`, `LICENSING`, `EVALUATION`, `PAPER_DETAIL`, `OTHER`), `severity`
+(`INFO`/`WARNING`/`BLOCKER`) and human-readable `detail`.
+
+### `claim_mappings`
+
+One current verdict per `(claim_id, snapshot_id)`: `status`
+(`PRESENT`/`PARTIAL`/`ABSENT`/`UNCERTAIN`/`CONFLICTING`/`NOT_APPLICABLE`),
+`status_reason`, `rationale`, `gaps`, `counter_evidence`, `validation_method`,
+`rule_pack_version`, `created_by` (`DETERMINISTIC`/`MODEL`/`USER`), optional
+model invocation, its own review status and a `details` JSON audit blob.
+Remapping updates this row and emits an event; each run also writes an
+immutable `CLAIM_MATRIX` artifact.
+
+### `mapping_evidence`
+
+Exact spans cited for a mapping: `snapshot_id`, `file_id`, optional
+`symbol_id`/`qualified_name`, `path`, 1-based `start_line`/`end_line`,
+`relation` (`IMPLEMENTS`/`SUPPORTS`/`CONTRADICTS`/`TEST_COVERS`), `strength`
+(`STRONG`/`MODERATE`/`WEAK`), verbatim `excerpt`, `excerpt_sha256`, `source`
+(`AST`/`LEXICAL`/`MANUAL`/`MODEL`) and `matched_signals`. Verification re-reads
+those lines from the pinned snapshot and requires exact equality with the
+stored excerpt and hash.
+
+### `research_memos`
+
+Versioned memo per `(project, document, snapshot)`: `version`,
+`supersedes_memo_id`, `title`, `body_markdown`, `artifact_id`,
+`source_interpretation_sha256` and the serialised readiness assessment.
+Appending copies the earlier source-interpretation block verbatim after
+verifying its hash; deviations are appended, never rewritten.
+
+### Research artefacts
+
+All research output is content-addressed and listed in the artifact table
+above. Citations in a memo name a passage id and quote hash, so a reader can
+re-derive the quote from the stored `SOURCE_TEXT` even after the workbench is
+restored from a checkpoint.
+
+## 7. Tasks and workspaces (schema 3)
+
+Migration `0003_tasks_and_workspaces.sql` adds the controlled-agent records.
+| Table | Purpose | Key columns |
+| --- | --- | --- |
+| `tasks` | User objective | `project_id`, `task_type`, `goal` |
+| `task_contracts` | Immutable scope/budget authorization | `task_id`, `version`, `scope_json`, `constraints_json`, `content_sha256` |
+| `task_plans` | Reviewable implementation plan | `run_id`, `version`, `plan_sha256`, `artifact_id` |
+| `workflow_runs` | One attempt and its state | `state`, `base_commit_sha`, `plan_id`, `workspace_id`, usage counters |
+| `approval_requests` | Durable scoped human authorization | `action`, `status`, `spec_sha256`, `nonce`, `expires_at`, `consumed_at` |
+| `execution_workspaces` | Task-owned detached worktree | `run_id` (unique), `path`, `base_commit_sha`, `status`, `patch_artifact_id` |
+| `tool_invocations` | Every gateway call | `tool_name`, `arguments_json`, `arguments_sha256`, `status`, `output_artifact_id` |
+| `task_diffs` | Candidate patch and review facts | `patch_artifact_id`, `patch_sha256`, `files_json`, `scope_violations_json`, `original_checkout_unchanged` |
+| `task_reviews` | Structural review findings | `diff_id`, `scope_ok`, `secrets_found`, `findings_json` |
+| `worker_jobs` | Durable worker queue | `run_id`, `status`, `attempts`, `lease_owner`, `lease_expires_at` |
+
+`workflow_events` gained nullable `task_id` and `run_id` columns. Existing
+events keep their entity ids and remain readable. Task/contract/plan/workspace
+tables use foreign keys with restrictive deletes where the evidence must not be
+silently orphaned, and cascade only from project/task ownership.
+
+The candidate patch, tool outputs, diff review and exported bundle are
+content-addressed artifacts (`TASK_PATCH`, `TOOL_OUTPUT`, `COMMAND_OUTPUT`,
+`DIFF_REVIEW`, `TASK_CONTRACT`, `IMPLEMENTATION_PLAN`). The database stores
+metadata and hashes; it does not store full patches or command output inline.

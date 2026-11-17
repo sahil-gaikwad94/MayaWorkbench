@@ -10,7 +10,12 @@ import pytest
 
 from mayaworkbench.app.container import Services
 from mayaworkbench.config import AppPaths, load_settings, save_settings
-from mayaworkbench.models.base import ModelCapabilities, ModelResponse, ModelUsage
+from mayaworkbench.models.base import (
+    ModelCapabilities,
+    ModelResponse,
+    ModelUsage,
+)
+from mayaworkbench.models.gateway import ModelGateway
 
 ATTENTION_PY = '''"""Attention modules."""
 
@@ -114,6 +119,40 @@ def test_forward_shape():
     assert out.shape == (1, 4, 8)
 '''
 
+PAPER_MD = '''---
+title: Causal Attention Revisited
+authors: Ada Lovelace, Grace Hopper
+organization: Analytical Engine Lab
+published: 2025-02-03
+license: CC-BY-4.0
+doi: 10.5555/maya.2025.001
+---
+
+# Abstract
+
+We introduce a causal self-attention mask that must prevent a position from attending to future positions.
+
+# 2 Method
+
+## 2.1 Masking
+
+For a sequence of length n we compute scaled scores and we apply a triangular mask with torch.triu before the softmax. Blocked positions receive negative infinity.
+
+This constraint is enforced with masked_fill on the scaled dot-product scores.
+
+## 2.2 Complexity
+
+The method keeps the O(n^2) score matrix and therefore does not change asymptotic complexity.
+
+# 3 Experiments
+
+We use the WikiText-103 dataset with 4 NVIDIA A100 GPUs for 40 epochs and we evaluate top-1 accuracy.
+
+# 4 Limitations
+
+The paper does not state how padding interacts with the causal mask.
+'''
+
 README = """# TinyFixture
 
 A deliberately small transformer fixture used by the MayaWorkbench tests.
@@ -177,6 +216,20 @@ def services(home: Path):
 @pytest.fixture
 def project(services: Services):
     return services.create_project("Fixture Project", "test project")
+
+
+@pytest.fixture
+def paper(services: Services, project, tmp_path: Path):
+    path = tmp_path / "paper.md"
+    path.write_text(PAPER_MD, encoding="utf-8")
+    return services.ingestion.ingest_file(project, path)
+
+
+def passage_containing(services: Services, document_id: str, needle: str):
+    for passage in services.passages.list_by_document(document_id):
+        if needle in passage.text:
+            return passage
+    raise AssertionError(f"no passage contains {needle!r}")
 
 
 @pytest.fixture
@@ -313,6 +366,75 @@ def enable_virtual_model(home: Path) -> None:
     save_settings(paths, settings)
 
 
+class ScriptedTaskProvider:
+    """A model double for plan and one-action-at-a-time task steps."""
+
+    name = "fake"
+    model = "fake-1"
+
+    def __init__(self):
+        self.plan: dict = {
+            "summary": "Make the smallest safe change.",
+            "steps": [
+                {
+                    "description": "Inspect and change the target file.",
+                    "files": ["utils.py"],
+                    "checks": [],
+                }
+            ],
+            "files": ["utils.py"],
+            "checks": [],
+            "risks": [],
+            "unknowns": [],
+            "estimated_steps": 3,
+        }
+        self.actions: list[dict] = []
+        self.calls = 0
+
+    def capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(structured_output=True)
+
+    def generate(self, request):
+        self.calls += 1
+        if request.schema_name == "PlanPayload":
+            payload = self.plan
+        else:
+            if not self.actions:
+                raise AssertionError("scripted task provider ran out of actions")
+            payload = self.actions.pop(0)
+        return ModelResponse(
+            text=json.dumps(payload, sort_keys=True),
+            structured=payload,
+            usage=ModelUsage(total_tokens=100),
+            provider="fake",
+            model="fake-1",
+            latency_ms=1,
+        )
+
+
+def install_task_model(services, home: Path, monkeypatch, provider: ScriptedTaskProvider):
+    enable_virtual_model(home)
+    monkeypatch.setenv("MAYA_MODEL_API_KEY", "test-key")
+    services.settings = load_settings(AppPaths.resolve(str(home)))
+    gateway = ModelGateway(
+        services.settings,
+        services.invocations,
+        services.events,
+        lambda _settings: provider,
+    )
+    services.gateway = gateway
+    services.plan_service.gateway = gateway
+    services.plan_service.settings = services.settings
+    services.task_service.gateway = gateway
+    services.task_service.settings = services.settings
+    return provider
+
+
+@pytest.fixture
+def task_model(services, home: Path, monkeypatch):
+    return install_task_model(services, home, monkeypatch, ScriptedTaskProvider())
+
+
 @pytest.fixture
 def virtual_model(services, home: Path, monkeypatch):
     enable_virtual_model(home)
@@ -328,4 +450,11 @@ def virtual_model(services, home: Path, monkeypatch):
     services.gateway = ModelGateway(services.settings, services.invocations, services.events, factory)
     services.ask.gateway = services.gateway
     services.ask.settings = services.settings
+    services.claim_service.gateway = services.gateway
+    services.claim_service.settings = services.settings
+    services.mapping_service.gateway = services.gateway
+    services.mapping_service.settings = services.settings
+    services.mapping_service.collector.settings = services.settings
+    services.memo_service.settings = services.settings
+    services.ingestion.settings = services.settings
     return provider

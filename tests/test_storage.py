@@ -17,10 +17,12 @@ PROJECT_INSERT = (
 def test_migrations_apply_once_and_record_checksums(tmp_path):
     db = Database(tmp_path / "maya.db")
     first = db.migrate()
-    assert [result.applied for result in first] == [True]
-    assert db.schema_version() == 1
+    assert [result.applied for result in first] == [True] * len(first)
+    assert len(first) >= 2  # 0001 core schema, 0002 research and claims
+    assert db.schema_version() == len(first)
     rows = db.applied_migrations()
-    assert rows[0]["checksum"]
+    assert all(row["checksum"] for row in rows)
+    assert [row["version"] for row in rows] == sorted(row["version"] for row in rows)
 
     second = db.migrate()
     assert all(result.applied is False for result in second)
