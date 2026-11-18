@@ -329,7 +329,7 @@ Migration `0003_tasks_and_workspaces.sql` adds the controlled-agent records.
 | Table | Purpose | Key columns |
 | --- | --- | --- |
 | `tasks` | User objective | `project_id`, `task_type`, `goal` |
-| `task_contracts` | Immutable scope/budget authorization | `task_id`, `version`, `scope_json`, `constraints_json`, `content_sha256` |
+| `task_contracts` | Immutable scope/budget authorization | `task_id`, `version`, `scope_json`, `constraints_json`, `research_context_json`, `content_sha256` |
 | `task_plans` | Reviewable implementation plan | `run_id`, `version`, `plan_sha256`, `artifact_id` |
 | `workflow_runs` | One attempt and its state | `state`, `base_commit_sha`, `plan_id`, `workspace_id`, usage counters |
 | `approval_requests` | Durable scoped human authorization | `action`, `status`, `spec_sha256`, `nonce`, `expires_at`, `consumed_at` |

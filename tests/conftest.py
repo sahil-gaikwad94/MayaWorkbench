@@ -359,6 +359,10 @@ def enable_virtual_model(home: Path) -> None:
                     "model": "fake-1",
                     "base_url": "http://127.0.0.1:9/v1",
                     "api_key_env": "MAYA_MODEL_API_KEY",
+                    # A stated zero price for the test double. Unknown prices are
+                    # refused by the budget controller (MWB-006).
+                    "input_cost_per_mtok": 0.0,
+                    "output_cost_per_mtok": 0.0,
                 }
             ),
         }

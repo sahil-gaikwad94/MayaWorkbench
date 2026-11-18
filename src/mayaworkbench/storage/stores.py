@@ -1620,6 +1620,7 @@ class ContractStore:
         "constraints": ("constraints_json", {}),
         "acceptance_criteria": ("acceptance_criteria_json", []),
         "unknowns": ("unknowns_json", []),
+        "research_context": ("research_context_json", None),
         "required_approvals": ("required_approvals_json", []),
     }
 

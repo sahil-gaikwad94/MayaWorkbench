@@ -111,3 +111,30 @@ def test_worktree_reconstructs_worktree_snapshot_with_untracked_file(services, p
         assert untracked.read_text() == "untracked evidence\n"
     finally:
         services.worktrees.remove(workspace)
+
+
+def test_new_ignored_file_is_force_added_to_the_candidate_patch(indexed):
+    """MWB-007: a task-created ignored file must not vanish from the patch."""
+    services = indexed.services
+    task, contract, run = _make_run(services, indexed, allowed_paths=["generated"])
+    workspace = services.worktrees.create(
+        run=run,
+        task=task,
+        contract=contract,
+        repository=services.repositories.get(contract.repository_id),
+        snapshot=indexed.snapshot,
+    )
+    try:
+        path = Path(workspace.path)
+        (path / ".gitignore").write_text("generated/\n", encoding="utf-8")
+        (path / "generated").mkdir()
+        (path / "generated" / "injected.py").write_text(
+            "INJECTED = True\n", encoding="utf-8"
+        )
+        patch, files, warnings = services.worktrees.capture_diff(workspace)
+    finally:
+        services.worktrees.remove(workspace)
+    assert b"generated/injected.py" in patch
+    assert b"INJECTED = True" in patch
+    assert any(item.path == "generated/injected.py" for item in files)
+    assert any("force-added" in warning for warning in warnings)

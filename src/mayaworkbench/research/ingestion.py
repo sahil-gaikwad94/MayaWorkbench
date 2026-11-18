@@ -129,10 +129,25 @@ class DocumentIngestionService:
             raise NotFoundError(f"{source} does not exist")
         if not source.is_file():
             raise UsageError(f"{source} is not a file")
+        limit = self.settings.research.max_document_bytes
         try:
-            data = source.read_bytes()
+            size = source.stat().st_size
+            if size > limit:
+                raise UsageError(
+                    f"{source.name} is {size} bytes, above the {limit} byte document limit",
+                    hint="Raise research.max_document_bytes or register a smaller extract.",
+                )
+            # Read one byte past the limit so a file that grew after ``stat`` is
+            # still rejected without ever materialising the whole input.
+            with source.open("rb") as handle:
+                data = handle.read(limit + 1)
         except OSError as exc:
             raise ExtractionError(f"Cannot read {source}: {exc}") from exc
+        if len(data) > limit:
+            raise UsageError(
+                f"{source.name} grew past the {limit} byte document limit while being read",
+                hint="Copy the file to a stable location and register it again.",
+            )
         return self._ingest_bytes(
             project,
             data,

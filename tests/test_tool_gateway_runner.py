@@ -21,7 +21,14 @@ from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
 from mayaworkbench.workspace.tools import ToolGateway
 
 
-def build_gateway(services, indexed, tmp_path: Path, *, allow_delete=False):
+def build_gateway(
+    services,
+    indexed,
+    tmp_path: Path,
+    *,
+    allow_delete=False,
+    network_policy="ALLOW_WITH_APPROVAL",
+):
     task, contract = services.task_service.create_task(
         project_id=indexed.project.id,
         title="Gateway test",
@@ -71,7 +78,7 @@ def build_gateway(services, indexed, tmp_path: Path, *, allow_delete=False):
         workspace,
         policy=CommandPolicy(
             profile="CPU_SMOKE",
-            network_policy="DENY_BY_DEFAULT",
+            network_policy=network_policy,
             dependency_policy="APPROVAL_REQUIRED",
             max_output_bytes=1000,
             max_runtime_seconds=10,
@@ -219,3 +226,74 @@ def test_runner_rejects_missing_approval_and_bad_timeout(services, indexed, tmp_
     assert blocked.status == ToolCallStatus.BLOCKED
     with pytest.raises(PolicyError):
         gateway.runner.validate(["python", "-c", "print(1)"], timeout_seconds=999)
+
+
+# --------------------------------------------------------------- adversarial
+def test_deny_by_default_refuses_when_isolation_is_unavailable(
+    services, indexed, tmp_path
+):
+    """MWB-002: a deny policy must fail closed, not run with egress."""
+    gateway, workspace, *_ = build_gateway(
+        services, indexed, tmp_path, network_policy="DENY_BY_DEFAULT"
+    )
+    gateway.runner._network_state = (False, "simulated: no network namespace")
+    marker = workspace / "network-ran.txt"
+    result = gateway.invoke(
+        "run_command",
+        {
+            "argv": [
+                "python",
+                "-c",
+                "open('network-ran.txt', 'w').write('ran'); print('ran')",
+            ],
+            "timeout_seconds": 5,
+        },
+    )
+    assert result.status == ToolCallStatus.BLOCKED
+    assert result.data["blocked"] is True
+    assert "DENY_BY_DEFAULT" in result.data["blocked_reason"]
+    # The command must not have been started at all.
+    assert not marker.exists()
+
+
+def test_background_child_is_terminated_when_leader_exits(services, indexed, tmp_path):
+    """MWB-003: a parent that exits must not leave descendants running."""
+    gateway, workspace, *_ = build_gateway(services, indexed, tmp_path)
+    result = gateway.invoke(
+        "run_command",
+        {
+            "argv": [
+                "python",
+                "-c",
+                (
+                    "import subprocess, sys; "
+                    "child = subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(30)']); "
+                    "open('child.pid', 'w').write(str(child.pid)); "
+                    "print('parent exited')"
+                ),
+            ],
+            "timeout_seconds": 10,
+        },
+    )
+    assert result.status == ToolCallStatus.SUCCEEDED
+    assert result.data["cleanup_required"] is True
+    assert result.data["cleanup_succeeded"] is True
+    import os
+
+    pid = int((workspace / "child.pid").read_text().strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_large_output_is_truncated_but_the_command_succeeds(services, indexed, tmp_path):
+    """MWB-009: output beyond the cap is truncated, not a kill signal."""
+    gateway, *_ = build_gateway(services, indexed, tmp_path)
+    result = gateway.invoke(
+        "run_command",
+        {"argv": ["python", "-c", "print('y' * 50_000)"], "timeout_seconds": 10},
+    )
+    assert result.status == ToolCallStatus.SUCCEEDED
+    assert result.exit_code == 0
+    assert result.data["output_truncated"] is True
+    assert len(result.output) < 10_000

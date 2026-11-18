@@ -154,3 +154,47 @@ and `maya worker`.
 - The worker is a local process under the user's account, not a hostile
   multi-tenant isolation boundary. This matches §12.5 and is repeated in the
   threat model.
+
+## 6. Post-audit remediation (18 November 2026)
+
+The adversarial audit (MWB-001 … MWB-014) found that the CLI did not expose this
+phase and that several execution guarantees were recorded but not enforced. The
+following fixes are implemented and covered by regression tests.
+
+**Environment:** Python 3.12.3, Git 2.43.0, SQLite 3.45.1.
+**Command:** `PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest --tb=no -p no:cacheprovider`
+**Result:** `191 passed in 17.69s` (whole suite).
+
+- **MWB-001** — `maya task …` and `maya worker` are registered by
+  `cli/task_commands.py`; `tests/test_task_cli.py` exercises create → start →
+  approve → run (separate worker process) → diff → review → finish, and
+  `tests/test_research_cli.py` asserts every Phase 2/3 command area is present.
+- **MWB-002** — under `DENY_BY_DEFAULT` the runner verifies a namespace with no
+  default route and **refuses to start** the command when isolation is
+  unavailable. `ALLOW_WITH_APPROVAL` is the explicit opt-in and still requires a
+  consumed `COMMAND_EXECUTION` approval.
+- **MWB-003** — the runner kills the whole process group when the leader exits
+  (not only on timeout/cancel) and records `cleanup_required`/`cleanup_succeeded`.
+- **MWB-009** — stdout/stderr are drained into bounded collectors; output beyond
+  the cap is truncated without killing a valid command or filling temporary
+  storage.
+- **MWB-010** — `resource.setrlimit` applies CPU time, address space, file size,
+  open files and a per-uid process ceiling before `exec`. If the host cannot
+  enforce limits, the command is refused rather than run unbounded. Covered by
+  `tests/test_runner_limits.py`.
+- **MWB-006** — a single `BudgetController` reserves input plus output tokens for
+  planner and implementer calls, caps the output allowance to the remaining
+  budget, and refuses calls whose price is unknown unless the contract sets
+  `allow_unknown_cost`. Unknown cost is never added as zero.
+- **MWB-007** — workspace creation records a baseline of ignored paths. New
+  ignored files created during a run are force-added to the candidate patch with
+  a warning; removed ignored paths are reported.
+- **MWB-014** — `TaskContract.research_context` pins document versions, claim IDs
+  and the claim-matrix artifact (with its SHA-256). The planner receives the
+  claim set. Migration `0004` adds the column.
+
+**Environment limitation recorded honestly:** this build host denies
+`unshare -n`, so command-execution tests use an explicit
+`network_access="ALLOW_WITH_APPROVAL"` contract. That is a deliberate contract
+choice, not a weakened assertion: the fail-closed `DENY_BY_DEFAULT` path has its
+own regression test.

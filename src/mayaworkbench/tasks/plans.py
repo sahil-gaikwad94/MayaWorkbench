@@ -30,15 +30,17 @@ from mayaworkbench.domain.models import (
     WorkflowEvent,
     WorkflowRun,
 )
-from mayaworkbench.errors import PolicyError, TaskError
+from mayaworkbench.errors import BudgetError, PolicyError, TaskError
 from mayaworkbench.ids import new_ulid
 from mayaworkbench.models.base import ChatMessage, ModelRequest
+from mayaworkbench.tasks.budget import BudgetController
 from mayaworkbench.models.gateway import ModelGateway
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.stores import (
     EventStore,
     FileStore,
     PlanStore,
+    ResearchClaimStore,
     RunStore,
 )
 from mayaworkbench.tasks.agent_models import PlanPayload
@@ -74,6 +76,7 @@ class PlanService:
         files: FileStore,
         artifacts: ArtifactStore,
         events: EventStore,
+        claims: ResearchClaimStore,
     ):
         self.settings = settings
         self.gateway = gateway
@@ -82,6 +85,7 @@ class PlanService:
         self.files = files
         self.artifacts = artifacts
         self.events = events
+        self.claims = claims
 
     def create(
         self,
@@ -150,6 +154,43 @@ class PlanService:
         )
         return plan
 
+    def _research_context(self, contract: TaskContract) -> dict[str, Any] | None:
+        """Version-pinned claims and source references for the planner."""
+        reference = contract.research_context
+        if reference is None:
+            return None
+        claims: list[dict[str, Any]] = []
+        for claim_id in reference.claim_ids[:50]:
+            try:
+                claim = self.claims.get(claim_id)
+            except Exception:  # noqa: BLE001 - a missing claim is reported below
+                claims.append({"claim_id": claim_id, "missing": True})
+                continue
+            claims.append(
+                {
+                    "claim_id": claim.id,
+                    "title": claim.title,
+                    "claim_type": claim.claim_type.value,
+                    "statement": claim.statement,
+                    "implementation_requirement": claim.implementation_requirement,
+                    "expected_code_signals": claim.expected_code_signals,
+                    "missing_details": claim.missing_details,
+                    "confidence": claim.confidence.value,
+                    "review_status": claim.review_status.value,
+                }
+            )
+        return {
+            "document_ids": reference.document_ids,
+            "claim_ids": reference.claim_ids,
+            "mapping_artifact_id": reference.mapping_artifact_id,
+            "mapping_sha256": reference.mapping_sha256,
+            "claims": claims,
+            "instruction": (
+                "Implement only the claims above. The plan summary must name the claims it "
+                "addresses and any it defers. Do not rewrite the paper's claims."
+            ),
+        }
+
     # ------------------------------------------------------------------ inputs
     def _load_file(self, plan_file: str | Path) -> PlanPayload:
         path = Path(plan_file).expanduser()
@@ -194,22 +235,43 @@ class PlanService:
             },
             "repository_inventory": inventory,
             "inventory_truncated": len(file_list) >= 400,
+            "research_context": self._research_context(contract),
         }
+        messages = [
+            ChatMessage(role="system", content=PLANNER_PROMPT),
+            ChatMessage(
+                role="user",
+                content=(
+                    "Plan this task. Context follows as JSON.\n\n"
+                    + json.dumps(prompt, ensure_ascii=False, indent=2)
+                ),
+            ),
+        ]
+        budget = BudgetController(
+            constraints=contract.constraints, run_id=run.id, runs=self.runs
+        )
+        cost_known = (
+            self.settings.model.input_cost_per_mtok is not None
+            and self.settings.model.output_cost_per_mtok is not None
+        )
+        try:
+            max_output_tokens = budget.reserve(
+                estimated_input_tokens=budget.estimate_input_tokens(
+                    "\n".join(message.content for message in messages)
+                ),
+                desired_output_tokens=min(3000, self.settings.model.max_output_tokens),
+                cost_known=cost_known,
+                input_price_per_mtok=self.settings.model.input_cost_per_mtok,
+                output_price_per_mtok=self.settings.model.output_cost_per_mtok,
+            )
+        except BudgetError as exc:
+            raise TaskError(str(exc), hint=exc.hint) from exc
         request = ModelRequest(
             purpose="task_plan",
-            messages=[
-                ChatMessage(role="system", content=PLANNER_PROMPT),
-                ChatMessage(
-                    role="user",
-                    content=(
-                        "Plan this task. Context follows as JSON.\n\n"
-                        + json.dumps(prompt, ensure_ascii=False, indent=2)
-                    ),
-                ),
-            ],
+            messages=messages,
             json_schema=PlanPayload.model_json_schema(),
             schema_name="PlanPayload",
-            max_output_tokens=min(3000, self.settings.model.max_output_tokens),
+            max_output_tokens=max_output_tokens,
         )
         response, invocation = self.gateway.structured(
             request,

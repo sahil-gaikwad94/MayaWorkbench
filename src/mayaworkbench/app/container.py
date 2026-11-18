@@ -266,6 +266,7 @@ class Services:
             files=files,
             artifacts=artifacts,
             events=events,
+            claims=claims,
         )
         workflow = WorkflowService(workflow_runs, events)
         approval_service = ApprovalService(
@@ -310,6 +311,8 @@ class Services:
             workflow=workflow,
             review_service=review_service,
             worktrees=worktrees,
+            documents=documents,
+            claims=claims,
         )
         return cls(
             paths=paths,

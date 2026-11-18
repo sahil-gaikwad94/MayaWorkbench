@@ -29,6 +29,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Better PDF text extraction (font encodings and ToUnicode maps). The builtin
+# parser remains the fallback when this extra is not installed.
+pdf = ["pypdf>=4.0,<6"]
 
 [project.scripts]
 maya = "mayaworkbench.cli.main:main"

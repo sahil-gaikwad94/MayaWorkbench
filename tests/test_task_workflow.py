@@ -23,6 +23,10 @@ def make_task(services, indexed, *, allowed=("utils.py",), max_steps=8, max_tool
             "max_tool_calls": max_tools,
             "max_model_tokens": 20_000,
             "max_runtime_seconds": 120,
+            # These tests exercise command execution. DENY_BY_DEFAULT now fails
+            # closed when the host cannot create a network namespace, so the
+            # egress allowance is an explicit contract choice.
+            "network_access": "ALLOW_WITH_APPROVAL",
         },
     )
 
@@ -303,3 +307,66 @@ def test_step_budget_blocks_and_preserves_partial_evidence(services, indexed, ta
     assert run.state == WorkflowState.BLOCKED
     assert run.error == "max_steps"
     assert services.diffs.get_by_run(run.id) is not None
+
+
+def test_contract_pins_research_context_and_rejects_foreign_claims(
+    services, indexed, paper, tmp_path
+):
+    """MWB-014: a paper-to-code task carries its exact research interpretation."""
+    summary = services.claim_service.extract(paper.document.id)
+    assert summary.claims
+    claim_id = summary.claims[0].id
+    mapping = services.mapping_service.map_project(indexed.project, indexed.snapshot)
+    task, contract = services.task_service.create_task(
+        project_id=indexed.project.id,
+        title="Implement a paper claim",
+        goal="Apply the pinned claim in utils.py",
+        task_type=TaskType.PAPER_TO_CODE,
+        snapshot_id=indexed.snapshot.id,
+        allowed_paths=["utils.py"],
+        research_document_ids=[paper.document.id],
+        claim_ids=[claim_id],
+        mapping_artifact_id=mapping.artifact_id,
+    )
+    reference = contract.research_context
+    assert reference is not None
+    assert reference.document_ids == [paper.document.id]
+    assert reference.claim_ids == [claim_id]
+    assert reference.mapping_artifact_id == mapping.artifact_id
+    assert reference.mapping_sha256
+
+    # The reference is part of the immutable contract and survives a reload.
+    reloaded = services.contracts.latest(task.id)
+    assert reloaded.research_context == reference
+
+    from mayaworkbench.domain.enums import ClaimType
+
+    other_project = services.create_project("Another Project", "isolation check")
+    foreign = services.claim_service.add_claim(
+        other_project.id,
+        claim_type=ClaimType.USER_REQUIREMENT,
+        title="Foreign requirement",
+        statement="A requirement from a different project must not be pinned.",
+        implementation_requirement="Implement it elsewhere.",
+        accept=True,
+    )
+    with pytest.raises(TaskError, match="belongs to another project"):
+        services.task_service.create_task(
+            project_id=indexed.project.id,
+            title="Foreign claim",
+            goal="Should be refused",
+            task_type=TaskType.PAPER_TO_CODE,
+            snapshot_id=indexed.snapshot.id,
+            allowed_paths=["utils.py"],
+            claim_ids=[foreign.id],
+        )
+    with pytest.raises(TaskError, match="was not found"):
+        services.task_service.create_task(
+            project_id=indexed.project.id,
+            title="Missing claim",
+            goal="Should be refused",
+            task_type=TaskType.PAPER_TO_CODE,
+            snapshot_id=indexed.snapshot.id,
+            allowed_paths=["utils.py"],
+            claim_ids=["rcl_missing"],
+        )

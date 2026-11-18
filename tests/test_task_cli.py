@@ -172,6 +172,10 @@ def test_cli_full_flow_uses_a_separate_worker_process(
                         "model": "mock-1",
                         "base_url": f"http://127.0.0.1:{mock.server.server_address[1]}/v1",
                         "api_key_env": "MAYA_MODEL_API_KEY",
+                        # The local mock states a zero price; an unknown price is
+                        # refused by the budget controller.
+                        "input_cost_per_mtok": 0.0,
+                        "output_cost_per_mtok": 0.0,
                     }
                 ),
             }
@@ -198,6 +202,8 @@ def test_cli_full_flow_uses_a_separate_worker_process(
                 "8",
                 "--max-tool-calls",
                 "20",
+                "--network",
+                "ALLOW_WITH_APPROVAL",
             ],
         )
         assert code == 0, captured.err

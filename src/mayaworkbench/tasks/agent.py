@@ -28,12 +28,13 @@ from mayaworkbench.domain.models import (
     TaskPlan,
     WorkflowRun,
 )
-from mayaworkbench.errors import ModelError, PolicyError
+from mayaworkbench.errors import BudgetError, ModelError, PolicyError
 from mayaworkbench.models.base import ChatMessage, ModelRequest
 from mayaworkbench.models.gateway import ModelGateway
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.stores import RunStore, ToolCallStore
 from mayaworkbench.tasks.agent_models import AgentAction, FinishArgs
+from mayaworkbench.tasks.budget import BudgetController
 from mayaworkbench.workspace.tools import ToolGateway
 
 MAX_OBSERVATIONS = 10
@@ -117,6 +118,9 @@ class ControlledAgent:
         self._invalid_actions = 0
         self._recent_failures: list[str] = []
         self._consecutive_failures = 0
+        self.budget = BudgetController(
+            constraints=contract.constraints, run_id=run.id, runs=runs
+        )
 
     # ------------------------------------------------------------------- loop
     def run_loop(self) -> AgentOutcome:
@@ -206,12 +210,38 @@ class ControlledAgent:
                     tokens=tokens,
                     cost_usd=cost,
                 )
+            messages = self._messages(last_error=last_error)
+            cost_known = (
+                self.settings.model.input_cost_per_mtok is not None
+                and self.settings.model.output_cost_per_mtok is not None
+            )
+            try:
+                max_output_tokens = self.budget.reserve(
+                    estimated_input_tokens=self.budget.estimate_input_tokens(
+                        "\n".join(message.content for message in messages)
+                    ),
+                    desired_output_tokens=min(2000, self.settings.model.max_output_tokens),
+                    cost_known=cost_known,
+                    input_price_per_mtok=self.settings.model.input_cost_per_mtok,
+                    output_price_per_mtok=self.settings.model.output_cost_per_mtok,
+                )
+            except BudgetError as exc:
+                return AgentOutcome(
+                    state=WorkflowState.BLOCKED,
+                    summary=str(exc),
+                    limitations=["The model budget stopped the run before the next request."],
+                    error="model_budget",
+                    steps=steps,
+                    tool_calls=current.tool_call_count,
+                    tokens=tokens,
+                    cost_usd=cost,
+                )
             request = ModelRequest(
                 purpose="task_step",
-                messages=self._messages(last_error=last_error),
+                messages=messages,
                 json_schema=AgentAction.model_json_schema(),
                 schema_name="AgentAction",
-                max_output_tokens=min(2000, self.settings.model.max_output_tokens),
+                max_output_tokens=max_output_tokens,
             )
             try:
                 response, invocation = self.gateway.structured(
@@ -238,12 +268,14 @@ class ControlledAgent:
             if used is None:
                 used = max(1, len(response.text) // 3)
             tokens += used
-            step_cost = usage.cost_usd or 0.0
-            cost += step_cost
+            # An unknown price is unknown, not zero. It is never added to the
+            # total as if it were free.
+            if usage.cost_usd is not None:
+                cost += usage.cost_usd
             self.runs.set_flags(
                 self.run.id,
                 add_tokens=used,
-                add_cost_usd=step_cost if usage.cost_usd is not None else None,
+                add_cost_usd=usage.cost_usd,
             )
             steps += 1
             self.runs.update_progress(self.run.id, step_count=steps)

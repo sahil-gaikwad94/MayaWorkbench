@@ -313,8 +313,11 @@ class EvidenceCollector:
     ) -> SpanAnalysis:
         candidate = analysis.candidate
         combined = [*declared, *derived]
-        hits = find_signal_hits(candidate.text, combined)
-        forbidden = find_signal_hits(candidate.text, claim.forbidden_code_signals)
+        language = "python" if candidate.path.endswith((".py", ".pyi")) else "text"
+        hits = find_signal_hits(candidate.text, combined, language=language)
+        forbidden = find_signal_hits(
+            candidate.text, claim.forbidden_code_signals, language=language
+        )
         analysis.matched_signals = list(dict.fromkeys(hit.signal for hit in hits))
         analysis.code_signals = list(
             dict.fromkeys(hit.signal for hit in hits if hit.is_code)

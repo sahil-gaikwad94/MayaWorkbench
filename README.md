@@ -78,15 +78,13 @@ maya model status                  # shows whether calls are permitted
 Turn a paper into reviewed, mapped claims:
 
 ```bash
-maya research add paper.pdf          # or .md/.txt, --url or --doi
-maya research extract <document>     # deterministic; --model is explicit
-maya research claim review <claim> --accept
-maya research claim add --type USER_REQUIREMENT --title "..." \
-  --expected-signal triu --expected-signal masked_fill
+maya research add paper.pdf --project research   # or .md/.txt, --url or --doi
+maya research extract <document>                 # deterministic; --model is explicit
+maya research claims --project research          # inspect extracted claims
 maya repo add /path/to/repository && maya snapshot create && maya index
-maya map                             # claim-to-code matrix with verified spans
-maya research readiness --code       # weighted risk, or INSUFFICIENT_INFORMATION
-maya research memo create --code --out memo.md
+maya map run --project research                  # claim-to-code matrix with verified spans
+maya map matrix --project research               # rebuild and inspect the matrix
+maya research memo --project research --out memo.md
 ```
 
 Every explicit claim quote is re-verified against the stored extracted text;
@@ -94,6 +92,25 @@ Every explicit claim quote is re-verified against the stored extracted text;
 definition-level span. A model, if enabled, may only adjudicate among discovered
 spans, and invalid verdicts are refused. See
 [docs/phase-2-report.md](docs/phase-2-report.md).
+
+Run one bounded engineering task in an isolated worktree:
+
+```bash
+maya task create --goal "Change count_tokens to a single split" \
+  --allow-path utils.py --network ALLOW_WITH_APPROVAL
+maya task start <task>
+maya task approve <approval>       # once per requested approval
+maya task run <task>
+maya task diff <run>
+maya task review <run>
+maya task finish <run> --accept --reason "reviewed by me"
+```
+
+`--network ALLOW_WITH_APPROVAL` is an explicit opt-in. The default,
+`DENY_BY_DEFAULT`, refuses to start a command on a host where a network
+namespace cannot be established and verified. `task finish --accept` records a
+user decision after a structural diff review; it is not deterministic
+verification (Phase 4).
 
 Include uncommitted work on purpose:
 
@@ -129,13 +146,17 @@ logs/                    optional structured logs
 | `maya symbol show` | Source, signature, docstring and relationships |
 | `maya ask` | Grounded answer or evidence digest; `--no-model`, `--budget` |
 | `maya qa list\|show` | Stored question/answer records and citations |
-| `maya research add\|list\|show` | Register document versions; inspect passages and claims |
+| `maya research add` | Register a file, URL or DOI as an immutable document version |
 | `maya research extract` | Deterministic claim extraction; `--model`, `--section`, `--force` |
-| `maya research claim add\|list\|show\|edit\|review` | Author, inspect, correct and review claims |
-| `maya research dag` | Validate claim dependencies (cycles, missing edges) |
-| `maya research readiness` | Reproduction risk factors; `--code`, `--snapshot` |
-| `maya research memo create\|list\|show` | Versioned memo; `--append`, `--deviation`, `--out` |
-| `maya map [run\|set\|show]` | Map claims to code evidence, override manually, show the matrix |
+| `maya research documents\|show\|claims` | Inspect documents, passages and extracted claims |
+| `maya research memo` | Source-linked memo and readiness; `--out`, `--deviations` |
+| `maya map run\|matrix\|claim` | Map claims to code evidence and inspect the matrix |
+| `maya task create\|list\|show` | Create a task contract; inspect tasks and runs |
+| `maya task start\|approve\|deny\|approvals` | Plan and approve write/command execution |
+| `maya task run\|status\|pause\|resume\|cancel` | Execute in the worker and control the run |
+| `maya task diff\|review\|finish` | Capture the patch, structurally review it, accept or reject |
+| `maya task cleanup\|export` | Remove the worktree or export an evidence bundle |
+| `maya worker [--once] [--run-id]` | Run the durable task worker process |
 | `maya issues` | Index issues filtered by kind or severity |
 | `maya events` | Append-only workflow event log |
 | `maya config show\|defaults\|set` | Inspect or change configuration |

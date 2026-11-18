@@ -712,24 +712,30 @@ class ToolGateway:
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
                 "cancelled": result.cancelled,
+                "blocked": result.blocked,
+                "blocked_reason": result.blocked_reason,
                 "network_isolated": result.network_isolated,
                 "network_enforcement": result.network_enforcement,
+                "limits_enforcement": result.limits_enforcement,
+                "cleanup_required": result.cleanup_required,
+                "cleanup_succeeded": result.cleanup_succeeded,
                 "env_names": result.env_names,
                 "output_truncated": result.output_truncated,
             }
         )
         self.calls.note(call.id, details=details)
-        status = (
-            ToolCallStatus.TIMED_OUT
-            if result.timed_out
-            else ToolCallStatus.FAILED
-            if result.exit_code not in (0, None)
-            else ToolCallStatus.SUCCEEDED
-        )
-        if result.cancelled:
+        if result.blocked:
+            status = ToolCallStatus.BLOCKED
+        elif result.timed_out:
+            status = ToolCallStatus.TIMED_OUT
+        elif result.cancelled or result.exit_code not in (0, None):
             status = ToolCallStatus.FAILED
+        else:
+            status = ToolCallStatus.SUCCEEDED
         summary = (
-            "Command timed out"
+            f"Command blocked: {result.blocked_reason}"
+            if result.blocked
+            else "Command timed out"
             if result.timed_out
             else "Command cancelled"
             if result.cancelled
@@ -745,8 +751,13 @@ class ToolGateway:
             data={
                 "timed_out": result.timed_out,
                 "cancelled": result.cancelled,
+                "blocked": result.blocked,
+                "blocked_reason": result.blocked_reason,
                 "network_isolated": result.network_isolated,
                 "network_enforcement": result.network_enforcement,
+                "limits_enforcement": result.limits_enforcement,
+                "cleanup_required": result.cleanup_required,
+                "cleanup_succeeded": result.cleanup_succeeded,
                 "output_truncated": result.output_truncated,
             },
         )
@@ -764,7 +775,9 @@ class ToolGateway:
             f"exit: {result.exit_code}\n"
             f"duration_ms: {result.duration_ms}\n"
             f"timed_out: {result.timed_out}\n"
+            f"blocked: {result.blocked}\n"
             f"network_enforcement: {result.network_enforcement}\n"
+            f"limits_enforcement: {result.limits_enforcement}\n"
             f"--- stdout ---\n{result.stdout}\n"
             f"--- stderr ---\n{result.stderr}"
             + ("\n[output truncated]" if result.output_truncated else "")

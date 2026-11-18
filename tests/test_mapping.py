@@ -455,3 +455,48 @@ def test_model_must_be_callable_when_requested(indexed):
     outcome = services.mapping_service.map_claim(claim, indexed.snapshot, use_model=True)
     assert outcome.model_used is False
     assert any("model unavailable" in note for note in outcome.notes)
+
+
+# --------------------------------------------------- adversarial regressions
+def test_inline_comment_is_not_executable_evidence():
+    """MWB-005: a signal after `#` on a code line must not count as code."""
+    from mayaworkbench.mapping.signals import find_signal_hits
+
+    text = "value = 1  # required_mask\nother = 2  # triu is mentioned here\n"
+    hits = find_signal_hits(text, ["required_mask", "triu"])
+    assert {hit.signal for hit in hits} == {"required_mask", "triu"}
+    assert all(not hit.is_code for hit in hits)
+
+    executable = find_signal_hits("required_mask = 1\n", ["required_mask"])
+    assert executable and executable[0].is_code
+
+
+def test_docstrings_strings_and_fstrings_are_not_executable_evidence():
+    from mayaworkbench.mapping.signals import find_signal_hits
+
+    text = (
+        '"""required_mask is described here."""\n'
+        "label = 'required_mask'\n"
+        "message = f\"required_mask\"\n"
+        "value = required_mask\n"
+    )
+    hits = find_signal_hits(text, ["required_mask"])
+    kinds = {hit.line_no: hit.kind for hit in hits}
+    assert kinds[1] != "code"  # docstring
+    assert kinds[2] != "code"  # string literal
+    assert kinds[3] != "code"  # f-string
+    assert kinds[4] == "code"
+
+
+def test_scattered_signals_do_not_produce_present(indexed):
+    """MWB-005: signals in unrelated definitions are not a coherent mapping."""
+    services = indexed.services
+    claim = user_claim(
+        services,
+        indexed.project,
+        title="Two signals in unrelated definitions",
+        signals=["triu", "Embedding"],
+    )
+    outcome = services.mapping_service.map_claim(claim, indexed.snapshot)
+    assert outcome.mapping.status is not ClaimMappingStatus.PRESENT
+    assert outcome.mapping.status is ClaimMappingStatus.PARTIAL

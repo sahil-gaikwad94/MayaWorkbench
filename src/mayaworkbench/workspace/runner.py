@@ -2,10 +2,10 @@
 
 There is no shell. Commands are argument arrays, executed in the isolated
 worktree with a minimal environment, a bounded wall clock, bounded output and
-best-effort network isolation. This is a local developer boundary, not a
-hostile multi-tenant sandbox: repository code runs with the user's privileges
-and can still read files the user can read. The implementation makes that
-limitation explicit in every result rather than implying stronger isolation.
+OS-enforced resource limits. This is a local developer boundary, not a hostile
+multi-tenant sandbox: repository code runs with the user's privileges and can
+still read files the user can read. The implementation makes that limitation
+explicit in every result rather than implying stronger isolation.
 
 Safety properties actually enforced here:
 
@@ -14,10 +14,16 @@ Safety properties actually enforced here:
 * cwd fixed to the workspace;
 * environment allowlist (no provider keys, no user HOME);
 * wall-clock timeout with process-group termination;
-* output caps and truncation flags;
+* the whole process group is terminated when the leader exits, so children
+  cannot outlive the command;
+* bounded streaming output that is truncated, never used as a kill signal;
 * dependency installation refused;
 * absolute paths outside the workspace refused;
-* network namespace isolation when the host supports it, recorded otherwise.
+* network namespace isolation when the host supports it. Under
+  ``DENY_BY_DEFAULT`` the runner **fails closed**: if isolation cannot be
+  established *and verified*, the command is not started;
+* OS resource limits (CPU time, address space, file size, open files and new
+  processes) applied through ``resource.setrlimit`` before ``exec``.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,10 +42,35 @@ from typing import Callable
 from mayaworkbench.domain.models import TaskConstraints
 from mayaworkbench.errors import PolicyError
 
+try:  # POSIX only; Windows has no resource module.
+    import resource  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - exercised only on Windows
+    resource = None  # type: ignore[assignment]
+
 DEFAULT_EXECUTABLES = ("python", "python3", "pytest", "ruff", "mypy")
 MAX_ARGS = 64
 MAX_ARG_LENGTH = 4096
 MAX_TOTAL_ARG_BYTES = 16_384
+OUTPUT_READ_CHUNK = 65_536
+
+#: A netns probe that succeeds only when the namespace has no default route.
+#: `/proc/net/route` is per-network-namespace, so this verifies the child
+#: namespace rather than assuming that ``unshare`` itself worked.
+_NETWORK_PROBE = r"""
+import sys
+
+try:
+    with open("/proc/net/route", encoding="ascii", errors="replace") as handle:
+        rows = handle.readlines()[1:]
+except OSError:
+    sys.exit(4)
+
+for row in rows:
+    fields = row.split()
+    if len(fields) > 2 and fields[1] == "00000000" and fields[2] == "00000000":
+        sys.exit(3)
+sys.exit(0)
+"""
 
 
 @dataclass(frozen=True)
@@ -50,6 +81,10 @@ class CommandPolicy:
     allowed_executables: tuple[str, ...] = DEFAULT_EXECUTABLES
     max_runtime_seconds: int = 1800
     max_output_bytes: int = 200_000
+    memory_limit_mb: int = 4096
+    max_processes: int = 128
+    max_open_files: int = 1024
+    max_file_size_mb: int = 256
 
     @classmethod
     def from_constraints(cls, constraints: TaskConstraints) -> "CommandPolicy":
@@ -69,6 +104,10 @@ class CommandPolicy:
             "allowed_executables": list(self.allowed_executables),
             "max_runtime_seconds": self.max_runtime_seconds,
             "max_output_bytes": self.max_output_bytes,
+            "memory_limit_mb": self.memory_limit_mb,
+            "max_processes": self.max_processes,
+            "max_open_files": self.max_open_files,
+            "max_file_size_mb": self.max_file_size_mb,
             "shell": False,
         }
 
@@ -83,14 +122,24 @@ class CommandResult:
     timed_out: bool
     output_truncated: bool
     cancelled: bool = False
+    blocked: bool = False
+    blocked_reason: str | None = None
     network_isolated: bool = False
     network_enforcement: str = "unavailable"
+    limits_enforcement: str = "unavailable"
+    cleanup_required: bool = False
+    cleanup_succeeded: bool = True
     env_names: list[str] = field(default_factory=list)
     cwd: str = ""
 
     @property
     def succeeded(self) -> bool:
-        return self.exit_code == 0 and not self.timed_out and not self.cancelled
+        return (
+            not self.blocked
+            and self.exit_code == 0
+            and not self.timed_out
+            and not self.cancelled
+        )
 
 
 class CommandRunner:
@@ -101,7 +150,7 @@ class CommandRunner:
         self.run_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._tmp = self.run_home / "tmp"
         self._tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._network_supported: bool | None = None
+        self._network_state: tuple[bool, str] | None = None
 
     # ------------------------------------------------------------------ policy
     def validate(self, argv: list[str], *, timeout_seconds: int) -> list[str]:
@@ -159,7 +208,6 @@ class CommandRunner:
         executable = Path(argv[0]).name
         notes: list[str] = []
         if executable in {"python", "python3"}:
-            base = Path(sys.executable).name
             if Path(sys.executable).resolve() != Path(shutil.which(executable) or "").resolve():
                 notes.append(f"{executable} resolved to the MayaWorkbench interpreter")
             return [sys.executable, *argv[1:]], notes
@@ -196,22 +244,101 @@ class CommandRunner:
         }
         return env
 
-    def _network_isolation(self) -> bool:
-        if self._network_supported is None:
-            if self.policy.network_policy != "DENY_BY_DEFAULT":
-                self._network_supported = False
-            elif not shutil.which("unshare"):
-                self._network_supported = False
-            else:
-                probe = subprocess.run(
-                    ["unshare", "-n", "true"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                    check=False,
+    # -------------------------------------------------------- network isolation
+    def _network_isolation(self) -> tuple[bool, str]:
+        """Return ``(isolated, reason)`` and cache the probe result.
+
+        ``DENY_BY_DEFAULT`` is a real contract: when the host cannot put the
+        child in a namespace with no default route, the runner refuses to start
+        the command instead of silently allowing egress.
+        """
+        if self._network_state is not None:
+            return self._network_state
+        if self.policy.network_policy != "DENY_BY_DEFAULT":
+            self._network_state = (False, "not_requested")
+            return self._network_state
+        unshare = shutil.which("unshare")
+        if not unshare:
+            self._network_state = (False, "unshare is not installed on this host")
+            return self._network_state
+        try:
+            probe = subprocess.run(
+                [unshare, "-n", sys.executable, "-c", _NETWORK_PROBE],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._network_state = (False, f"network-isolation probe failed: {exc}")
+            return self._network_state
+        if probe.returncode != 0:
+            detail = (probe.stderr or b"").decode("utf-8", errors="replace").strip()
+            reason = {
+                3: "the isolated namespace still has a default route",
+                4: "the isolated namespace could not be inspected",
+            }.get(probe.returncode, detail or f"probe exited {probe.returncode}")
+            self._network_state = (False, f"network isolation unavailable: {reason}")
+            return self._network_state
+        self._network_state = (True, "network_namespace")
+        return self._network_state
+
+    # ---------------------------------------------------------- resource limits
+    def _limits_available(self) -> bool:
+        return (
+            resource is not None
+            and sys.platform.startswith(("linux", "darwin", "freebsd"))
+            and hasattr(resource, "setrlimit")
+        )
+
+    def _process_headroom(self) -> int | None:
+        """A per-uid process ceiling that leaves room for the command itself.
+
+        ``RLIMIT_NPROC`` counts every process of the real uid, so a small fixed
+        value can prevent the child from starting at all on a busy host. Using
+        the current count plus the policy allowance keeps fork-bomb protection
+        real without breaking ordinary builds.
+        """
+        if self.policy.max_processes <= 0:
+            return None
+        try:
+            current = len(os.listdir("/proc"))
+        except OSError:
+            current = 0
+        return max(1, current + self.policy.max_processes)
+
+    def _preexec(self, *, cpu_seconds: int, nproc: int | None):  # type: ignore[no-untyped-def]
+        def apply() -> None:  # pragma: no cover - runs in the forked child
+            try:
+                resource.setrlimit(
+                    resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1)
                 )
-                self._network_supported = probe.returncode == 0
-        return bool(self._network_supported)
+            except (ValueError, OSError):
+                pass
+            memory = self.policy.memory_limit_mb * 1024 * 1024
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+            except (ValueError, OSError):
+                pass
+            try:
+                resource.setrlimit(
+                    resource.RLIMIT_NOFILE,
+                    (self.policy.max_open_files, self.policy.max_open_files),
+                )
+            except (ValueError, OSError):
+                pass
+            file_size = self.policy.max_file_size_mb * 1024 * 1024
+            try:
+                resource.setrlimit(resource.RLIMIT_FSIZE, (file_size, file_size))
+            except (ValueError, OSError):
+                pass
+            if nproc is not None and hasattr(resource, "RLIMIT_NPROC"):
+                try:
+                    resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
+                except (ValueError, OSError):
+                    pass
+
+        return apply
 
     # ---------------------------------------------------------------- execution
     def run(
@@ -223,103 +350,226 @@ class CommandRunner:
         on_start: Callable[[int, list[str]], None] | None = None,
     ) -> CommandResult:
         validated = self.validate(argv, timeout_seconds=timeout_seconds)
-        resolved, notes = self._resolve_argv(validated)
+        resolved, _notes = self._resolve_argv(validated)
         env = self._environment()
-        network_isolated = self._network_isolation()
-        if network_isolated:
-            resolved = ["unshare", "-n", "--", *resolved]
         started = time.monotonic()
-        with tempfile.TemporaryFile(dir=self._tmp) as stdout_file, tempfile.TemporaryFile(
-            dir=self._tmp
-        ) as stderr_file:
-            try:
-                process = subprocess.Popen(
-                    resolved,
-                    cwd=str(self.workspace),
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    shell=False,
-                    start_new_session=True,
-                )
-            except OSError as exc:
-                raise PolicyError(f"Could not start command: {exc}") from exc
-            if on_start is not None:
-                on_start(process.pid, resolved)
-            timed_out = False
-            cancelled = False
-            deadline = started + timeout_seconds
-            while process.poll() is None:
-                if cancel_requested is not None and cancel_requested():
-                    cancelled = True
-                    self._terminate(process)
-                    break
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    self._terminate(process)
-                    break
-                if self._output_size(stdout_file) + self._output_size(stderr_file) > (
-                    self.policy.max_output_bytes * 2
-                ):
-                    self._terminate(process)
-                    break
-                time.sleep(0.05)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:  # pragma: no cover - kill already sent
-                self._terminate(process)
-                process.wait(timeout=5)
-            duration_ms = int((time.monotonic() - started) * 1000)
-            stdout, stdout_truncated = self._read_capped(stdout_file)
-            stderr, stderr_truncated = self._read_capped(stderr_file)
 
-        enforcement = (
-            "network_namespace"
-            if network_isolated
-            else (
-                "not_requested"
-                if self.policy.network_policy != "DENY_BY_DEFAULT"
-                else "unavailable"
+        network_isolated, network_reason = self._network_isolation()
+        if self.policy.network_policy == "DENY_BY_DEFAULT" and not network_isolated:
+            return self._blocked_result(
+                validated,
+                f"Command refused: network policy is DENY_BY_DEFAULT and {network_reason}.",
+                started=started,
+                env=env,
             )
+        if network_isolated:
+            resolved = [shutil.which("unshare") or "unshare", "-n", "--", *resolved]
+
+        limits_available = self._limits_available()
+        if not limits_available:
+            return self._blocked_result(
+                validated,
+                "Command refused: this host cannot enforce OS resource limits "
+                "(CPU, memory, file size, open files, process count).",
+                started=started,
+                env=env,
+                network=(network_isolated, network_reason),
+            )
+
+        preexec = self._preexec(
+            cpu_seconds=max(1, int(timeout_seconds) + 5),
+            nproc=self._process_headroom(),
         )
+        try:
+            process = subprocess.Popen(
+                resolved,
+                cwd=str(self.workspace),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+                preexec_fn=preexec,
+            )
+        except OSError as exc:
+            raise PolicyError(f"Could not start command: {exc}") from exc
+        if on_start is not None:
+            on_start(process.pid, resolved)
+
+        # ``start_new_session`` makes the leader the process-group id, so the
+        # group can still be addressed after the leader has been reaped.
+        pgid = process.pid
+        cap = self.policy.max_output_bytes
+        stdout_state = _Capture(cap)
+        stderr_state = _Capture(cap)
+        readers = [
+            threading.Thread(
+                target=_drain,
+                args=(process.stdout, stdout_state),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drain,
+                args=(process.stderr, stderr_state),
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        timed_out = False
+        cancelled = False
+        deadline = started + timeout_seconds
+        while process.poll() is None:
+            if cancel_requested is not None and cancel_requested():
+                cancelled = True
+                self._kill_group(process.pid)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                self._kill_group(process.pid)
+                break
+            time.sleep(0.05)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - kill already sent
+            self._kill_group(process.pid)
+            process.wait(timeout=10)
+
+        # The leader exiting must not leave descendants behind: a command could
+        # start a server or daemon and return immediately.
+        cleanup_required, cleanup_succeeded = self._cleanup_descendants(pgid)
+
+        for reader in readers:
+            reader.join(timeout=5)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()  # type: ignore[union-attr]
+            except OSError:  # pragma: no cover
+                pass
+
         return CommandResult(
             argv=validated,
             exit_code=None if timed_out or cancelled else process.returncode,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=stdout_state.text(),
+            stderr=stderr_state.text(),
             duration_ms=duration_ms,
             timed_out=timed_out,
-            output_truncated=stdout_truncated or stderr_truncated,
+            output_truncated=stdout_state.truncated or stderr_state.truncated,
             cancelled=cancelled,
             network_isolated=network_isolated,
-            network_enforcement=enforcement,
+            network_enforcement=network_reason,
+            limits_enforcement="rlimit",
+            cleanup_required=cleanup_required,
+            cleanup_succeeded=cleanup_succeeded,
             env_names=sorted(env),
             cwd=str(self.workspace),
         )
 
-    def _output_size(self, handle) -> int:  # type: ignore[no-untyped-def]
-        try:
-            return os.fstat(handle.fileno()).st_size
-        except OSError:  # pragma: no cover
-            return 0
+    def _blocked_result(
+        self,
+        argv: list[str],
+        reason: str,
+        *,
+        started: float,
+        env: dict[str, str],
+        network: tuple[bool, str] | None = None,
+    ) -> CommandResult:
+        isolated, enforcement = network or (False, "unavailable")
+        return CommandResult(
+            argv=argv,
+            exit_code=None,
+            stdout="",
+            stderr=reason,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            timed_out=False,
+            output_truncated=False,
+            blocked=True,
+            blocked_reason=reason,
+            network_isolated=isolated,
+            network_enforcement=enforcement,
+            limits_enforcement="not_applied",
+            env_names=sorted(env),
+            cwd=str(self.workspace),
+        )
 
-    def _read_capped(self, handle) -> tuple[str, bool]:  # type: ignore[no-untyped-def]
-        handle.flush()
-        handle.seek(0)
-        data = handle.read(self.policy.max_output_bytes + 1)
-        truncated = len(data) > self.policy.max_output_bytes
-        data = data[: self.policy.max_output_bytes]
-        return data.decode("utf-8", errors="replace"), truncated
-
-    def _terminate(self, process: subprocess.Popen) -> None:
+    # ------------------------------------------------------------- lifecycle
+    def _kill_group(self, pid: int) -> None:
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             try:
-                process.kill()
+                os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:  # pragma: no cover
                 pass
+
+    def _cleanup_descendants(self, pgid: int) -> tuple[bool, bool]:
+        """Kill any process group members that survived the leader.
+
+        Returns ``(cleanup_required, cleanup_succeeded)``. The leader itself has
+        been reaped, so a live group can only contain descendants.
+        """
+        alive = _group_alive(pgid)
+        if not alive:
+            return False, True
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for _ in range(40):
+            if not _group_alive(pgid):
+                return True, True
+            time.sleep(0.05)
+        return True, not _group_alive(pgid)
+
+
+class _Capture:
+    """Bounded byte collector that never blocks the child's pipes."""
+
+    __slots__ = ("cap", "buffer", "total", "truncated", "lock")
+
+    def __init__(self, cap: int):
+        self.cap = max(0, cap)
+        self.buffer = bytearray()
+        self.total = 0
+        self.truncated = False
+        self.lock = threading.Lock()
+
+    def append(self, chunk: bytes) -> None:
+        with self.lock:
+            self.total += len(chunk)
+            remaining = self.cap - len(self.buffer)
+            if remaining > 0:
+                self.buffer.extend(chunk[:remaining])
+            if len(chunk) > max(0, remaining):
+                self.truncated = True
+
+    def text(self) -> str:
+        with self.lock:
+            return bytes(self.buffer).decode("utf-8", errors="replace")
+
+
+def _drain(stream, capture: _Capture) -> None:  # type: ignore[no-untyped-def]
+    try:
+        while True:
+            chunk = stream.read(OUTPUT_READ_CHUNK)
+            if not chunk:
+                break
+            capture.append(chunk)
+    except (OSError, ValueError):  # pragma: no cover - closed pipe on kill
+        return
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - group exists but is foreign
+        return True
+    return True
 
 
 __all__ = ["CommandPolicy", "CommandResult", "CommandRunner", "DEFAULT_EXECUTABLES"]

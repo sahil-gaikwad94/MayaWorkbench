@@ -654,6 +654,22 @@ class TaskConstraints(Record):
     max_tool_calls: int = Field(default=120, ge=1, le=1000)
     max_output_bytes: int = Field(default=200_000, ge=1024, le=10_000_000)
     allow_file_deletion: bool = False
+    # An unknown model price is not zero. Set this only when the user accepts
+    # spend that the contract cannot bound.
+    allow_unknown_cost: bool = False
+
+
+class ResearchContextRef(Record):
+    """Version-pinned research interpretation a task implements (MWB-014).
+
+    Stored on the contract so a paper-to-code task can be reconstructed from the
+    contract alone: exact document versions, claim graph and mapping artifact.
+    """
+
+    document_ids: list[str] = Field(default_factory=list)
+    claim_ids: list[str] = Field(default_factory=list)
+    mapping_artifact_id: str | None = None
+    mapping_sha256: str | None = None
 
 
 class TaskContract(Record):
@@ -671,6 +687,7 @@ class TaskContract(Record):
     constraints: TaskConstraints = Field(default_factory=TaskConstraints)
     acceptance_criteria: list[str] = Field(min_length=1)
     unknowns: list[str] = Field(default_factory=list)
+    research_context: ResearchContextRef | None = None
     required_approvals: list[ApprovalAction] = Field(
         default_factory=lambda: [ApprovalAction.WRITE_ACCESS, ApprovalAction.COMMAND_EXECUTION]
     )

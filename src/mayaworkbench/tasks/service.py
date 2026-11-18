@@ -38,6 +38,7 @@ from mayaworkbench.domain.models import (
     ExecutionWorkspace,
     Repository,
     RepositorySnapshot,
+    ResearchContextRef,
     Task,
     TaskConstraints,
     TaskContract,
@@ -68,6 +69,8 @@ from mayaworkbench.storage.stores import (
     PlanStore,
     ProjectStore,
     RepositoryStore,
+    ResearchClaimStore,
+    ResearchDocumentStore,
     ReviewStore,
     RunStore,
     SnapshotStore,
@@ -134,6 +137,8 @@ class TaskService:
         workflow: WorkflowService,
         review_service: ReviewService,
         worktrees: WorktreeManager,
+        documents: ResearchDocumentStore,
+        claims: ResearchClaimStore,
     ):
         self.paths = paths
         self.settings = settings
@@ -160,6 +165,8 @@ class TaskService:
         self.workflow = workflow
         self.review_service = review_service
         self.worktrees = worktrees
+        self.documents = documents
+        self.claims = claims
 
     # ------------------------------------------------------------------ create
     def create_task(
@@ -176,6 +183,9 @@ class TaskService:
         constraints: dict[str, Any] | None = None,
         unknowns: list[str] | None = None,
         required_approvals: list[ApprovalAction] | None = None,
+        research_document_ids: list[str] | None = None,
+        claim_ids: list[str] | None = None,
+        mapping_artifact_id: str | None = None,
         created_by: str = "local-user",
     ) -> tuple[Task, TaskContract]:
         project = self.projects.get(project_id)
@@ -224,6 +234,12 @@ class TaskService:
                 "READ_ONLY/STATIC_ANALYSIS profiles cannot require command execution approval"
             )
 
+        research_context = self._build_research_context(
+            project=project,
+            document_ids=research_document_ids or [],
+            claim_ids=claim_ids or [],
+            mapping_artifact_id=mapping_artifact_id,
+        )
         task = Task(
             id="task_" + new_ulid(),
             project_id=project.id,
@@ -245,6 +261,9 @@ class TaskService:
             "constraints": parsed_constraints.model_dump(mode="json"),
             "acceptance_criteria": criteria,
             "unknowns": unknowns or [],
+            "research_context": (
+                research_context.model_dump(mode="json") if research_context else None
+            ),
             "required_approvals": [action.value for action in approvals],
             "contract_version": "1.0",
         }
@@ -261,6 +280,7 @@ class TaskService:
             constraints=parsed_constraints,
             acceptance_criteria=criteria,
             unknowns=unknowns or [],
+            research_context=research_context,
             required_approvals=approvals,
             content_sha256=canonical_sha256(payload),
             created_by=created_by,
@@ -310,6 +330,58 @@ class TaskService:
                 },
             )
         return task, contract
+
+    def _build_research_context(
+        self,
+        *,
+        project,  # type: ignore[no-untyped-def]
+        document_ids: list[str],
+        claim_ids: list[str],
+        mapping_artifact_id: str | None,
+    ) -> ResearchContextRef | None:
+        """Validate and pin the research interpretation a task implements."""
+        if not document_ids and not claim_ids and not mapping_artifact_id:
+            return None
+        resolved_documents: list[str] = []
+        for document_id in document_ids:
+            try:
+                document = self.documents.get(document_id)
+            except NotFoundError as exc:
+                raise TaskError(
+                    f"Research document {document_id} was not found"
+                ) from exc
+            if document.project_id != project.id:
+                raise TaskError(
+                    f"Research document {document_id} belongs to another project"
+                )
+            resolved_documents.append(document.id)
+        resolved_claims: list[str] = []
+        for claim_id in claim_ids:
+            try:
+                claim = self.claims.get(claim_id)
+            except NotFoundError as exc:
+                raise TaskError(f"Research claim {claim_id} was not found") from exc
+            if claim.project_id != project.id:
+                raise TaskError(f"Research claim {claim_id} belongs to another project")
+            if document_ids and claim.document_id and claim.document_id not in document_ids:
+                raise TaskError(
+                    f"Research claim {claim_id} comes from a document outside the pinned set"
+                )
+            resolved_claims.append(claim.id)
+        mapping_sha256: str | None = None
+        if mapping_artifact_id:
+            artifact = self.artifacts.get(mapping_artifact_id)
+            if artifact.kind is not ArtifactKind.CLAIM_MATRIX:
+                raise TaskError(
+                    f"Artifact {mapping_artifact_id} is not a claim-to-code matrix"
+                )
+            mapping_sha256 = artifact.sha256
+        return ResearchContextRef(
+            document_ids=resolved_documents,
+            claim_ids=resolved_claims,
+            mapping_artifact_id=mapping_artifact_id,
+            mapping_sha256=mapping_sha256,
+        )
 
     # ------------------------------------------------------------------- start
     def start_task(

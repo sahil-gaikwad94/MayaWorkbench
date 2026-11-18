@@ -27,7 +27,19 @@ from mayaworkbench.errors import ExtractionError
 
 #: Marker prefixed to tool names so a memo can state exactly what produced its quotes.
 BUILTIN_TOOL = "maya-pdf-text"
-BUILTIN_VERSION = "1.0.0"
+BUILTIN_VERSION = "1.1.0"
+
+#: Resource ceilings for untrusted PDF structure. A small compressed stream can
+#: expand enormously, so decoding is incremental and stops at the byte budget.
+MAX_STREAM_BYTES = 32 * 1024 * 1024
+MAX_OBJECT_STREAMS = 256
+MAX_PAGES = 5000
+MAX_CHARS_PER_PAGE = 200_000
+MAX_TOTAL_CHARS = 5_000_000
+
+
+class _StreamTooLarge(Exception):
+    """A compressed stream exceeded the bounded decompression budget."""
 
 _OBJ_RE = re.compile(rb"(?<![0-9])(\d+)\s+(\d+)\s+obj\b(.*?)\bendobj", re.S)
 _STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\n?endstream", re.S)
@@ -117,18 +129,39 @@ def _extract_with_pypdf(pypdf, data: bytes) -> PdfExtraction:  # type: ignore[no
             ) from exc
 
     pages: list[PdfPage] = []
+    total_chars = 0
     for index, page in enumerate(reader.pages, start=1):
+        if index > MAX_PAGES:
+            warnings.append(
+                f"The PDF has more than {MAX_PAGES} pages; later pages were not extracted."
+            )
+            break
         page_warnings: list[str] = []
         try:
             text = page.extract_text() or ""
         except Exception as exc:  # noqa: BLE001
             text = ""
             page_warnings.append(f"Page {index} could not be extracted: {exc}")
-        if not text.strip():
+        cleaned = clean_pdf_text(text)
+        if len(cleaned) > MAX_CHARS_PER_PAGE:
+            cleaned = cleaned[:MAX_CHARS_PER_PAGE]
+            page_warnings.append(
+                f"Page {index} exceeded the {MAX_CHARS_PER_PAGE}-character per-page "
+                "extraction budget and was truncated."
+            )
+        total_chars += len(cleaned)
+        if total_chars > MAX_TOTAL_CHARS:
+            warnings.append(
+                f"Extraction stopped after {MAX_TOTAL_CHARS} characters; later pages were "
+                "not read."
+            )
+            pages.append(PdfPage(index, cleaned, page_warnings))
+            break
+        if not cleaned.strip():
             page_warnings.append(
                 f"Page {index} produced no text; it may be a scanned image or empty."
             )
-        pages.append(PdfPage(index, clean_pdf_text(text), page_warnings))
+        pages.append(PdfPage(index, cleaned, page_warnings))
 
     metadata: dict[str, str] = {}
     info = getattr(reader, "metadata", None)
@@ -158,16 +191,22 @@ def _extract_with_pypdf(pypdf, data: bytes) -> PdfExtraction:  # type: ignore[no
 
 # ------------------------------------------------------------------------- builtin
 def _extract_builtin(data: bytes) -> PdfExtraction:
-    objects = _parse_objects(data)
+    warnings: list[str] = []
+    objects = _parse_objects(data, warnings)
     if not objects:
         raise ExtractionError(
             "No PDF objects could be parsed",
             hint="The file may be truncated or use an unsupported PDF structure.",
         )
-    warnings: list[str] = []
     page_refs = _page_order(objects)
     if not page_refs:
         raise ExtractionError("No PDF pages were found in this file")
+    if len(page_refs) > MAX_PAGES:
+        warnings.append(
+            f"The PDF declares {len(page_refs)} pages; only the first {MAX_PAGES} were "
+            "inspected."
+        )
+        page_refs = page_refs[:MAX_PAGES]
 
     # Document-level encoding signal: Type0 fonts without ToUnicode usually mean
     # glyph ids rather than characters, which the builtin decoder cannot map.
@@ -179,11 +218,26 @@ def _extract_builtin(data: bytes) -> PdfExtraction:
 
     pages: list[PdfPage] = []
     seen_encodings: set[str] = set()
+    total_chars = 0
     for index, reference in enumerate(page_refs, start=1):
         body = objects.get(reference, b"")
-        content = _page_content(body, objects)
+        content = _page_content(body, objects, warnings)
         page_warnings: list[str] = []
         text = clean_pdf_text(_content_stream_to_text(content, page_warnings))
+        if len(text) > MAX_CHARS_PER_PAGE:
+            text = text[:MAX_CHARS_PER_PAGE]
+            page_warnings.append(
+                f"Page {index} exceeded the {MAX_CHARS_PER_PAGE}-character per-page "
+                "extraction budget and was truncated."
+            )
+        total_chars += len(text)
+        if total_chars > MAX_TOTAL_CHARS:
+            warnings.append(
+                f"Extraction stopped after {MAX_TOTAL_CHARS} characters; later pages were "
+                "not read."
+            )
+            pages.append(PdfPage(index, text, page_warnings))
+            break
         if not text.strip():
             if b"/XObject" in body:
                 page_warnings.append(
@@ -206,15 +260,30 @@ def _extract_builtin(data: bytes) -> PdfExtraction:
     )
 
 
-def _parse_objects(data: bytes) -> dict[int, bytes]:
+def _parse_objects(data: bytes, warnings: list[str] | None = None) -> dict[int, bytes]:
+    warnings = warnings if warnings is not None else []
     objects: dict[int, bytes] = {}
     for match in _OBJ_RE.finditer(data):
         objects[int(match.group(1))] = match.group(3)
     # PDF 1.5+ object streams: recover objects that only exist compressed.
+    object_streams = 0
     for body in list(objects.values()):
         if b"/ObjStm" not in body:
             continue
-        payload = _stream_payload(body)
+        object_streams += 1
+        if object_streams > MAX_OBJECT_STREAMS:
+            warnings.append(
+                f"The PDF has more than {MAX_OBJECT_STREAMS} object streams; later object "
+                "streams were not decoded."
+            )
+            break
+        try:
+            payload = _stream_payload(body)
+        except _StreamTooLarge:
+            warnings.append(
+                "An object stream exceeded the bounded decompression budget and was skipped."
+            )
+            continue
         if payload is None:
             continue
         try:
@@ -260,17 +329,50 @@ def _stream_payload(body: bytes) -> bytes | None:
     dictionary = body[: stream.start()]
     payload = stream.group(1)
     filters = re.findall(rb"/(\w*Decode)\b", dictionary)
+    budget = MAX_STREAM_BYTES
     for name in filters:
         if name != b"FlateDecode":
             return None
-        try:
-            payload = zlib.decompress(payload)
-        except zlib.error:
-            try:
-                payload = zlib.decompressobj().decompress(payload)
-            except zlib.error:
-                return None
+        decoded = _bounded_flate(payload, limit=budget)
+        if decoded is None:
+            return None
+        payload = decoded
+        budget = max(0, budget - len(payload))
     return payload
+
+
+def _bounded_flate(payload: bytes, *, limit: int = MAX_STREAM_BYTES) -> bytes | None:
+    """Inflate with a hard output budget.
+
+    ``zlib.decompress`` allocates the entire output before returning, which is
+    how a tiny stream becomes hundreds of megabytes. Incremental decompression
+    stops as soon as the budget is crossed and raises :class:`_StreamTooLarge`.
+    """
+    if limit <= 0:
+        raise _StreamTooLarge()
+    decompressor = zlib.decompressobj()
+    output = bytearray()
+    chunk = payload
+    while True:
+        try:
+            part = decompressor.decompress(chunk, limit + 1 - len(output))
+        except zlib.error:
+            return None
+        output.extend(part)
+        if len(output) > limit:
+            raise _StreamTooLarge()
+        if not decompressor.unconsumed_tail:
+            break
+        if len(output) >= limit:
+            raise _StreamTooLarge()
+        chunk = decompressor.unconsumed_tail
+    try:
+        output.extend(decompressor.flush(max(0, limit + 1 - len(output))))
+    except zlib.error:
+        return None
+    if len(output) > limit:
+        raise _StreamTooLarge()
+    return bytes(output)
 
 
 def _resolve(value: bytes, objects: dict[int, bytes], depth: int = 0) -> bytes | None:
@@ -313,18 +415,35 @@ def _walk_pages(number: int, objects: dict[int, bytes], order: list[int], seen: 
         _walk_pages(int(match.group(1)), objects, order, seen)
 
 
-def _page_content(body: bytes, objects: dict[int, bytes]) -> bytes:
+def _page_content(
+    body: bytes, objects: dict[int, bytes], warnings: list[str] | None = None
+) -> bytes:
+    warnings = warnings if warnings is not None else []
     direct = re.search(rb"/Contents\s*\[(.*?)\]", body, re.S)
     content = b""
     if direct is not None:
         for match in _REF_RE.finditer(direct.group(1)):
-            payload = _stream_payload(objects.get(int(match.group(1)), b""))
+            try:
+                payload = _stream_payload(objects.get(int(match.group(1)), b""))
+            except _StreamTooLarge:
+                warnings.append(
+                    "A page content stream exceeded the bounded decompression budget and "
+                    "was skipped."
+                )
+                continue
             if payload:
                 content += payload + b"\n"
         return content
     single = re.search(rb"/Contents\s+(\d+)\s+0\s+R", body)
     if single is not None:
-        return _stream_payload(objects.get(int(single.group(1)), b"")) or b""
+        try:
+            return _stream_payload(objects.get(int(single.group(1)), b"")) or b""
+        except _StreamTooLarge:
+            warnings.append(
+                "A page content stream exceeded the bounded decompression budget and was "
+                "skipped."
+            )
+            return b""
     return content
 
 

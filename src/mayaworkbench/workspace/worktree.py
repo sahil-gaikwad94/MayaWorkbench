@@ -153,6 +153,9 @@ class WorktreeManager:
             if snapshot.kind == SnapshotKind.WORKTREE or snapshot.includes_worktree_patch:
                 self._apply_snapshot_state(git, worktree_git, snapshot)
             verified = self._verify_snapshot_content(snapshot, path)
+            # Baseline ignored paths are needed so a task-created ignored file
+            # cannot disappear from the candidate patch (MWB-007).
+            ignored_baseline = self._ignored_paths(path)
 
             head_after = git.head_commit()
             status_after = git.status_porcelain()
@@ -171,6 +174,7 @@ class WorktreeManager:
                     "original_status_after": status_after,
                     "original_checkout_unchanged": True,
                     "verified_files": verified,
+                    "ignored_baseline": sorted(ignored_baseline),
                 },
             )
             self._event(
@@ -285,12 +289,46 @@ class WorktreeManager:
             verified += 1
         return verified
 
+    def _ignored_paths(self, path: Path) -> set[str]:
+        result = GitClient(path).run(
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            check=False,
+        )
+        raw = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+        return {normalize_rel(item) for item in raw.split("\x00") if item.strip()}
+
     # -------------------------------------------------------------------- diff
     def capture_diff(self, workspace: ExecutionWorkspace) -> tuple[bytes, list[DiffFile], list[str]]:
         path = self._owned_path(workspace)
         git = GitClient(path)
         warnings: list[str] = []
         git.run("add", "-A")
+        # Git silently ignores new ignored files. A task can still create one
+        # (a generated module, a build artifact) and it must be visible in the
+        # patch and review instead of vanishing from both.
+        baseline = set(workspace.details.get("ignored_baseline") or [])
+        current_ignored = self._ignored_paths(path)
+        for rel in sorted(current_ignored - baseline):
+            added = git.run("add", "-f", "--", rel, check=False)
+            if added.returncode != 0:
+                warnings.append(
+                    f"A new ignored path could not be represented in the patch: {rel} "
+                    f"({added.stderr[:200]})"
+                )
+            else:
+                warnings.append(
+                    f"A new ignored path was created during the run and force-added to the "
+                    f"candidate patch: {rel}"
+                )
+        for rel in sorted(baseline - current_ignored):
+            warnings.append(
+                "A previously ignored path was removed during the run; a deletion of an "
+                f"ignored path cannot be represented in the patch: {rel}"
+            )
         patch = git.run(
             "diff",
             "--cached",
@@ -355,7 +393,8 @@ class WorktreeManager:
         unrepresented = [
             line
             for line in status.splitlines()
-            if line.startswith("??") or (len(line) > 1 and line[1] != " ")
+            if not line.startswith("!!")
+            and (line.startswith("??") or (len(line) > 1 and line[1] != " "))
         ]
         if unrepresented:
             warnings.append(

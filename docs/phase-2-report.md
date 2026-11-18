@@ -117,7 +117,8 @@ $ .venv/bin/python -m compileall -q src tests && echo COMPILE_OK
 COMPILE_OK
 
 $ .venv/bin/pytest
-154 passed in 9.65 s
+154 passed in 9.65 s   # original Phase 2 run
+# Current, measured suite result: see the post-audit section at the end.
 ```
 
 New tests:
@@ -246,3 +247,31 @@ deviations list.
 - **Readiness weights are a product judgement, not a measurement.** They are
   published in the output, versioned (`readiness/v1`) and applied only to
   recorded facts. Changing them requires a new score version and an ADR update.
+
+## Post-audit remediation (18 November 2026)
+
+An adversarial audit of Phases 1–3 (MWB-001 … MWB-014) found that this report
+cited test files that were not present in the shipped archive. Both files now
+exist. This section records the measured build result, not a narrative claim.
+
+**Environment:** Python 3.12.3, Git 2.43.0, SQLite 3.45.1.
+**Command:** `PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest --tb=no -p no:cacheprovider`
+**Result:** `191 passed in 17.69s` (whole suite, all phases; the per-file counts
+in the table above describe the original report and are not re-asserted here).
+
+Phase 2 fixes delivered in this change:
+
+- **MWB-004** — incremental Flate decompression with a per-stream byte budget and
+  page/object/character caps; the optional `pypdf` path is bounded too.
+- **MWB-005** — Python signals are classified with `tokenize` plus AST docstring
+  spans, so inline comments, strings, f-strings and docstrings are never
+  executable evidence. `PRESENT` now requires every declared signal to co-occur
+  in one definition-level span; scattered signals are `PARTIAL`.
+- **MWB-008** — remote fetch resolves once per redirect hop, connects to the
+  validated address, verifies the connected peer, and revalidates every redirect
+  before use.
+- **MWB-012** — the `mayaworkbench[pdf]` optional extra now exists.
+- **MWB-013** — local document size is checked with `stat` before reading, then
+  read with a hard byte bound.
+- **MWB-001 (Phase 2 part)** — `maya research …` and `maya map …` are registered;
+  `tests/test_research_cli.py` and `tests/test_research_documents.py` now exist.

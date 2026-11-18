@@ -255,6 +255,19 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_db_info
     )
 
+    # Phase 2/3 command areas are registered by their own modules so a missing
+    # area is caught by a parser test rather than by a user (MWB-001).
+    from mayaworkbench.cli.research_commands import register_research_commands
+    from mayaworkbench.cli.task_commands import register_task_commands
+
+    register_research_commands(sub)
+    register_task_commands(sub)
+
+    worker = sub.add_parser("worker", help="Run the durable task worker process")
+    worker.add_argument("--once", action="store_true", help="Process one job and exit")
+    worker.add_argument("--run-id", help="Claim a specific run's job")
+    worker.set_defaults(func=cmd_worker)
+
     return parser
 
 
@@ -1556,6 +1569,18 @@ def cmd_db_info(args: argparse.Namespace) -> int:
     console.section("Row counts")
     console.table(["table", "rows"], sorted(counts.items()))
     return 0
+
+
+# -------------------------------------------------------------------- worker
+def cmd_worker(args: argparse.Namespace) -> int:
+    from mayaworkbench.worker import Worker
+
+    console = args.console
+    worker = Worker(services(args))
+    exit_code = worker.run(once=args.once, run_id=args.run_id)
+    if console.json_mode:
+        console.json({"worker": {"exit_code": exit_code, "run_id": args.run_id}})
+    return exit_code
 
 
 # --------------------------------------------------------------------- entry

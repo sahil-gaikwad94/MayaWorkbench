@@ -13,7 +13,10 @@ that only appears in prose is not implementation evidence.
 
 from __future__ import annotations
 
+import ast
+import io
 import re
+import tokenize
 from dataclasses import dataclass
 
 STOPWORDS = {
@@ -187,46 +190,144 @@ def signal_regex(signal: str) -> re.Pattern[str]:
     return re.compile("|".join(patterns), re.IGNORECASE)
 
 
+_SEGMENT_END = 10**9
+
+# Python 3.12 tokenizes f-strings into FSTRING_* parts instead of STRING.
+_FSTRING_TOKENS = {
+    getattr(tokenize, name)
+    for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END")
+    if hasattr(tokenize, name)
+}
+
+
+def _add_segment(
+    segments: dict[int, list[tuple[int, int, str]]],
+    line: int,
+    start: int,
+    end: int,
+    kind: str,
+) -> None:
+    segments.setdefault(line, []).append((start, end, kind))
+
+
+def _python_docstring_rows(text: str) -> set[int]:
+    """Line numbers where a module/class/function docstring begins."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    rows: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+            if isinstance(first.value.value, str):
+                rows.add(first.value.lineno)
+    return rows
+
+
+def _python_segments(text: str) -> dict[int, list[tuple[int, int, str]]] | None:
+    """True token spans for comments, strings and docstrings.
+
+    Using :mod:`tokenize` instead of ``startswith('#')`` is what stops an inline
+    comment from being mistaken for executable code. Returns ``None`` when the
+    span is not tokenizable (for example, a window cut mid-function), in which
+    case callers fall back to a conservative per-character scanner.
+    """
+    doc_rows = _python_docstring_rows(text)
+    segments: dict[int, list[tuple[int, int, str]]] = {}
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    for token in tokens:
+        if token.type == tokenize.COMMENT:
+            _add_segment(
+                segments, token.start[0], token.start[1], token.end[1], "comment"
+            )
+        elif token.type == tokenize.STRING or token.type in _FSTRING_TOKENS:
+            kind = "docstring" if token.start[0] in doc_rows else "string"
+            for line in range(token.start[0], token.end[0] + 1):
+                start = token.start[1] if line == token.start[0] else 0
+                end = token.end[1] if line == token.end[0] else _SEGMENT_END
+                _add_segment(segments, line, start, end, kind)
+    return segments
+
+
+def _comment_column(line: str) -> int | None:
+    """Column of the first unquoted ``#`` on a line, or ``None``."""
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character == "#":
+            return index
+    return None
+
+
+def _fallback_kind(line: str, position: int) -> str:
+    if _inside_string(line, position):
+        return "string"
+    comment = _comment_column(line)
+    if comment is not None and comment <= position:
+        return "comment"
+    return "code"
+
+
 def line_kinds(text: str) -> list[str]:
     """Classify each line as code, comment, docstring, string or blank.
 
-    This is a lightweight scanner, not a parser. It exists so a match in a
-    comment is never counted as executable evidence; the mapping explanation says
-    the classification is heuristic.
+    A line that contains any executable token is ``code`` even when it also has
+    a trailing comment. The per-match classification in :func:`find_signal_hits`
+    is authoritative; this helper exists for summaries and reporting.
     """
+    segments = _python_segments(text)
     kinds: list[str] = []
-    triple: str | None = None
-    for line in text.splitlines():
+    for index, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
-        if triple is not None:
-            kinds.append("docstring")
-            if triple in line:
-                triple = None
-            continue
         if not stripped:
             kinds.append("blank")
             continue
-        if stripped.startswith("#"):
-            kinds.append("comment")
+        line_segments = segments.get(index, []) if segments is not None else []
+        if not line_segments:
+            kinds.append("comment" if stripped.startswith("#") else "code")
             continue
-        opened = None
-        for quote in ('"""', "'''"):
-            if line.count(quote) % 2 == 1:
-                opened = quote
-                break
-        if opened is not None:
-            kinds.append("docstring")
-            triple = opened
+        only_prose = all(
+            kind in {"comment", "string", "docstring"} for _s, _e, kind in line_segments
+        )
+        if not only_prose:
+            kinds.append("code")
             continue
-        kinds.append("code")
+        kinds.append(line_segments[0][2])
     return kinds
 
 
-def find_signal_hits(text: str, signals: list[str]) -> list[SignalHit]:
+def find_signal_hits(
+    text: str, signals: list[str], *, language: str = "python"
+) -> list[SignalHit]:
+    """Find signal matches and classify each by executable/prose context."""
     if not text or not signals:
         return []
     lines = text.splitlines()
-    kinds = line_kinds(text)
+    segments = _python_segments(text) if language in {"python", "py"} else None
     compiled = [(signal, signal_regex(signal)) for signal in signals if signal.strip()]
     hits: list[SignalHit] = []
     for index, line in enumerate(lines):
@@ -234,17 +335,28 @@ def find_signal_hits(text: str, signals: list[str]) -> list[SignalHit]:
             match = pattern.search(line)
             if match is None:
                 continue
-            kind = kinds[index] if index < len(kinds) else "code"
-            if kind == "code" and _inside_string(line, match.start()):
-                kind = "string"
+            kind = "code"
+            if segments is not None:
+                for start, end, segment_kind in segments.get(index + 1, []):
+                    if start <= match.start() < end:
+                        kind = segment_kind
+                        break
+            else:
+                kind = _fallback_kind(line, match.start())
             hits.append(
                 SignalHit(signal=signal, line_no=index + 1, line=line.strip()[:300], kind=kind)
             )
     return hits
 
 
-def matched_signals(text: str, signals: list[str], *, code_only: bool = False) -> list[str]:
-    hits = find_signal_hits(text, signals)
+def matched_signals(
+    text: str,
+    signals: list[str],
+    *,
+    code_only: bool = False,
+    language: str = "python",
+) -> list[str]:
+    hits = find_signal_hits(text, signals, language=language)
     found: list[str] = []
     for hit in hits:
         if code_only and not hit.is_code:

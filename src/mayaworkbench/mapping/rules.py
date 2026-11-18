@@ -72,7 +72,6 @@ def decide_mapping(
         for analysis in analyses
         if analysis.definitional and analysis.code_signals
     ]
-    strong = [analysis for analysis in definitional_code if analysis.strength is EvidenceStrength.STRONG]
     searched = sorted({analysis.candidate.path for analysis in analyses})
     validation_method = (
         "; ".join(claim.validation_methods)
@@ -116,25 +115,55 @@ def decide_mapping(
 
     if declared:
         if len(declared_in_code) == len(declared):
-            if strong:
+            # Signals scattered across unrelated definitions are a name-match,
+            # not evidence of one coherent implementation. PRESENT requires all
+            # declared signals to co-occur in the same executable definition.
+            coherent = [
+                analysis
+                for analysis in definitional_code
+                if set(declared).issubset(set(analysis.code_signals))
+            ]
+            strong_coherent = [
+                analysis for analysis in coherent if analysis.strength is EvidenceStrength.STRONG
+            ]
+            if strong_coherent:
                 return MappingDecision(
                     status=ClaimMappingStatus.PRESENT,
                     reason=(
-                        "All declared acceptance signals occur in executable code and at least one "
-                        "occurs in a definition-level span with full parser coverage."
+                        "All declared acceptance signals occur together in executable code inside "
+                        "a definition-level span with full parser coverage."
                     ),
-                    rationale=_rationale(analyses, declared, declared_matched, strong=strong),
+                    rationale=_rationale(
+                        analyses, declared, declared_matched, strong=strong_coherent
+                    ),
+                    validation_method=validation_method,
+                )
+            if coherent:
+                gaps.append(
+                    "All declared signals occur in one executable definition, but that definition "
+                    "does not have full parser coverage at definition level; the mapping is "
+                    "therefore only partial."
+                )
+                return MappingDecision(
+                    status=ClaimMappingStatus.PARTIAL,
+                    reason=(
+                        "All declared signals occur together in executable code, but not in a "
+                        "definition-level span with full parser coverage."
+                    ),
+                    rationale=_rationale(analyses, declared, declared_matched),
+                    gaps=gaps,
                     validation_method=validation_method,
                 )
             gaps.append(
-                "All declared signals occur in code, but none inside a definition-level span "
-                "with full parser coverage; the mapping is therefore only partial."
+                "Declared signals occur in executable code, but only in different spans that do "
+                "not demonstrate one coherent implementation. A human should confirm the "
+                "relationship before this is treated as present."
             )
             return MappingDecision(
                 status=ClaimMappingStatus.PARTIAL,
                 reason=(
-                    "All declared signals occur in executable code, but not in a definition-level "
-                    "span with full parser coverage."
+                    "Declared acceptance signals occur in executable code but are not co-located "
+                    "in one definition-level span, so a coherent implementation is not established."
                 ),
                 rationale=_rationale(analyses, declared, declared_matched),
                 gaps=gaps,
