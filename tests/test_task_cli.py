@@ -204,6 +204,10 @@ def test_cli_full_flow_uses_a_separate_worker_process(
                 "20",
                 "--network",
                 "ALLOW_WITH_APPROVAL",
+                "--check",
+                "python -c \"from utils import count_tokens; assert count_tokens('a b') == 2; print('ok')\"",
+                "--check-criteria",
+                "AC1",
             ],
         )
         assert code == 0, captured.err
@@ -242,6 +246,27 @@ def test_cli_full_flow_uses_a_separate_worker_process(
         assert "+    return len(text.split())" in diff["patch"]
         review = run(capsys, ["--home", str(home), "--json", "task", "review", run_id])[1]
         assert review["review"]["scope_ok"] is True
+        code, verified, captured = run(
+            capsys,
+            ["--home", str(home), "--json", "verify", "run", run_id, "--no-review"],
+        )
+        assert code == 0, captured.err
+        assert verified["report"]["decision"] in {
+            "ACCEPTED",
+            "COMPLETED_WITH_LIMITATIONS",
+        }, verified["report"]["blocking"]
+        bundle_dir = tmp_path / "evidence-bundle"
+        code, bundled, captured = run(
+            capsys,
+            ["--home", str(home), "--json", "verify", "bundle", run_id, str(bundle_dir)],
+        )
+        assert code == 0, captured.err
+        code, checked, captured = run(
+            capsys,
+            ["--home", str(home), "--json", "verify", "check-bundle", str(bundle_dir)],
+        )
+        assert code == 0, captured.err
+        assert checked["ok"] is True
         code, decided, captured = run(
             capsys,
             [

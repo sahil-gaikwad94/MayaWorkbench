@@ -162,6 +162,12 @@ class ToolError(MayaError):
     exit_code = 3
 
 
+class VerificationError(MayaError):
+    """Verification could not produce evidence for the requested run."""
+
+    code = "VERIFICATION_ERROR"
+
+
 class BudgetError(MayaError):
     """A task budget (time, tokens, cost, steps or output) was exhausted."""
 

@@ -179,8 +179,14 @@ was not given, and cannot widen a line range beyond the span it received.
 
 ## 6. Performance characteristics
 
-- Indexing streams Git object content in batches; it does not shell out per
-  file. SQLite writes are batched inside the single transaction.
+- Indexing is two-phase. Phase 1 reads Git objects, decodes, parses and writes
+  content artifacts with **no write transaction open**, spilling prepared rows
+  to a private JSONL file in bounded batches. Phase 2 replays those rows inside
+  one short `BEGIN IMMEDIATE` transaction, so readers see either the old index
+  or the new one and other writers are not blocked for the parse. Merely
+  holding rows in memory would scale with repository size; the spill file keeps
+  memory bounded by one batch. `prepare_ms`/`write_ms` are recorded on the
+  index report, snapshot metadata and `INDEX_COMPLETED` event.
 - FTS search is index-backed (`bm25`); exact/regex search scans the stored
   per-line table for the snapshot, which is linear in indexed lines but avoids
   false negatives from tokenisation.
@@ -198,9 +204,10 @@ was not given, and cannot widen a line range beyond the span it received.
   register it in the gateway factory; the domain contract does not change.
 - **New search mode**: add a mode to `retrieval/search.py` and expose it in the
   CLI; retrieval scoring already merges multiple candidate sources.
-- **Phase 4 verification**: consume `workflow_runs`, `tool_invocations`,
-  `task_diffs` and command output artifacts; add a check registry and evidence
-  graph without changing the task/approval contracts.
+- **Verification check**: add a built-in to `verification/registry.py` (with a
+  gate, kind and evidence) or a new invariant template returning a validated
+  script; the report and evidence graph consume the same `VerificationCheck`
+  rows. New checks must not mutate a past attempt.
 
 ## 8. Task execution (Phase 3)
 
@@ -233,7 +240,38 @@ starts the worker and then polls the database. The worker owns the agent loop
 and closes the run with a state transition; only `WorkflowService` calls
 `compare_and_set_state`.
 
-## 9. Deliberate non-architecture
+## 9. Verification and evidence (Phase 4)
+
+```text
+TaskService.verify_run
+      |
+      v
+VerificationService
+  |-- built-in checks (scope, approvals, budget, snapshot, diff, report)
+  |-- declared checks --> BaselineWorkspace (git worktree @ base + patch)
+  |                     --> CommandRunner (candidate)
+  |-- test integrity  --> base/candidate content from Git objects
+  |-- reviewer        --> read-only prompt + structured findings
+  |-- report          --> decision rules + evidence links
+  v
+verification_runs / checks / findings / reports / evidence_links
+      |
+      v
+bundle (report.json, checks.json, criteria.json, patch.diff, artifacts)
+```
+
+Attempts are append-only; a re-run inserts attempt *n+1*. Built-ins always run;
+command and ML-invariant checks only run when declared in the immutable task
+contract, and command checks additionally require a consumed
+`COMMAND_EXECUTION` approval matching the current contract/plan hash. Baseline
+and candidate execution go through the same `CommandRunner`, so argv validation,
+timeouts, process-group cleanup and rlimits apply to both. The reviewer is
+advisory and cannot change a deterministic outcome. `WorkflowService` is still
+the only writer of run state; `task finish` refuses to accept a run without a
+report and gates on the fixed decision rules (with an explicit, recorded
+`--override`).
+
+## 10. Deliberate non-architecture
 
 - No plugin loading from repositories (would execute untrusted code).
 - No daemon, no background indexing, no file watcher (Phase 1 is explicit

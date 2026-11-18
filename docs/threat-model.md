@@ -196,18 +196,55 @@ Controls implemented:
   and a cost value only when the user supplied prices (`cost_basis` says so).
 - Prompts are never stored; the context pack is stored locally as an artifact.
 
-## 4. Out of scope (future phases)
+## 4. Agent and verification boundaries
 
-- **Multi-user access control** (Phase 3+): needs authentication, per-user
-  scoping of rows and artifacts, and audit of shared resources.
-- **Agent worktrees and patch application** (Phase 3): needs sandboxing,
-  command allowlists, resource limits and a separate approval boundary.
-- **Test execution** (Phase 4): running repository code is arbitrary code
-  execution and requires a container/VM boundary.
+Phase 3 added code execution inside a task-owned worktree, and Phase 4 runs
+declared commands and ML invariant scripts against both base and candidate.
+Implemented controls:
+
+- Writes and command execution each require a separate, scoped, single-use
+  approval; command checks additionally require the approval to match the
+  current contract/plan hash (`expected_command_sha`).
+- Commands are argv arrays, never shell text. `CommandRunner` validates the
+  executable allowlist, rejects absolute/`..` path arguments and newlines,
+  applies timeouts, process-group cleanup, output caps, file/address-space/CPU/
+  process-count rlimits, and denies network by default unless a network
+  namespace can be created and verified.
+- The agent workspace is a detached worktree; the user's checkout is verified
+  unchanged and the captured patch is replayed independently before acceptance.
+- Verification check scripts are generated from validated typed parameters, not
+  string interpolation, and run under the same policy.
+- The reviewer is read-only, receives a bounded diff, and cannot execute tools or
+  change deterministic results. Ungrounded model findings are rejected.
+
+Residual risks:
+
+- **Local execution is not a container boundary.** A command approved by the
+  user runs as the user, with the host filesystem visible outside the workspace.
+  Rlimits and path validation reduce accidents, not a determined escape.
+- **Approval scope is a hash of the command/plan, not a syscall sandbox.** An
+  approved interpreter can still do whatever that program does.
+- **A malicious repository can attack the parser, Git, or an approved test run.**
+  Only read-only Git commands are used and helpers are disabled, but Git and the
+  Python interpreter are trusted.
+- **The reviewer can be prompt-injected by the diff.** Its output is advisory,
+  findings outside the diff are rejected, and it cannot change check outcomes,
+  but a compromised review may add misleading (recorded) comments.
+- **An exported bundle is trustworthy only if the manifest verifies.**
+  `verify bundle` recomputes hashes and rejects extra/missing files; a bundle
+  whose manifest was rewritten by an attacker is not signed and cannot be
+  distinguished from a fresh export.
+
+## 5. Out of scope (future phases)
+
+- **Multi-user access control**: needs authentication, per-user scoping of rows
+  and artifacts, and audit of shared resources.
 - **Hosted deployment**: TLS, secret management, tenancy isolation, rate
   limiting and abuse controls are not designed here.
+- **Container/VM sandbox for approved commands**: the current boundary is the
+  OS user plus rlimits, not an isolated kernel.
 
-## 5. Reporting
+## 6. Reporting
 
 This is a local developer tool with no security programme. If you find a
 weakness in the controls above, document the reproduction and treat the

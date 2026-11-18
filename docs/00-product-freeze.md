@@ -28,8 +28,9 @@ dashboards, or automated merge bots.
 | J5 | "Tell me what you could not analyse." | Coverage claims that are really hopes |
 | J6 | "What does this paper require, and how much of it does the code actually implement?" | Summaries that merge the paper, guesses and code into one confident story |
 
-Later phases add J7–J9 (task contracts, isolated worktrees, verified patches,
-evaluation runs); those are specified but not implemented.
+J7–J9 (task contracts, isolated worktrees, verified patches) are implemented in
+Phases 3–4. Labelled corpora and evaluation scoring are specified but not
+implemented; the evidence records needed to score runs now exist.
 
 ## 3. Product principles (non-negotiable)
 
@@ -108,11 +109,39 @@ contract schemas, evaluation plan, CLI/UI flow, gap analysis, ADRs.
 - CLI: `research add|list|show|extract|dag|readiness|memo`, `research claim
   add|list|show|edit|review`, and `map [run|set|show]`.
 
-### Explicitly out of scope for Phases 1–2 (deferred to Phases 3–4)
+### Phase 3 — controlled engineering agent (implemented)
 
-Task contracts, approval gates, worktrees/branches for agents, patch
-verification, test execution, multi-repository reasoning, embeddings/vector
-search, hosted service, authentication, UI beyond the CLI.
+- Immutable, hash-addressed task contracts: scope, budgets, approvals,
+  acceptance criteria and declared verification checks.
+- Reviewable plans (model-generated or supplied as a reviewed JSON file) and
+  durable, scoped, single-use approvals for writes and command execution.
+- Detached Git worktrees at the pinned commit; the user's checkout is never
+  modified. Captured patches include untracked files.
+- Bounded agent loop with a tool gateway, per-run budgets, pause/cancel, a
+  durable worker queue with leases, and crash-safe settlement.
+- Structural diff review (scope, secrets, test changes, dependencies) and
+  content-addressed tool/command output.
+
+### Phase 4 — verification and evidence (implemented)
+
+- Append-only verification attempts; deterministic check registry (scope,
+  approvals, budgets, snapshot, diff, patch reproducibility, test integrity,
+  report integrity).
+- Baseline comparison: declared commands run on a detached worktree at the base
+  revision with the snapshot patch applied, so regressions and pre-existing
+  failures are distinguished by execution.
+- Test-integrity warnings from an AST comparison of test files and config.
+- Eight parameterised ML invariant templates executed through the same command
+  policy, including an explicit SKIP marker for unavailable dependencies.
+- Read-only, grounded model reviewer whose findings can never overrule a
+  deterministic result.
+- Fixed decision rules, per-criterion evidence assessment, an evidence graph,
+  hashed JSON/Markdown reports and a self-verifying export bundle.
+
+### Explicitly out of scope
+
+Multi-repository reasoning, embeddings/vector search, hosted service,
+authentication, UI beyond the CLI, and labelled-corpus evaluation scoring.
 
 ## 5. Success criteria (Phase 1)
 
@@ -141,6 +170,17 @@ measured numbers on the fixture repository rather than extrapolating.
 | Memo history | appended versions reproduce the earlier interpretation byte for byte | hash and tamper tests |
 | Honest readiness | unknown factors stay unknown and suppress an overall value below 75% known weight | `test_readiness_memo.py` |
 
+### Phase 4 success criteria
+
+| Criterion | Target | Verified by |
+| --- | --- | --- |
+| Every success/failure claim links to evidence | each check row names a command/artifact, each criterion names check keys | report payload, `evidence_links` |
+| No self-grading | reviewer can only add findings; deterministic checks decide | reviewer grounding tests |
+| Regressions vs pre-existing failures | both measured on the base revision | baseline execution tests |
+| Test weakening is visible | detectable patterns produce warnings with path/line | `test_verification_evidence.py` |
+| Reports are reproducible | append-only attempts; bundle hashes verify | bundle tamper tests |
+| No silent acceptance | missing/blocked checks yield `INCONCLUSIVE`/`BLOCKED` | decision matrix tests |
+
 ## 6. Constraints and decisions already made
 
 - Python 3.11+, one runtime dependency (`pydantic`), stdlib for Git/SQLite/HTTP.
@@ -157,6 +197,8 @@ measured numbers on the fixture repository rather than extrapolating.
   the workbench database (Phase 3 decision; the database is authoritative
   either way).
 - Which patch-verification checks are mandatory before a task can be marked
-  complete (Phase 4 evaluation will inform this).
+  complete. Phase 4 resolves the mechanism (the contract declares checks; no
+  declared functional check ⇒ `INCONCLUSIVE`) but not the policy for which
+  checks a given task type must require.
 - Whether multi-repository projects need a cross-repository snapshot group
   (not needed for Phase 1; would change snapshot identity semantics).

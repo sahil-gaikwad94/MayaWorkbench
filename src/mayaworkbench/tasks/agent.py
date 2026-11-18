@@ -321,8 +321,8 @@ class ControlledAgent:
                         )
                     continue
                 limitations = list(finish.limitations) + [
-                    "Phase 3 records a structural diff review only; deterministic "
-                    "verification gates are Phase 4 and were not applied."
+                    "The implementer's own report is not verification; run "
+                    "`maya verify run` before accepting this run."
                 ]
                 self.runs.update_progress(
                     self.run.id,

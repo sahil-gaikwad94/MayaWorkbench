@@ -123,6 +123,13 @@ class ArtifactKind(StrEnum):
     TASK_SUMMARY = "TASK_SUMMARY"
     DIFF_REVIEW = "DIFF_REVIEW"
     TASK_EXPORT = "TASK_EXPORT"
+    VERIFICATION_PLAN = "VERIFICATION_PLAN"
+    VERIFICATION_CHECK = "VERIFICATION_CHECK"
+    VERIFICATION_REPORT = "VERIFICATION_REPORT"
+    BASELINE_CAPTURE = "BASELINE_CAPTURE"
+    TEST_INTEGRITY_REPORT = "TEST_INTEGRITY_REPORT"
+    MODEL_REVIEW = "MODEL_REVIEW"
+    EVIDENCE_BUNDLE = "EVIDENCE_BUNDLE"
     OTHER = "OTHER"
 
 
@@ -210,6 +217,14 @@ class EventType(StrEnum):
     WORKER_LEASE_ACQUIRED = "WORKER_LEASE_ACQUIRED"
     WORKER_LEASE_LOST = "WORKER_LEASE_LOST"
     WORKER_FINISHED = "WORKER_FINISHED"
+    # Phase 4 — verification and evidence
+    VERIFICATION_STARTED = "VERIFICATION_STARTED"
+    VERIFICATION_CHECK_COMPLETED = "VERIFICATION_CHECK_COMPLETED"
+    VERIFICATION_COMPLETED = "VERIFICATION_COMPLETED"
+    VERIFICATION_FAILED = "VERIFICATION_FAILED"
+    VERIFICATION_OVERRIDDEN = "VERIFICATION_OVERRIDDEN"
+    MODEL_REVIEW_COMPLETED = "MODEL_REVIEW_COMPLETED"
+    EVIDENCE_BUNDLE_EXPORTED = "EVIDENCE_BUNDLE_EXPORTED"
 
 
 # ------------------------------------------------------------ task workflow
@@ -455,6 +470,118 @@ class RiskSeverity(StrEnum):
     BLOCKER = "BLOCKER"
 
 
+class VerificationGate(StrEnum):
+    """Gates A-G from the specification (§13.2).
+
+    A gate is a question about evidence, not a checklist of intentions. A gate
+    with no applicable evidence is reported as ``SKIPPED``/``UNVERIFIED`` rather
+    than passed.
+    """
+
+    SCOPE = "A_SCOPE"
+    CHANGE = "B_CHANGE"
+    FUNCTIONAL = "C_FUNCTIONAL"
+    ML_INVARIANT = "D_ML_INVARIANT"
+    REVIEW = "E_REVIEW"
+    EXPERIMENT = "F_EXPERIMENT"
+    REPORT = "G_REPORT"
+
+
+class CheckKind(StrEnum):
+    """What produced a verification check's outcome."""
+
+    DETERMINISTIC = "DETERMINISTIC"
+    COMMAND = "COMMAND"
+    TEST_INTEGRITY = "TEST_INTEGRITY"
+    ML_INVARIANT = "ML_INVARIANT"
+    MODEL_REVIEW = "MODEL_REVIEW"
+    HUMAN = "HUMAN"
+
+
+class CheckOutcome(StrEnum):
+    """Outcome of one verification check (§13.1).
+
+    ``PASSED`` means the check ran and met its condition. ``SKIPPED``,
+    ``BLOCKED``, ``INCONCLUSIVE`` and ``UNVERIFIED`` are distinct on purpose:
+    they have different causes and different consequences for a decision.
+    """
+
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    PARTIAL = "PARTIAL"
+    BLOCKED = "BLOCKED"
+    SKIPPED = "SKIPPED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class EvidenceProvenance(StrEnum):
+    """Where a claim or evidence item originated (§13.1)."""
+
+    REPOSITORY = "REPOSITORY"
+    DOCUMENT = "DOCUMENT"
+    PATCH = "PATCH"
+    COMMAND_OUTPUT = "COMMAND_OUTPUT"
+    TEST_RESULT = "TEST_RESULT"
+    EXPERIMENT_ARTIFACT = "EXPERIMENT_ARTIFACT"
+    MODEL_INTERPRETATION = "MODEL_INTERPRETATION"
+    HUMAN_NOTE = "HUMAN_NOTE"
+    ARTIFACT = "ARTIFACT"
+
+
+class VerificationMethod(StrEnum):
+    """How a claim was checked (§13.1)."""
+
+    SOURCE_INSPECTION = "SOURCE_INSPECTION"
+    STATIC_ANALYSIS = "STATIC_ANALYSIS"
+    DETERMINISTIC_TEST = "DETERMINISTIC_TEST"
+    NUMERICAL_INVARIANT = "NUMERICAL_INVARIANT"
+    RUNTIME_OBSERVATION = "RUNTIME_OBSERVATION"
+    EXPERIMENT = "EXPERIMENT"
+    INDEPENDENT_MODEL_REVIEW = "INDEPENDENT_MODEL_REVIEW"
+    HUMAN_REVIEW = "HUMAN_REVIEW"
+    NOT_CHECKED = "NOT_CHECKED"
+
+
+class EvidenceRelation(StrEnum):
+    """How one evidence node relates to another."""
+
+    PROVES = "PROVES"
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    DERIVED_FROM = "DERIVED_FROM"
+    RECORDED_IN = "RECORDED_IN"
+
+
+class CriterionStatus(StrEnum):
+    """Evidence status of one acceptance criterion."""
+
+    VERIFIED = "VERIFIED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class TaskDecision(StrEnum):
+    """Final task decisions (§13.5). Never inferred from model confidence."""
+
+    ACCEPTED = "ACCEPTED"
+    COMPLETED_WITH_LIMITATIONS = "COMPLETED_WITH_LIMITATIONS"
+    REJECTED = "REJECTED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    NEEDS_HUMAN_DECISION = "NEEDS_HUMAN_DECISION"
+
+
+class FindingSeverity(StrEnum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    BLOCKER = "BLOCKER"
+
+
 class RetentionClass(StrEnum):
     """How long an artifact should live.
 
@@ -508,4 +635,13 @@ __all__ = [
     "WorkspaceStatus",
     "ToolCallStatus",
     "WorkerJobStatus",
+    "VerificationGate",
+    "CheckKind",
+    "CheckOutcome",
+    "EvidenceProvenance",
+    "VerificationMethod",
+    "EvidenceRelation",
+    "CriterionStatus",
+    "TaskDecision",
+    "FindingSeverity",
 ]

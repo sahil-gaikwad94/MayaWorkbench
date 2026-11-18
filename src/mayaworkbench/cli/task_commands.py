@@ -58,6 +58,32 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     create.add_argument("--document", action="append", default=[], help="Research document id")
     create.add_argument("--claim", action="append", default=[], help="Research claim id")
     create.add_argument("--mapping-artifact", help="Claim-to-code matrix artifact id")
+    create.add_argument(
+        "--check",
+        dest="checks",
+        action="append",
+        default=[],
+        help="Required verification command, e.g. --check 'pytest -q'",
+    )
+    create.add_argument(
+        "--optional-check",
+        dest="optional_checks",
+        action="append",
+        default=[],
+        help="Verification command recorded but not blocking",
+    )
+    create.add_argument(
+        "--check-criteria",
+        help="Comma-separated criterion ids (AC1,AC2) for the declared checks",
+    )
+    create.add_argument("--check-timeout", type=int, default=300)
+    create.add_argument(
+        "--invariant",
+        dest="invariants",
+        action="append",
+        default=[],
+        help="ML invariant, e.g. forward_smoke:module=model,callable=Model,shape=1x4x32",
+    )
     create.set_defaults(func=cmd_task_create)
 
     listing = task_sub.add_parser("list", help="List tasks")
@@ -127,6 +153,14 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     decision.add_argument("--accept", action="store_true")
     decision.add_argument("--reject", action="store_true")
     finish.add_argument("--reason", default="reviewed by the user")
+    finish.add_argument(
+        "--override",
+        action="store_true",
+        help=(
+            "Record a human override of a negative verification decision. The report "
+            "is not changed; the override is stored as a limitation and an event."
+        ),
+    )
     finish.set_defaults(func=cmd_task_finish)
 
     cleanup = task_sub.add_parser("cleanup", help="Remove an isolated workspace")
@@ -177,6 +211,38 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         "allow_file_deletion": bool(args.allow_delete),
         "allow_unknown_cost": bool(args.allow_unknown_cost),
     }
+    from mayaworkbench.verification.registry import command_check
+    from mayaworkbench.cli.verification_commands import parse_invariant_expression
+
+    criteria_refs = [
+        item.strip().upper()
+        for item in (args.check_criteria or "").split(",")
+        if item.strip()
+    ]
+    checks = []
+    for command in args.checks:
+        checks.append(
+            command_check(
+                command,
+                criteria=criteria_refs,
+                timeout_seconds=args.check_timeout,
+                required=True,
+            )
+        )
+    for command in args.optional_checks:
+        checks.append(
+            command_check(
+                command,
+                criteria=criteria_refs,
+                timeout_seconds=args.check_timeout,
+                required=False,
+            )
+        )
+    for expression in args.invariants:
+        spec = parse_invariant_expression(expression)
+        if criteria_refs:
+            spec = spec.model_copy(update={"criteria": criteria_refs})
+        checks.append(spec)
     task, contract = svc.task_service.create_task(
         project_id=_project.id,
         title=args.title or args.goal[:120],
@@ -191,6 +257,7 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         research_document_ids=list(args.document),
         claim_ids=list(args.claim),
         mapping_artifact_id=args.mapping_artifact,
+        verification_checks=checks,
     )
     payload = {"task": task.model_dump(mode="json"), "contract": contract.model_dump(mode="json")}
     if console.json_mode:
@@ -207,8 +274,14 @@ def cmd_task_create(args: argparse.Namespace) -> int:
             ("scope", ", ".join(contract.scope.allowed_paths)),
             ("network", contract.constraints.network_access),
             ("approvals", ", ".join(item.value for item in contract.required_approvals)),
+            ("verification checks", len(contract.verification_checks) or "none declared"),
         ]
     )
+    if not contract.verification_checks:
+        console.warning(
+            "No verification checks are declared. Verification will report INCONCLUSIVE "
+            "for this task; add --check 'pytest -q' (or an invariant) to validate behaviour."
+        )
     console.print("")
     console.print(f"Next: maya task start {task.id}")
     return 0
@@ -523,7 +596,8 @@ def cmd_task_review(args: argparse.Namespace) -> int:
         max_column=70,
     )
     console.note(
-        "Structural review only; it is not deterministic verification (Phase 4)."
+        "Structural review only; it is not deterministic verification. Run "
+        "`maya verify run <run>` for execution evidence."
     )
     return 0
 
@@ -533,16 +607,28 @@ def cmd_task_finish(args: argparse.Namespace) -> int:
     svc = _services(args)
     run = _resolve_run(svc, args.identifier)
     updated = svc.task_service.finish_run(
-        run.id, accept=bool(args.accept), reason=args.reason
+        run.id,
+        accept=bool(args.accept),
+        reason=args.reason,
+        override=bool(getattr(args, "override", False)),
     )
     if console.json_mode:
         console.json({"run": updated.model_dump(mode="json")})
         return 0
     console.heading(f"Run {updated.id}: {updated.state.value}")
     console.kv([("reason", args.reason)])
+    report = svc.verification.latest_report(updated.id)
+    if report is not None:
+        console.kv(
+            [
+                ("verification decision", report.decision.value),
+                ("verification report", report.id),
+                ("override", "yes" if report.decision.value not in {"ACCEPTED", "COMPLETED_WITH_LIMITATIONS"} else "no"),
+            ]
+        )
     if updated.state == WorkflowState.COMPLETED_WITH_LIMITATIONS:
         console.note(
-            "Accepted with limitations. Phase 4 deterministic verification was not applied."
+            "Accepted with limitations; inspect `maya verify show " + updated.id + "`."
         )
     return 0
 

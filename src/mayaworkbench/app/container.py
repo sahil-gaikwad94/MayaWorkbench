@@ -24,6 +24,7 @@ from mayaworkbench.tasks.plans import PlanService
 from mayaworkbench.tasks.review import ReviewService
 from mayaworkbench.tasks.service import TaskService
 from mayaworkbench.tasks.workflow import WorkflowService
+from mayaworkbench.verification.service import VerificationService
 from mayaworkbench.workspace.worktree import WorktreeManager
 from mayaworkbench.models.gateway import ModelGateway, ProviderFactory
 from mayaworkbench.qa.service import AskService
@@ -47,6 +48,7 @@ from mayaworkbench.storage.stores import (
     RunStore,
     TaskStore,
     ToolCallStore,
+    VerificationStore,
     WorkerJobStore,
     WorkspaceStore,
     FileStore,
@@ -119,6 +121,8 @@ class Services:
     workflow: WorkflowService
     review_service: ReviewService
     worktrees: WorktreeManager
+    verification_store: VerificationStore
+    verification_service: VerificationService
     task_service: TaskService
 
     @classmethod
@@ -258,6 +262,7 @@ class Services:
         task_diffs = DiffStore(db)
         task_reviews = ReviewStore(db)
         jobs = WorkerJobStore(db)
+        verification_store = VerificationStore(db)
         plan_service = PlanService(
             settings=settings,
             gateway=gateway,
@@ -284,6 +289,28 @@ class Services:
             artifacts=artifacts,
             workspaces=execution_workspaces,
             events=events,
+        )
+        verification_service = VerificationService(
+            home=paths.home,
+            db=db,
+            settings=settings,
+            artifacts=artifacts,
+            events=events,
+            runs=workflow_runs,
+            tasks=task_store,
+            contracts=contracts,
+            plans=task_plans,
+            diffs=task_diffs,
+            reviews=task_reviews,
+            review_service=review_service,
+            workspaces=execution_workspaces,
+            repositories=repositories,
+            snapshots=snapshots,
+            files=files,
+            approvals=task_approvals,
+            invocations=invocations,
+            store=verification_store,
+            gateway=gateway,
         )
         task_service = TaskService(
             paths=paths,
@@ -313,6 +340,7 @@ class Services:
             worktrees=worktrees,
             documents=documents,
             claims=claims,
+            verification=verification_service,
         )
         return cls(
             paths=paths,
@@ -361,6 +389,8 @@ class Services:
             workflow=workflow,
             review_service=review_service,
             worktrees=worktrees,
+            verification_store=verification_store,
+            verification_service=verification_service,
             task_service=task_service,
         )
 
@@ -397,6 +427,10 @@ class Services:
     @property
     def reviews(self) -> ReviewStore:
         return self.task_reviews
+
+    @property
+    def verification(self) -> VerificationService:
+        return self.verification_service
 
     def close(self) -> None:
         self.db.close()

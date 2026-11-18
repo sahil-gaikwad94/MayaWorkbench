@@ -329,7 +329,7 @@ Migration `0003_tasks_and_workspaces.sql` adds the controlled-agent records.
 | Table | Purpose | Key columns |
 | --- | --- | --- |
 | `tasks` | User objective | `project_id`, `task_type`, `goal` |
-| `task_contracts` | Immutable scope/budget authorization | `task_id`, `version`, `scope_json`, `constraints_json`, `research_context_json`, `content_sha256` |
+| `task_contracts` | Immutable scope/budget authorization | `task_id`, `version`, `scope_json`, `constraints_json`, `research_context_json`, `verification_checks_json`, `content_sha256` |
 | `task_plans` | Reviewable implementation plan | `run_id`, `version`, `plan_sha256`, `artifact_id` |
 | `workflow_runs` | One attempt and its state | `state`, `base_commit_sha`, `plan_id`, `workspace_id`, usage counters |
 | `approval_requests` | Durable scoped human authorization | `action`, `status`, `spec_sha256`, `nonce`, `expires_at`, `consumed_at` |
@@ -348,3 +348,25 @@ The candidate patch, tool outputs, diff review and exported bundle are
 content-addressed artifacts (`TASK_PATCH`, `TOOL_OUTPUT`, `COMMAND_OUTPUT`,
 `DIFF_REVIEW`, `TASK_CONTRACT`, `IMPLEMENTATION_PLAN`). The database stores
 metadata and hashes; it does not store full patches or command output inline.
+
+## 8. Verification and evidence (schema 5)
+
+Migration `0005_verification_and_evidence.sql` adds the append-only evidence
+records. `task_contracts.verification_checks_json` stores the declared
+`CheckSpec` list that was hashed into the contract.
+
+| Table | Purpose | Key columns |
+| --- | --- | --- |
+| `verification_runs` | One attempt over one run | `run_id`, `attempt` (unique with run), `plan_sha256`, `status`, `details_json` |
+| `verification_checks` | Recorded outcome of one check | `verification_id`, `check_key`, `gate`, `kind`, `method`, `outcome`, `required`, `criteria_json`, `command_json`, `artifact_id`, `details_json` |
+| `verification_findings` | Check/test/reviewer findings | `verification_id`, `check_id`, `severity`, `code`, `path`, `line`, `criterion_ref`, `source`, `details_json` |
+| `verification_reports` | Immutable decision | `verification_id`, `decision`, `criteria_json`, `check_ids_json`, `blocking_json`, `limitations_json`, `json_sha256`, `report_artifact_id`, `reviewer_invocation_id` |
+| `evidence_links` | Typed edge of the evidence graph | `report_id`, `from_kind`, `from_ref`, `relation`, `to_kind`, `to_ref`, `sha256` |
+
+`CHECK`/`PATCH`/`CRITERION`/`COMMAND`/`MODEL_REVIEW` links make the report
+mechanically inspectable: every criterion names the checks that support or
+contradict it, and every check names the command/artifact it came from. Reports
+are never updated; a new attempt writes new rows. `verification_checks` has a
+unique `(verification_id, check_key)` constraint; findings cascade from their
+check. Command output (stdout/stderr) lives in `COMMAND_OUTPUT` artifacts, and
+evidence bundles copy the artifacts they cite.

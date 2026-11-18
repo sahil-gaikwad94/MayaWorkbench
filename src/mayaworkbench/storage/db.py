@@ -7,9 +7,11 @@ checksummed migrations; application code never issues DDL.
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -44,9 +46,16 @@ class Database:
     ``BEGIN IMMEDIATE`` handle cross-process serialization.
     """
 
-    def __init__(self, path: Path, *, busy_timeout_ms: int = 10_000):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        busy_timeout_ms: int = 10_000,
+        allow_shared_filesystem: bool = False,
+    ):
         self.path = Path(path)
         self._busy_timeout_ms = busy_timeout_ms
+        self._allow_shared_filesystem = allow_shared_filesystem
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.RLock()
 
@@ -59,6 +68,8 @@ class Database:
     def _connection_locked(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._allow_shared_filesystem:
+                _assert_local_filesystem(self.path)
             try:
                 # isolation_level=None disables the stdlib's implicit BEGIN/COMMIT
                 # management. Transaction boundaries must be explicit: otherwise a
@@ -162,7 +173,7 @@ class Database:
         conn = self.conn
         # Caller (migrate) already holds the re-entrant lock.
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(conn)
             for statement in _split_statements(migration.sql):
                 conn.execute(statement)
             conn.execute(
@@ -209,7 +220,7 @@ class Database:
             if conn.in_transaction:
                 yield conn
                 return
-            conn.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(conn)
             try:
                 yield conn
             except BaseException:
@@ -220,6 +231,37 @@ class Database:
                 raise
             else:
                 conn.execute("COMMIT")
+
+    def _begin_immediate(self, conn: sqlite3.Connection) -> None:
+        """Start a write transaction, retrying transient busy/locked errors.
+
+        ``busy_timeout`` already waits inside SQLite. This loop covers the case
+        where a WAL checkpoint or a long reader repeatedly grabs the lock, and
+        turns a temporary contention into a bounded wait instead of a failed
+        command. The total wait is bounded so a wedged process cannot hang a
+        worker forever.
+        """
+        deadline = time.monotonic() + max(5.0, self._busy_timeout_ms / 1000)
+        delay = 0.02
+        while True:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise DatabaseError(
+                        "The database stayed locked by another process; the operation "
+                        "was not started.",
+                        hint=(
+                            "SQLite is single-writer and same-host only. Check for a stuck "
+                            "worker or move $MAYA_HOME off a network filesystem."
+                        ),
+                    ) from exc
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
 
     # ----------------------------------------------------------------- queries
     def execute(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
@@ -276,6 +318,68 @@ class Database:
             info["fts5"] = False
             info["error"] = str(exc)
         return info
+
+
+# Filesystems where SQLite WAL and POSIX locking are not safe for a live
+# database. A workbench database accidentally placed on one of these must fail
+# loudly instead of corrupting evidence.
+_SHARED_FILESYSTEMS = {
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "9p",
+    "ceph",
+    "afs",
+    "glusterfs",
+    "lustre",
+    "fuse.sshfs",
+}
+
+
+def _mount_entries() -> list[tuple[str, str]]:
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:  # pragma: no cover - non-Linux or restricted /proc
+        return []
+    entries: list[tuple[str, str]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mount_point = fields[1].replace("\\040", " ").replace("\\011", "\t")
+        entries.append((mount_point, fields[2].lower()))
+    return entries
+
+
+def _filesystem_type(path: Path) -> str | None:
+    resolved = os.path.realpath(str(path))
+    best: tuple[int, str] | None = None
+    for mount_point, fs_type in _mount_entries():
+        prefix = mount_point.rstrip("/") or "/"
+        if resolved == prefix or resolved.startswith(prefix.rstrip("/") + "/") or prefix == "/":
+            length = len(prefix)
+            if best is None or length > best[0]:
+                best = (length, fs_type)
+    return best[1] if best else None
+
+
+def _assert_local_filesystem(path: Path) -> None:
+    fs_type = _filesystem_type(path)
+    if fs_type is None:
+        return
+    if fs_type in _SHARED_FILESYSTEMS:
+        raise DatabaseError(
+            f"$MAYA_HOME is on a shared filesystem ({fs_type}) at {path.parent}",
+            hint=(
+                "SQLite WAL and POSIX locking are only safe on a local filesystem, and "
+                "MayaWorkbench is single-host by design. Move the data directory to local "
+                "disk. If this filesystem really is local, open Database(..., "
+                "allow_shared_filesystem=True) deliberately."
+            ),
+        )
 
 
 def _regexp(pattern: str, value: str | None) -> bool:

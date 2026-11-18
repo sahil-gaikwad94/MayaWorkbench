@@ -47,17 +47,22 @@ from mayaworkbench.domain.models import (
     SymbolEdge,
     ApprovalRequest,
     ExecutionWorkspace,
+    EvidenceLink,
     Task,
     TaskContract,
     TaskDiff,
     TaskPlan,
     TaskReview,
     ToolCall,
+    VerificationCheck,
+    VerificationFinding,
+    VerificationReport,
+    VerificationRun,
     WorkflowEvent,
     WorkflowRun,
     WorkerJob,
 )
-from mayaworkbench.errors import DatabaseError, NotFoundError
+from mayaworkbench.errors import ConflictError, DatabaseError, NotFoundError
 from mayaworkbench.ids import short_hash
 from mayaworkbench.storage.db import Database
 from mayaworkbench.tokenize import expand_line
@@ -1187,6 +1192,8 @@ class ResearchClaimStore:
         *,
         project_id: str | None = None,
         document_id: str | None = None,
+        document_ids: Sequence[str] | None = None,
+        include_project_level: bool = False,
         claim_type: ClaimType | None = None,
         review_status: ClaimReviewStatus | None = None,
         limit: int = 500,
@@ -1199,6 +1206,19 @@ class ResearchClaimStore:
         if document_id is not None:
             clauses.append("document_id = ?")
             params.append(document_id)
+        if document_ids is not None:
+            ids = list(dict.fromkeys(document_ids))
+            if ids:
+                placeholders = ", ".join("?" for _ in ids)
+                clause = f"document_id IN ({placeholders})"
+                if include_project_level:
+                    clause = f"({clause} OR document_id IS NULL)"
+                clauses.append(clause)
+                params.extend(ids)
+            elif include_project_level:
+                clauses.append("document_id IS NULL")
+            else:
+                return []
         if claim_type is not None:
             clauses.append("claim_type = ?")
             params.append(claim_type.value)
@@ -1621,6 +1641,7 @@ class ContractStore:
         "acceptance_criteria": ("acceptance_criteria_json", []),
         "unknowns": ("unknowns_json", []),
         "research_context": ("research_context_json", None),
+        "verification_checks": ("verification_checks_json", []),
         "required_approvals": ("required_approvals_json", []),
     }
 
@@ -2147,11 +2168,24 @@ class DiffStore:
         self.db = db
 
     def create(self, diff: TaskDiff) -> TaskDiff:
-        _insert(
-            self.db,
-            "task_diffs",
-            _model_to_row(diff, json_fields=self.JSON, bool_fields=self.BOOL),
-        )
+        """Insert once per run; concurrent callers get the recorded diff.
+
+        ``capture_diff`` checks-then-inserts, and two processes can pass that
+        check together. ``task_diffs.run_id`` is UNIQUE, so the constraint is the
+        real guard; losing the race must return the existing evidence rather
+        than fail the run.
+        """
+        try:
+            _insert(
+                self.db,
+                "task_diffs",
+                _model_to_row(diff, json_fields=self.JSON, bool_fields=self.BOOL),
+            )
+        except ConflictError:
+            existing = self.get_by_run(diff.run_id)
+            if existing is None:  # pragma: no cover - constraint without a row
+                raise
+            return existing
         return diff
 
     def get_by_run(self, run_id: str) -> TaskDiff | None:
@@ -2177,11 +2211,17 @@ class ReviewStore:
         self.db = db
 
     def create(self, review: TaskReview) -> TaskReview:
-        _insert(
-            self.db,
-            "task_reviews",
-            _model_to_row(review, json_fields=self.JSON, bool_fields=self.BOOL),
-        )
+        try:
+            _insert(
+                self.db,
+                "task_reviews",
+                _model_to_row(review, json_fields=self.JSON, bool_fields=self.BOOL),
+            )
+        except ConflictError:
+            existing = self.get_by_run(review.run_id)
+            if existing is None:  # pragma: no cover
+                raise
+            return existing
         return review
 
     def get_by_run(self, run_id: str) -> TaskReview | None:
@@ -2343,6 +2383,257 @@ class WorkerJobStore:
         return [_row_to_model(WorkerJob, row, json_fields=self.JSON) for row in rows]
 
 
+class VerificationStore:
+    """Attempts, checks, findings, reports and evidence links (Phase 4).
+
+    Attempts are append-only. Re-running verification adds an attempt instead of
+    rewriting the evidence a previous report cited.
+    """
+
+    CHECK_JSON = {
+        "criteria": ("criteria_json", []),
+        "command": ("command_json", []),
+        "details": ("details_json", {}),
+    }
+    CHECK_BOOL = ("required",)
+    FINDING_JSON = {"details": ("details_json", {})}
+    REPORT_JSON = {
+        "criteria": ("criteria_json", []),
+        "check_ids": ("check_ids_json", []),
+        "blocking": ("blocking_json", []),
+        "limitations": ("limitations_json", []),
+        "details": ("details_json", {}),
+    }
+    ATTEMPT_JSON = {"details": ("details_json", {})}
+    LINK_JSON = {}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    # ------------------------------------------------------------- attempts
+    def next_attempt(self, run_id: str) -> int:
+        row = self.db.fetchone(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM verification_runs WHERE run_id = ?",
+            (run_id,),
+        )
+        return int(row[0]) if row else 1
+
+    def create_attempt(self, attempt: VerificationRun) -> VerificationRun:
+        _insert(
+            self.db,
+            "verification_runs",
+            _model_to_row(attempt, json_fields=self.ATTEMPT_JSON),
+        )
+        return attempt
+
+    def get_attempt(self, verification_id: str) -> VerificationRun:
+        row = self.db.fetchone(
+            "SELECT * FROM verification_runs WHERE id = ?", (verification_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Verification attempt {verification_id} does not exist")
+        return _row_to_model(VerificationRun, row, json_fields=self.ATTEMPT_JSON)
+
+    def latest_attempt(self, run_id: str) -> VerificationRun | None:
+        row = self.db.fetchone(
+            "SELECT * FROM verification_runs WHERE run_id = ? ORDER BY attempt DESC LIMIT 1",
+            (run_id,),
+        )
+        return (
+            None
+            if row is None
+            else _row_to_model(VerificationRun, row, json_fields=self.ATTEMPT_JSON)
+        )
+
+    def finish_attempt(
+        self,
+        verification_id: str,
+        *,
+        status: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.db.execute(
+            "UPDATE verification_runs SET status = ?, completed_at = ?, details_json = ? "
+            "WHERE id = ?",
+            (
+                status,
+                to_iso(utcnow()),
+                _dump_json(details or {}),
+                verification_id,
+            ),
+        )
+
+    # --------------------------------------------------------------- checks
+    def add_check(self, check: VerificationCheck) -> VerificationCheck:
+        row = _model_to_row(
+            check.model_copy(update={"findings": []}),
+            json_fields=self.CHECK_JSON,
+            bool_fields=self.CHECK_BOOL,
+        )
+        row["check_key"] = row.pop("key")
+        row.pop("findings", None)
+        with self.db.transaction():
+            _insert(self.db, "verification_checks", row)
+            for finding in check.findings:
+                _insert(
+                    self.db,
+                    "verification_findings",
+                    {
+                        "id": "vfd_" + short_hash(f"{check.id}:{finding.code}:{finding.path}:{finding.line}:{finding.message}", 26),
+                        "verification_id": check.verification_id,
+                        "check_id": check.id,
+                        "run_id": check.run_id,
+                        "severity": finding.severity.value,
+                        "code": finding.code,
+                        "message": finding.message,
+                        "path": finding.path,
+                        "line": finding.line,
+                        "criterion_ref": finding.criterion_ref,
+                        "source": finding.source,
+                        "details_json": _dump_json(finding.details),
+                        "created_at": to_iso(utcnow()),
+                    },
+                )
+        return check
+
+    def list_checks(self, verification_id: str) -> list[VerificationCheck]:
+        rows = self.db.fetchall(
+            "SELECT * FROM verification_checks WHERE verification_id = ? "
+            "ORDER BY started_at, check_key",
+            (verification_id,),
+        )
+        if not rows:
+            return []
+        finding_rows = self.db.fetchall(
+            "SELECT * FROM verification_findings WHERE verification_id = ? "
+            "ORDER BY created_at, code",
+            (verification_id,),
+        )
+        grouped: dict[str, list[VerificationFinding]] = {}
+        for row in finding_rows:
+            data = dict(row)
+            for extra in ("verification_id", "check_id", "run_id", "created_at"):
+                data.pop(extra, None)
+            for field, (column, default) in self.FINDING_JSON.items():
+                data[field] = _load_json(data.pop(column, None), default)
+            grouped.setdefault(str(row["check_id"]), []).append(
+                VerificationFinding.model_validate(data)
+            )
+        checks: list[VerificationCheck] = []
+        for row in rows:
+            data = dict(row)
+            data["key"] = data.pop("check_key")
+            for field, (column, default) in self.CHECK_JSON.items():
+                data[field] = _load_json(data.pop(column, None), default)
+            for field in self.CHECK_BOOL:
+                data[field] = bool(data[field])
+            data["findings"] = []
+            check = VerificationCheck.model_validate(data)
+            check.findings = grouped.get(check.id, [])
+            checks.append(check)
+        return checks
+
+    def get_check(self, verification_id: str, key: str) -> VerificationCheck | None:
+        for check in self.list_checks(verification_id):
+            if check.key == key:
+                return check
+        return None
+
+    def list_findings(self, run_id: str, *, severity: str | None = None) -> list[VerificationFinding]:
+        if severity is None:
+            rows = self.db.fetchall(
+                "SELECT * FROM verification_findings WHERE run_id = ? ORDER BY created_at, code",
+                (run_id,),
+            )
+        else:
+            rows = self.db.fetchall(
+                "SELECT * FROM verification_findings WHERE run_id = ? AND severity = ? "
+                "ORDER BY created_at, code",
+                (run_id, severity),
+            )
+        findings: list[VerificationFinding] = []
+        for row in rows:
+            data = dict(row)
+            for extra in ("verification_id", "check_id", "run_id", "created_at"):
+                data.pop(extra, None)
+            for field, (column, default) in self.FINDING_JSON.items():
+                data[field] = _load_json(data.pop(column, None), default)
+            findings.append(VerificationFinding.model_validate(data))
+        return findings
+
+    # --------------------------------------------------------------- reports
+    def create_report(
+        self, report: VerificationReport, links: Sequence[EvidenceLink]
+    ) -> VerificationReport:
+        with self.db.transaction():
+            _insert(
+                self.db,
+                "verification_reports",
+                _model_to_row(report, json_fields=self.REPORT_JSON),
+            )
+            _insert_many(
+                self.db,
+                "evidence_links",
+                [
+                    _model_to_row(link, json_fields=self.LINK_JSON)
+                    for link in links
+                ],
+            )
+        return report
+
+    def get_report(self, report_id: str) -> VerificationReport:
+        row = self.db.fetchone(
+            "SELECT * FROM verification_reports WHERE id = ?", (report_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Verification report {report_id} does not exist")
+        return _row_to_model(
+            VerificationReport, row, json_fields=self.REPORT_JSON
+        )
+
+    def report_for_attempt(self, verification_id: str) -> VerificationReport | None:
+        row = self.db.fetchone(
+            "SELECT * FROM verification_reports WHERE verification_id = ?",
+            (verification_id,),
+        )
+        return (
+            None
+            if row is None
+            else _row_to_model(VerificationReport, row, json_fields=self.REPORT_JSON)
+        )
+
+    def latest_report(self, run_id: str) -> VerificationReport | None:
+        row = self.db.fetchone(
+            "SELECT * FROM verification_reports WHERE run_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        )
+        return (
+            None
+            if row is None
+            else _row_to_model(VerificationReport, row, json_fields=self.REPORT_JSON)
+        )
+
+    def list_reports(self, run_id: str) -> list[VerificationReport]:
+        rows = self.db.fetchall(
+            "SELECT * FROM verification_reports WHERE run_id = ? ORDER BY created_at",
+            (run_id,),
+        )
+        return [
+            _row_to_model(VerificationReport, row, json_fields=self.REPORT_JSON)
+            for row in rows
+        ]
+
+    def list_links(self, report_id: str) -> list[EvidenceLink]:
+        rows = self.db.fetchall(
+            "SELECT * FROM evidence_links WHERE report_id = ? ORDER BY created_at",
+            (report_id,),
+        )
+        return [
+            _row_to_model(EvidenceLink, row, json_fields=self.LINK_JSON) for row in rows
+        ]
+
+
 __all__ = [
     "ProjectStore",
     "RepositoryStore",
@@ -2369,5 +2660,6 @@ __all__ = [
     "DiffStore",
     "ReviewStore",
     "WorkerJobStore",
+    "VerificationStore",
     "like_pattern",
 ]

@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import sqlite3
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Iterator, Sequence
@@ -100,6 +102,8 @@ class IndexReport(BaseModel):
     languages: dict[str, int] = {}
     parse_coverage: dict[str, int] = {}
     duration_ms: int
+    prepare_ms: int = 0
+    write_ms: int = 0
     manifest_artifact_id: str | None = None
     warnings: list[str] = Field(default_factory=list)
 
@@ -169,17 +173,26 @@ class Indexer:
         started_monotonic = time.monotonic()
 
         self._begin(snapshot, repository)
+        spill_path: str | None = None
         try:
             discovery, source = self.repository_service.discover(snapshot, repository)
             collector = _Collector(snapshot, repository)
+            discovery_issues = discovery.issues(snapshot_id)
+            collector.skipped += len(discovery.skipped)
 
-            with self.db.transaction():
-                self.files.clear_snapshot_index(snapshot_id)
-                discovery_issues = discovery.issues(snapshot_id)
-                if discovery_issues:
-                    self.issues.insert_many(discovery_issues)
-                    collector.issues += len(discovery_issues)
-                collector.skipped += len(discovery.skipped)
+            # Phase 1: read and parse with no write transaction open. Prepared
+            # batches are spilled to a private temp file so memory stays bounded
+            # by one batch and the SQLite write lock is held only for inserts.
+            #
+            # The previous implementation did all Git reads, decoding, AST
+            # parsing and content-artifact writes inside the rebuild transaction,
+            # so a large snapshot blocked every other writer for the whole parse.
+            prepare_started = time.monotonic()
+            fd, spill_path = tempfile.mkstemp(
+                dir=str(self._spill_dir()), prefix="index-", suffix=".jsonl"
+            )
+            os.close(fd)
+            with open(spill_path, "w", encoding="utf-8") as spill:
                 for candidates in _batches(discovery.candidates):
                     contents = source.read_many(candidates)
                     batch = _FileBatch()
@@ -197,7 +210,18 @@ class Indexer:
                             )
                             continue
                         self._index_file(snapshot, candidate, data, batch, collector)
-                    self._flush(snapshot_id, batch, collector)
+                    self._spill_batch(spill, batch, collector)
+            prepare_ms = int((time.monotonic() - prepare_started) * 1000)
+
+            # Phase 2: one short transaction replaces the derived rows. Readers
+            # see either the previous complete index or the new complete index.
+            write_started = time.monotonic()
+            with self.db.transaction():
+                self.files.clear_snapshot_index(snapshot_id)
+                if discovery_issues:
+                    self.issues.insert_many(discovery_issues)
+                    collector.issues += len(discovery_issues)
+                self._replay_spill(spill_path, snapshot_id)
 
                 unresolved_issues = self._resolve_edges(snapshot, collector)
                 if unresolved_issues:
@@ -205,7 +229,15 @@ class Indexer:
                     collector.issues += len(unresolved_issues)
 
                 collector.manifest_artifact_id = self._write_manifest(snapshot, collector)
-                report = self._finish(snapshot, repository, collector, started_monotonic)
+                write_ms = int((time.monotonic() - write_started) * 1000)
+                report = self._finish(
+                    snapshot,
+                    repository,
+                    collector,
+                    started_monotonic,
+                    prepare_ms=prepare_ms,
+                    write_ms=write_ms,
+                )
                 self._complete(snapshot, repository, collector, report, started)
             return report
         except BaseException as exc:  # noqa: BLE001 - status must be repaired on any exit
@@ -219,6 +251,17 @@ class Indexer:
                     hint="The previous index (if any) was preserved. See `maya events` for details.",
                 ) from exc
             raise
+        finally:
+            if spill_path is not None:
+                try:
+                    os.unlink(spill_path)
+                except OSError:  # pragma: no cover - already removed
+                    pass
+
+    def _spill_dir(self):  # type: ignore[no-untyped-def]
+        target = self.artifacts.root / "tmp"
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return target
 
     # --------------------------------------------------------------- lifecycle
     def _begin(self, snapshot: RepositorySnapshot, repository: Repository) -> None:
@@ -282,6 +325,8 @@ class Indexer:
                     "issues": report.issues,
                     "bytes_indexed": report.bytes_indexed,
                     "duration_ms": report.duration_ms,
+                    "prepare_ms": report.prepare_ms,
+                    "write_ms": report.write_ms,
                     "manifest_artifact_id": report.manifest_artifact_id,
                 },
             )
@@ -666,23 +711,53 @@ class Indexer:
         return issues
 
     # ------------------------------------------------------------------ persist
-    def _flush(self, snapshot_id: str, batch: _FileBatch, collector: "_Collector") -> None:
+    def _spill_batch(self, spill, batch: _FileBatch, collector: "_Collector") -> None:
+        """Write one prepared batch to the spill file and update counters."""
         collector.add_manifest(batch.manifest)
-        if batch.files:
-            self.files.insert_files(batch.files)
-        for file_id, lines in batch.lines.items():
-            self.files.insert_lines(snapshot_id, lines)
-        if batch.symbols:
-            self.symbols.insert_many(batch.symbols)
-        if batch.aliases:
-            self.files.insert_import_aliases(snapshot_id, batch.aliases)
-        if batch.edges:
-            self.symbols.insert_edges(batch.edges)
-        if batch.issues:
-            self.issues.insert_many(batch.issues)
-            collector.issues += len(batch.issues)
         collector.files += len(batch.files)
+        collector.issues += len(batch.issues)
+        payload = {
+            "files": [item.model_dump(mode="json") for item in batch.files],
+            "symbols": [item.model_dump(mode="json") for item in batch.symbols],
+            "edges": [item.model_dump(mode="json") for item in batch.edges],
+            "issues": [item.model_dump(mode="json") for item in batch.issues],
+            "aliases": [list(item) for item in batch.aliases],
+            "lines": {
+                file_id: [[line_no, text] for _file_id, line_no, text in rows]
+                for file_id, rows in batch.lines.items()
+            },
+        }
+        spill.write(json.dumps(payload, ensure_ascii=False))
+        spill.write("\n")
         batch.reset()
+
+    def _replay_spill(self, spill_path: str, snapshot_id: str) -> None:
+        """Insert spilled batches inside the rebuild transaction."""
+        with open(spill_path, encoding="utf-8") as spill:
+            for line in spill:
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                files = [IndexedFile.model_validate(item) for item in payload["files"]]
+                if files:
+                    self.files.insert_files(files)
+                for file_id, rows in payload["lines"].items():
+                    self.files.insert_lines(
+                        snapshot_id,
+                        [(file_id, int(line_no), text) for line_no, text in rows],
+                    )
+                symbols = [Symbol.model_validate(item) for item in payload["symbols"]]
+                if symbols:
+                    self.symbols.insert_many(symbols)
+                aliases = [tuple(item) for item in payload["aliases"]]
+                if aliases:
+                    self.files.insert_import_aliases(snapshot_id, aliases)
+                edges = [SymbolEdge.model_validate(item) for item in payload["edges"]]
+                if edges:
+                    self.symbols.insert_edges(edges)
+                issues = [IndexIssue.model_validate(item) for item in payload["issues"]]
+                if issues:
+                    self.issues.insert_many(issues)
 
     def _write_manifest(
         self, snapshot: RepositorySnapshot, collector: "_Collector"
@@ -713,6 +788,9 @@ class Indexer:
         repository: Repository,
         collector: "_Collector",
         started_monotonic: float,
+        *,
+        prepare_ms: int = 0,
+        write_ms: int = 0,
     ) -> IndexReport:
         duration_ms = int((time.monotonic() - started_monotonic) * 1000)
         unresolved = collector.edges - collector.edges_resolved
@@ -742,6 +820,8 @@ class Indexer:
             languages=languages,
             parse_coverage=coverage,
             duration_ms=duration_ms,
+            prepare_ms=prepare_ms,
+            write_ms=write_ms,
             manifest_artifact_id=collector.manifest_artifact_id,
             warnings=warnings,
         )
@@ -791,6 +871,8 @@ class _Collector:
             "languages": report.languages,
             "parse_coverage": report.parse_coverage,
             "duration_ms": report.duration_ms,
+            "prepare_ms": report.prepare_ms,
+            "write_ms": report.write_ms,
             "manifest_artifact_id": report.manifest_artifact_id,
         }
 

@@ -6,6 +6,7 @@ import pytest
 
 from mayaworkbench.domain.enums import ApprovalStatus, TaskType, WorkflowState
 from mayaworkbench.errors import ApprovalError, TaskError
+from mayaworkbench.verification.registry import command_check
 from mayaworkbench.worker import Worker
 
 
@@ -18,6 +19,13 @@ def make_task(services, indexed, *, allowed=("utils.py",), max_steps=8, max_tool
         snapshot_id=indexed.snapshot.id,
         allowed_paths=list(allowed),
         acceptance_criteria=["count_tokens returns the number of words"],
+        verification_checks=[
+            command_check(
+                "python -c \"from utils import count_tokens; assert count_tokens('a b') == 2; print('ok')\"",
+                criteria=["AC1"],
+                timeout_seconds=30,
+            )
+        ],
         constraints={
             "max_steps": max_steps,
             "max_tool_calls": max_tools,
@@ -192,6 +200,14 @@ def test_full_agent_flow_keeps_original_checkout_and_records_patch(
     review = services.task_service.review_run(run.id)
     assert review.scope_ok is True
     assert review.secrets_found is False
+    report, checks = services.task_service.verify_run(run.id)
+    assert report.decision.value in {"ACCEPTED", "COMPLETED_WITH_LIMITATIONS"}, report.blocking
+    assert any(item.key.startswith("command.") for item in checks)
+    assert all(
+        item.outcome.value == "PASSED"
+        for item in checks
+        if item.key == "scope.integrity"
+    )
     finished = services.task_service.finish_run(
         run.id, accept=True, reason="targeted change is reviewable"
     )

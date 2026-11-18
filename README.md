@@ -7,11 +7,13 @@ evidence from that snapshot — with every claim traceable to a file, line range
 and verified quote.
 
 Phase 0 (product/architecture contracts), Phase 1 (repository intelligence),
-Phase 2 (research intelligence and claim-to-code mapping) and Phase 3 (task
-contracts, approvals, isolated worktrees, patch verification and the bounded
-agent loop) are implemented and covered by tests. The evaluation harness for
-agent runs (Phase 4) and hosted multi-user hardening are designed but
-deliberately not stubbed — see
+Phase 2 (research intelligence and claim-to-code mapping), Phase 3 (task
+contracts, approvals, isolated worktrees and the bounded agent loop) and Phase 4
+(verification and evidence: deterministic checks, baseline comparison, test
+integrity, ML invariants, independent review, evidence graph and bundles) are
+implemented and covered by tests. Hosted multi-user hardening and labelled
+corpus scoring remain designed but deliberately not stubbed — see
+[docs/phase-4-report.md](docs/phase-4-report.md) and
 [docs/implementation-gap-analysis.md](docs/implementation-gap-analysis.md).
 
 ## The problem
@@ -103,15 +105,29 @@ maya task start <task>
 maya task approve <approval>       # once per requested approval
 maya task run <task>
 maya task diff <run>
-maya task review <run>
+maya verify run <run>              # declared checks, baseline comparison, report
+maya verify show <run>
+maya verify bundle <run> --out evidence/
+maya verify check-bundle evidence/
 maya task finish <run> --accept --reason "reviewed by me"
+```
+
+Declare what must be executed when the task is created; verification never
+invents a check or authorizes a command:
+
+```bash
+maya task create --goal "Add count_occurrences" --allow-path more_itertools/recipes.py \
+  --acceptance "counts matching items" \
+  --check 'python -m pytest tests/test_recipes.py -q' --check-criteria AC1 \
+  --invariant 'forward_smoke:module=model,callable=Model,shape=1x4x32'
 ```
 
 `--network ALLOW_WITH_APPROVAL` is an explicit opt-in. The default,
 `DENY_BY_DEFAULT`, refuses to start a command on a host where a network
-namespace cannot be established and verified. `task finish --accept` records a
-user decision after a structural diff review; it is not deterministic
-verification (Phase 4).
+namespace cannot be established and verified. `task finish --accept` requires a
+verification report and refuses a `REJECTED`, `BLOCKED` or `INCONCLUSIVE`
+decision unless `--override` is passed with a reason; the override is recorded
+as a limitation and an event, and the report is never rewritten.
 
 Include uncommitted work on purpose:
 
@@ -156,7 +172,10 @@ logs/                    optional structured logs
 | `maya task start\|approve\|deny\|approvals` | Plan and approve write/command execution |
 | `maya task run\|status\|pause\|resume\|cancel` | Execute in the worker and control the run |
 | `maya task diff\|review\|finish` | Capture the patch, structurally review it, accept or reject |
-| `maya task cleanup\|export` | Remove the worktree or export an evidence bundle |
+| `maya verify checks\|plan` | List built-in checks and inspect/suggest declared checks |
+| `maya verify run\|show\|report` | Run an append-only attempt; inspect or write the report |
+| `maya verify bundle\|check-bundle` | Export and independently re-verify an evidence bundle |
+| `maya task cleanup\|export` | Remove the worktree or export a run bundle |
 | `maya worker [--once] [--run-id]` | Run the durable task worker process |
 | `maya issues` | Index issues filtered by kind or severity |
 | `maya events` | Append-only workflow event log |
@@ -223,6 +242,18 @@ features:
   discovery is incomplete.
 - **Readiness is a heuristic, not a probability.** Factors with no recorded facts
   stay `UNKNOWN`, and an overall value is withheld below 75% known weight.
+- **Verification proves only what a declared check exercised.** With no
+  functional check declared, the decision is `INCONCLUSIVE`. Baseline
+  comparison runs on the same host/interpreter; if the base revision cannot run
+  the check, the report records `BASELINE_UNAVAILABLE` as a limitation.
+- **Test integrity is structural, not semantic.** It detects common weakening
+  patterns (deleted/skipped tests, reduced assertions, tautologies, inflated
+  tolerances, config weakening), not every way a test can be gamed.
+- **The independent reviewer is advisory and needs a model.** It can only read
+  the captured diff and check metadata; without a model the check is `SKIPPED`
+  and the report says so. It can never turn a failed check into a pass.
+- **SQLite is single-host.** The database refuses known network filesystems
+  (NFS/SMB/9p/…) instead of pretending WAL locking is safe there.
 
 ## Repository layout
 
@@ -238,10 +269,11 @@ src/mayaworkbench/
   qa/                  prompts, deterministic citation validation, answer pipeline
   research/            documents, passages, claims, DAG, readiness, memos
   mapping/             signals, evidence discovery, rule pack, adjudication
+  verification/        check registry, test integrity, reviewer, report, bundle
   app/container.py     composition root
   cli/                 argparse CLI and human/JSON renderers
-tests/                 pytest suite (storage, snapshots, indexing, retrieval, QA, research, mapping, CLI)
-docs/                  Phase 0 contracts and the Phase 1/2 reports
+tests/                 pytest suite (storage, snapshots, indexing, retrieval, QA, research, mapping, CLI, verification)
+docs/                  Phase 0 contracts and the Phase 1–4 reports
 ```
 
 ## Testing
@@ -269,5 +301,9 @@ the previous index intact, invalid citations withhold the answer, and
 - [Implementation gap analysis](docs/implementation-gap-analysis.md)
 - [Phase 1 report](docs/phase-1-report.md)
 - [Phase 2 report](docs/phase-2-report.md)
+- [Phase 3 report](docs/phase-3-report.md)
+- [Phase 4 report](docs/phase-4-report.md)
 - [ADR 0007 — claims, mapping and readiness](docs/adr/0007-claims-mapping-and-readiness.md)
+- [ADR 0008 — controlled engineering agent](docs/adr/0008-controlled-engineering-agent.md)
+- [ADR 0009 — verification and evidence](docs/adr/0009-verification-and-evidence.md)
 - [Architecture decision records](docs/adr/)

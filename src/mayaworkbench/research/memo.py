@@ -68,6 +68,10 @@ from mayaworkbench.storage.stores import (
 )
 from mayaworkbench.version import MAYA_VERSION, MEMO_PROTOCOL_VERSION
 
+#: A memo needs the claim set to compute readiness. Beyond this bound the
+#: command refuses explicitly instead of holding an unbounded list in memory.
+MAX_MEMO_CLAIMS = 20_000
+
 INTERPRETATION_START = "<!-- maya:interpretation:start -->"
 INTERPRETATION_END = "<!-- maya:interpretation:end -->"
 DEVIATIONS_START = "<!-- maya:deviations:start -->"
@@ -309,13 +313,27 @@ class MemoService:
         document: ResearchDocument | None,
         snapshot: RepositorySnapshot | None,
     ) -> "_MemoContext":
-        claims = self.claims.list(project_id=project.id, limit=1_000_000)
-        if document is not None:
-            # Project-level requirements and implementation decisions (no document)
-            # belong to every document memo; only other documents' claims are excluded.
-            claims = [
-                claim for claim in claims if claim.document_id in (None, document.id)
-            ]
+        # Scope the query, not a post-fetch list filter: a project with many
+        # documents previously loaded every claim into memory for a memo about
+        # one document. A whole-project memo still needs the claim set, but it
+        # now fails explicitly instead of exhausting memory without a message.
+        claims = self.claims.list(
+            project_id=project.id,
+            document_ids=[document.id] if document is not None else None,
+            include_project_level=True,
+            limit=MAX_MEMO_CLAIMS + 1,
+        )
+        if len(claims) > MAX_MEMO_CLAIMS:
+            from mayaworkbench.errors import UsageError
+
+            raise UsageError(
+                f"This memo would cover more than {MAX_MEMO_CLAIMS} claims",
+                hint=(
+                    "Generate a document-scoped memo (`maya research memo --document <id>`) "
+                    "or split the research project. Readiness is not computed on a truncated "
+                    "claim set."
+                ),
+            )
         dependencies = self.claims.list_dependencies(
             claim_ids=[claim.id for claim in claims]
         )

@@ -19,7 +19,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mayaworkbench.clock import utcnow
 from mayaworkbench.domain.enums import (
@@ -27,17 +27,22 @@ from mayaworkbench.domain.enums import (
     ApprovalAction,
     ApprovalStatus,
     ArtifactKind,
+    CheckKind,
+    CheckOutcome,
     ClaimAuthor,
     ClaimConfidence,
     ClaimMappingStatus,
     ClaimReviewStatus,
     ClaimType,
+    CriterionStatus,
     DocumentMediaKind,
     DocumentOrigin,
     EdgeConfidence,
     EdgeType,
     EventType,
+    EvidenceRelation,
     EvidenceStrength,
+    FindingSeverity,
     ExtractionStatus,
     FileStatus,
     IssueKind,
@@ -51,8 +56,11 @@ from mayaworkbench.domain.enums import (
     RiskCategory,
     RiskSeverity,
     SnapshotKind,
+    TaskDecision,
     TaskType,
     ToolCallStatus,
+    VerificationGate,
+    VerificationMethod,
     WorkflowState,
     WorkerJobStatus,
     WorkspaceStatus,
@@ -640,6 +648,89 @@ class TaskScope(Record):
         return cleaned
 
 
+class InvariantSpec(Record):
+    """One ML-specific invariant template and its parameters.
+
+    The template is rendered into a self-contained script and executed through
+    the same command policy as any other check. Parameters are validated here,
+    never interpolated into a shell.
+    """
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{2,40}$")
+    module: str = Field(min_length=1, max_length=300)
+    callable: str | None = Field(default=None, max_length=200)
+    input_shape: list[int] = Field(default_factory=lambda: [1, 4, 32], min_length=1, max_length=6)
+    dtype: str = "float32"
+    seed: int = Field(default=0, ge=0, le=2**31 - 1)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("input_shape")
+    @classmethod
+    def _shape_positive(cls, values: list[int]) -> list[int]:
+        if any(value < 1 or value > 1_000_000 for value in values):
+            raise ValueError("input_shape dimensions must be between 1 and 1,000,000")
+        return values
+
+    @field_validator("dtype")
+    @classmethod
+    def _dtype_allowed(cls, value: str) -> str:
+        allowed = {"float32", "float64", "float16", "bfloat16"}
+        if value not in allowed:
+            raise ValueError(f"dtype must be one of {sorted(allowed)}")
+        return value
+
+
+class CheckSpec(Record):
+    """A declared verification check, pinned in the task contract.
+
+    A command check is an argv array, never shell text. An invariant check names
+    a built-in template whose generated script runs through the command policy.
+    """
+
+    key: str = Field(pattern=r"^[a-z][a-z0-9_.-]{2,80}$")
+    gate: VerificationGate
+    kind: CheckKind
+    title: str = Field(min_length=1, max_length=300)
+    required: bool = True
+    argv: list[str] | None = None
+    timeout_seconds: int = Field(default=300, ge=1, le=86_400)
+    criteria: list[str] = Field(default_factory=list)
+    invariant: InvariantSpec | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("criteria")
+    @classmethod
+    def _criteria_shape(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if not re.match(r"^AC[0-9]{1,4}$", value):
+                raise ValueError(
+                    "criteria references use the AC<n> ids derived from the contract's "
+                    "acceptance criteria in order"
+                )
+        return values
+
+    @model_validator(mode="after")
+    def _kind_payload(self) -> "CheckSpec":
+        if self.kind == CheckKind.COMMAND:
+            if not self.argv or not all(isinstance(arg, str) and arg for arg in self.argv):
+                raise ValueError("a COMMAND check requires a non-empty argv array")
+            if self.invariant is not None:
+                raise ValueError("a COMMAND check cannot also declare an invariant")
+        elif self.kind == CheckKind.ML_INVARIANT:
+            if self.invariant is None:
+                raise ValueError("an ML_INVARIANT check requires an invariant specification")
+            if not self.invariant.callable:
+                raise ValueError(
+                    "an ML_INVARIANT check requires invariant.callable; every template "
+                    "calls the named target"
+                )
+            if self.argv:
+                raise ValueError("an ML_INVARIANT check derives its command from the template")
+        else:
+            raise ValueError("CheckSpec supports COMMAND and ML_INVARIANT kinds only")
+        return self
+
+
 class TaskConstraints(Record):
     """Budgets and permissions a run may not exceed."""
 
@@ -653,6 +744,7 @@ class TaskConstraints(Record):
     max_steps: int = Field(default=30, ge=1, le=200)
     max_tool_calls: int = Field(default=120, ge=1, le=1000)
     max_output_bytes: int = Field(default=200_000, ge=1024, le=10_000_000)
+    max_processes: int = Field(default=128, ge=8, le=4096)
     allow_file_deletion: bool = False
     # An unknown model price is not zero. Set this only when the user accepts
     # spend that the contract cannot bound.
@@ -688,6 +780,7 @@ class TaskContract(Record):
     acceptance_criteria: list[str] = Field(min_length=1)
     unknowns: list[str] = Field(default_factory=list)
     research_context: ResearchContextRef | None = None
+    verification_checks: list[CheckSpec] = Field(default_factory=list)
     required_approvals: list[ApprovalAction] = Field(
         default_factory=lambda: [ApprovalAction.WRITE_ACCESS, ApprovalAction.COMMAND_EXECUTION]
     )
@@ -868,6 +961,133 @@ class TaskReview(Record):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+# ------------------------------------------------------- verification (Phase 4)
+class VerificationRun(Record):
+    """One verification attempt over one workflow run.
+
+    Attempts are append-only: re-running verification never rewrites the checks
+    a report was based on.
+    """
+
+    id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    attempt: int = Field(ge=1)
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["RUNNING", "COMPLETED", "FAILED"] = "RUNNING"
+    started_at: datetime = Field(default_factory=utcnow)
+    completed_at: datetime | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class VerificationFinding(Record):
+    """One finding produced by a check or reviewer.
+
+    ``source`` distinguishes deterministic evidence from model interpretation;
+    a model finding can never be reported as a deterministic result.
+    """
+
+    severity: FindingSeverity = FindingSeverity.WARNING
+    code: str = Field(min_length=3, max_length=80, pattern=r"^[A-Z][A-Z0-9_]{2,79}$")
+    message: str = Field(min_length=1, max_length=4000)
+    path: str | None = Field(default=None, max_length=1000)
+    line: int | None = Field(default=None, ge=1)
+    criterion_ref: str | None = Field(default=None, pattern=r"^AC[0-9]{1,4}$")
+    source: str = Field(default="deterministic", max_length=40)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class VerificationCheck(Record):
+    """The recorded result of one check. Evidence, not a verdict by itself."""
+
+    id: str
+    verification_id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    key: str
+    gate: VerificationGate
+    kind: CheckKind
+    title: str
+    method: VerificationMethod
+    outcome: CheckOutcome
+    required: bool = True
+    criteria: list[str] = Field(default_factory=list)
+    command: list[str] = Field(default_factory=list)
+    exit_code: int | None = None
+    duration_ms: int | None = None
+    artifact_id: str | None = None
+    summary: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+    findings: list[VerificationFinding] = Field(default_factory=list)
+    started_at: datetime = Field(default_factory=utcnow)
+    completed_at: datetime | None = None
+    schema_version: str = "1.0"
+
+    @property
+    def blocking(self) -> bool:
+        return self.required and self.outcome in {
+            CheckOutcome.FAILED,
+            CheckOutcome.BLOCKED,
+            CheckOutcome.INCONCLUSIVE,
+            CheckOutcome.UNVERIFIED,
+        }
+
+
+class CriterionAssessment(Record):
+    """Evidence status for one acceptance criterion, by its AC<n> id."""
+
+    criterion_id: str = Field(pattern=r"^AC[0-9]{1,4}$")
+    text: str
+    status: CriterionStatus = CriterionStatus.UNVERIFIED
+    check_keys: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class VerificationReport(Record):
+    """The decision and its evidence. Never rewritten after creation."""
+
+    id: str
+    verification_id: str
+    run_id: str
+    task_id: str
+    project_id: str
+    decision: TaskDecision
+    summary: str
+    criteria: list[CriterionAssessment] = Field(default_factory=list)
+    check_ids: list[str] = Field(default_factory=list)
+    blocking: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    report_artifact_id: str | None = None
+    json_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reviewer_invocation_id: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class EvidenceLink(Record):
+    """One edge in the evidence graph.
+
+    Kinds are a small closed vocabulary so a report can be verified mechanically:
+    ``CRITERION``, ``CHECK``, ``ARTIFACT``, ``FILE_SPAN``, ``COMMAND``,
+    ``MODEL_REVIEW``, ``HUMAN_NOTE``, ``CLAIM``.
+    """
+
+    id: str
+    verification_id: str
+    run_id: str
+    report_id: str | None = None
+    from_kind: str = Field(max_length=40)
+    from_ref: str = Field(max_length=1000)
+    relation: EvidenceRelation
+    to_kind: str = Field(max_length=40)
+    to_ref: str = Field(max_length=1000)
+    note: str = ""
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class WorkerJob(Record):
     """Durable queue entry for the separate local worker process."""
 
@@ -926,6 +1146,14 @@ __all__ = [
     "ReviewFinding",
     "TaskReview",
     "WorkerJob",
+    "InvariantSpec",
+    "CheckSpec",
+    "VerificationRun",
+    "VerificationFinding",
+    "VerificationCheck",
+    "CriterionAssessment",
+    "VerificationReport",
+    "EvidenceLink",
     "ArtifactKind",
     "EventType",
     "QaStatus",

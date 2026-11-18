@@ -259,9 +259,11 @@ def build_parser() -> argparse.ArgumentParser:
     # area is caught by a parser test rather than by a user (MWB-001).
     from mayaworkbench.cli.research_commands import register_research_commands
     from mayaworkbench.cli.task_commands import register_task_commands
+    from mayaworkbench.cli.verification_commands import register_verification_commands
 
     register_research_commands(sub)
     register_task_commands(sub)
+    register_verification_commands(sub)
 
     worker = sub.add_parser("worker", help="Run the durable task worker process")
     worker.add_argument("--once", action="store_true", help="Process one job and exit")

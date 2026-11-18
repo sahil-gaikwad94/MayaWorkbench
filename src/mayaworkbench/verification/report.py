@@ -1,0 +1,600 @@
+"""Evidence graph, decision rules and report rendering (§13.2, §13.5, Gate G).
+
+The report is built from recorded checks. It never upgrades a claim because a
+model said so, and it never reports a check that did not run. Its vocabulary
+separates what was implemented from what was validated.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Iterable
+
+from mayaworkbench.domain.enums import (
+    CheckKind,
+    CheckOutcome,
+    CriterionStatus,
+    EvidenceRelation,
+    FindingSeverity,
+    TaskDecision,
+    WorkflowState,
+)
+from mayaworkbench.domain.models import (
+    CheckSpec,
+    CriterionAssessment,
+    EvidenceLink,
+    Task,
+    TaskContract,
+    TaskDiff,
+    VerificationCheck,
+    WorkflowRun,
+)
+from mayaworkbench.ids import new_ulid
+
+FUNCTIONAL_KINDS = {CheckKind.COMMAND, CheckKind.ML_INVARIANT}
+
+
+def criteria_from_contract(contract: TaskContract) -> list[tuple[str, str]]:
+    return [
+        (f"AC{index}", text)
+        for index, text in enumerate(contract.acceptance_criteria, start=1)
+    ]
+
+
+def assess_criteria(
+    criteria: list[tuple[str, str]],
+    checks: list[VerificationCheck],
+) -> list[CriterionAssessment]:
+    assessments: list[CriterionAssessment] = []
+    for criterion_id, text in criteria:
+        mapped = [check for check in checks if criterion_id in check.criteria]
+        passed = [check for check in mapped if check.outcome == CheckOutcome.PASSED]
+        failed = [check for check in mapped if check.outcome == CheckOutcome.FAILED]
+        if failed:
+            status = CriterionStatus.FAILED
+            note = "Failing checks: " + ", ".join(check.key for check in failed)
+        elif passed and len(passed) == len(mapped):
+            status = CriterionStatus.VERIFIED
+            note = "Verified by: " + ", ".join(check.key for check in passed)
+        elif passed:
+            status = CriterionStatus.PARTIAL
+            note = (
+                "Passed: "
+                + ", ".join(check.key for check in passed)
+                + " · no outcome: "
+                + ", ".join(
+                    f"{check.key}={check.outcome.value}"
+                    for check in mapped
+                    if check.outcome != CheckOutcome.PASSED
+                )
+            )
+        elif mapped:
+            status = CriterionStatus.UNVERIFIED
+            note = "Declared checks did not produce a pass: " + ", ".join(
+                f"{check.key}={check.outcome.value}" for check in mapped
+            )
+        else:
+            status = CriterionStatus.UNVERIFIED
+            note = (
+                "No declared check references this criterion. Source inspection of "
+                "the diff shows a change exists, but it is not functional evidence."
+            )
+        assessments.append(
+            CriterionAssessment(
+                criterion_id=criterion_id,
+                text=text,
+                status=status,
+                check_keys=[check.key for check in mapped],
+                note=note,
+            )
+        )
+    return assessments
+
+
+def _preexisting(check: VerificationCheck) -> bool:
+    return bool(check.details.get("preexisting_failure"))
+
+
+def decide(
+    *,
+    run: WorkflowRun,
+    checks: list[VerificationCheck],
+    criteria: list[CriterionAssessment],
+    reviewer: dict[str, Any] | None,
+    declared_specs: Iterable[CheckSpec],
+) -> tuple[TaskDecision, list[str], list[str]]:
+    """Compute a decision from recorded evidence only."""
+    blocking: list[str] = []
+    limitations: list[str] = list(run.limitations)
+    required = [check for check in checks if check.required]
+    declared = list(declared_specs)
+
+    if run.state == WorkflowState.CANCELLED:
+        return TaskDecision.INCONCLUSIVE, ["the run was cancelled"], limitations
+    if run.state == WorkflowState.FAILED:
+        return TaskDecision.FAILED, [run.error or "the run failed"], limitations
+    if run.state == WorkflowState.BLOCKED:
+        return TaskDecision.BLOCKED, [run.error or "the run was blocked"], limitations
+
+    hard_failures = [
+        check
+        for check in required
+        if check.outcome == CheckOutcome.FAILED and not _preexisting(check)
+    ]
+    if hard_failures:
+        blocking.extend(
+            f"{check.key} failed: {check.summary or 'no summary'}" for check in hard_failures
+        )
+        return TaskDecision.REJECTED, blocking, limitations
+
+    blocked = [check for check in required if check.outcome == CheckOutcome.BLOCKED]
+    if blocked:
+        blocking.extend(
+            f"{check.key} was blocked: {check.summary or 'no summary'}" for check in blocked
+        )
+        return TaskDecision.BLOCKED, blocking, limitations
+
+    no_evidence = [
+        check
+        for check in required
+        if check.outcome
+        in {CheckOutcome.INCONCLUSIVE, CheckOutcome.UNVERIFIED, CheckOutcome.SKIPPED}
+    ]
+    if no_evidence:
+        for check in no_evidence:
+            limitations.append(
+                f"{check.key} produced no usable evidence ({check.outcome.value}): "
+                f"{check.summary or 'no summary'}"
+            )
+        # A passing built-in (scope, diff, reproducibility) is not evidence that
+        # the implementation works. If every declared functional check was
+        # skipped or inconclusive, the honest decision is INCONCLUSIVE even
+        # though deterministic gates passed.
+        if not any(
+            check.outcome == CheckOutcome.PASSED and check.kind in FUNCTIONAL_KINDS
+            for check in required
+        ):
+            blocking.append("no required functional check produced a passing result")
+            return TaskDecision.INCONCLUSIVE, blocking, limitations
+
+    if not any(check.kind in FUNCTIONAL_KINDS for check in checks):
+        blocking.append(
+            "no functional check (command or ML invariant) was declared, so the "
+            "implementation is inspected but not validated"
+        )
+        return TaskDecision.INCONCLUSIVE, blocking, limitations
+
+    failed_criteria = [
+        item for item in criteria if item.status == CriterionStatus.FAILED
+    ]
+    if failed_criteria:
+        blocking.extend(
+            f"{item.criterion_id} failed: {item.note}" for item in failed_criteria
+        )
+        return TaskDecision.REJECTED, blocking, limitations
+
+    reviewer_findings = (reviewer or {}).get("findings", [])
+    blocking_review = [
+        item
+        for item in reviewer_findings
+        if item.get("severity") in {"ERROR", "BLOCKER"} and item.get("source") == "model_review"
+    ]
+    if any(item.get("severity") == "BLOCKER" for item in blocking_review):
+        blocking.append("the independent reviewer raised a BLOCKER finding")
+        return TaskDecision.NEEDS_HUMAN_DECISION, blocking, limitations
+
+    warnings = [
+        finding
+        for check in checks
+        for finding in check.findings
+        if finding.severity in {FindingSeverity.WARNING, FindingSeverity.ERROR}
+    ]
+    preexisting = [check for check in required if _preexisting(check)]
+    for check in preexisting:
+        limitations.append(
+            f"{check.key} already failed before the change; the failure is not "
+            "attributed to this patch, and it is not evidence that the change works."
+        )
+    unverified = [
+        item for item in criteria if item.status != CriterionStatus.VERIFIED
+    ]
+    for item in unverified:
+        limitations.append(
+            f"{item.criterion_id} is {item.status.value.lower()}: {item.note}"
+        )
+    if warnings:
+        limitations.append(
+            f"{len(warnings)} check finding(s) require review; see the report."
+        )
+    if blocking_review:
+        limitations.append(
+            f"the independent reviewer raised {len(blocking_review)} error-level finding(s)."
+        )
+    if (reviewer or {}).get("same_model_as_implementer"):
+        limitations.append(
+            "the reviewer model is the same model that implemented the change; "
+            "independence is reduced."
+        )
+    if (reviewer or {}).get("skipped_reason"):
+        limitations.append(
+            "independent review did not run: " + str(reviewer["skipped_reason"])
+        )
+    if (reviewer or {}).get("diff_truncated"):
+        limitations.append("the reviewer received a truncated diff.")
+
+    reviewer_concerns = (reviewer or {}).get("assessment") in {"CONCERNS", "UNSOUND"}
+    if unverified or warnings or preexisting or blocking_review or reviewer_concerns or declared == []:
+        return TaskDecision.COMPLETED_WITH_LIMITATIONS, blocking, _dedupe(limitations)
+    return TaskDecision.ACCEPTED, blocking, _dedupe(limitations)
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def build_evidence_links(
+    *,
+    verification_id: str,
+    run_id: str,
+    report_id: str,
+    checks: list[VerificationCheck],
+    criteria: list[CriterionAssessment],
+    reviewer: dict[str, Any] | None,
+    patch_sha256: str,
+) -> list[EvidenceLink]:
+    links: list[EvidenceLink] = []
+    for check in checks:
+        relation = (
+            EvidenceRelation.CONTRADICTS
+            if check.outcome == CheckOutcome.FAILED
+            else EvidenceRelation.SUPPORTS
+        )
+        for criterion_id in check.criteria:
+            links.append(
+                EvidenceLink(
+                    id="evl_" + new_ulid(),
+                    verification_id=verification_id,
+                    run_id=run_id,
+                    report_id=report_id,
+                    from_kind="CHECK",
+                    from_ref=check.key,
+                    relation=relation,
+                    to_kind="CRITERION",
+                    to_ref=criterion_id,
+                    note=check.outcome.value,
+                )
+            )
+        if check.artifact_id:
+            links.append(
+                EvidenceLink(
+                    id="evl_" + new_ulid(),
+                    verification_id=verification_id,
+                    run_id=run_id,
+                    report_id=report_id,
+                    from_kind="CHECK",
+                    from_ref=check.key,
+                    relation=EvidenceRelation.RECORDED_IN,
+                    to_kind="ARTIFACT",
+                    to_ref=check.artifact_id,
+                    note=check.outcome.value,
+                )
+            )
+        if check.command:
+            links.append(
+                EvidenceLink(
+                    id="evl_" + new_ulid(),
+                    verification_id=verification_id,
+                    run_id=run_id,
+                    report_id=report_id,
+                    from_kind="CHECK",
+                    from_ref=check.key,
+                    relation=EvidenceRelation.DERIVED_FROM,
+                    to_kind="COMMAND",
+                    to_ref=json.dumps(check.command)[:1000],
+                    note=f"exit={check.exit_code}",
+                )
+            )
+    for criterion in criteria:
+        if criterion.status == CriterionStatus.UNVERIFIED:
+            links.append(
+                EvidenceLink(
+                    id="evl_" + new_ulid(),
+                    verification_id=verification_id,
+                    run_id=run_id,
+                    report_id=report_id,
+                    from_kind="CRITERION",
+                    from_ref=criterion.criterion_id,
+                    relation=EvidenceRelation.RECORDED_IN,
+                    to_kind="NOTE",
+                    to_ref=criterion.note[:1000],
+                    note="no check evidence",
+                )
+            )
+    if reviewer:
+        links.append(
+            EvidenceLink(
+                id="evl_" + new_ulid(),
+                verification_id=verification_id,
+                run_id=run_id,
+                report_id=report_id,
+                from_kind="MODEL_REVIEW",
+                from_ref=reviewer.get("check_key", "review.independent"),
+                relation=EvidenceRelation.SUPPORTS,
+                to_kind="CRITERION",
+                to_ref="*",
+                note=str(reviewer.get("assessment", "INCONCLUSIVE")),
+            )
+        )
+    links.append(
+        EvidenceLink(
+            id="evl_" + new_ulid(),
+            verification_id=verification_id,
+            run_id=run_id,
+            report_id=report_id,
+            from_kind="PATCH",
+            from_ref=patch_sha256,
+            relation=EvidenceRelation.RECORDED_IN,
+            to_kind="REPORT",
+            to_ref=report_id,
+            note="the patch hash this report verified",
+            sha256=patch_sha256,
+        )
+    )
+    return links
+
+
+def build_report_payload(
+    *,
+    attempt_id: str,
+    report_id: str,
+    run: WorkflowRun,
+    task: Task,
+    contract: TaskContract,
+    diff: TaskDiff,
+    checks: list[VerificationCheck],
+    criteria: list[CriterionAssessment],
+    decision: TaskDecision,
+    summary: str,
+    blocking: list[str],
+    limitations: list[str],
+    reviewer: dict[str, Any] | None,
+    declared_specs: list[CheckSpec],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "verification_id": attempt_id,
+        "report_id": report_id,
+        "run_id": run.id,
+        "task_id": task.id,
+        "project_id": run.project_id,
+        "snapshot_id": run.snapshot_id,
+        "base_commit_sha": run.base_commit_sha,
+        "contract_sha256": contract.content_sha256,
+        "patch_sha256": diff.patch_sha256,
+        "decision": decision.value,
+        "summary": summary,
+        "blocking": blocking,
+        "limitations": limitations,
+        "criteria": [item.model_dump(mode="json") for item in criteria],
+        "checks": [item.model_dump(mode="json") for item in checks],
+        "declared_checks": [item.model_dump(mode="json") for item in declared_specs],
+        "reviewer": reviewer,
+        "evidence_classification": evidence_classification(checks, reviewer, diff),
+        "generated_at": _now_iso(),
+    }
+
+
+def evidence_classification(
+    checks: list[VerificationCheck],
+    reviewer: dict[str, Any] | None,
+    diff: TaskDiff,
+) -> dict[str, Any]:
+    """Separate implemented, checked, model-assessed and unverified claims."""
+    functional = [check for check in checks if check.kind in FUNCTIONAL_KINDS]
+    return {
+        "implemented": {
+            "value": bool(diff.files),
+            "basis": f"{len(diff.files)} file(s), +{diff.additions}/-{diff.deletions}",
+        },
+        "deterministically_checked": {
+            "value": any(
+                check.outcome == CheckOutcome.PASSED
+                and check.kind
+                in {CheckKind.COMMAND, CheckKind.TEST_INTEGRITY, CheckKind.DETERMINISTIC}
+                for check in checks
+            ),
+            "basis": [check.key for check in functional if check.outcome == CheckOutcome.PASSED],
+        },
+        "experimentally_observed": {
+            "value": False,
+            "basis": "experiments are Phase 5; no metric observation exists",
+        },
+        "model_assessed": {
+            "value": bool(reviewer and not reviewer.get("skipped_reason")),
+            "basis": (reviewer or {}).get("assessment", "not run"),
+        },
+        "human_confirmed": {
+            "value": False,
+            "basis": "recorded by `maya task finish`, not by verification",
+        },
+        "unverified": [
+            check.key
+            for check in checks
+            if check.outcome
+            in {CheckOutcome.SKIPPED, CheckOutcome.BLOCKED, CheckOutcome.INCONCLUSIVE, CheckOutcome.UNVERIFIED}
+        ],
+    }
+
+
+def render_markdown(
+    payload: dict[str, Any],
+    *,
+    task: Task,
+    run: WorkflowRun,
+    contract: TaskContract,
+) -> str:
+    checks = [VerificationCheck.model_validate(item) for item in payload["checks"]]
+    criteria = [CriterionAssessment.model_validate(item) for item in payload["criteria"]]
+    lines: list[str] = [
+        f"# Verification report: {task.title}",
+        "",
+        f"- Decision: **{payload['decision']}**",
+        f"- Run: `{run.id}`",
+        f"- Snapshot: `{run.snapshot_id}`",
+        f"- Base commit: `{run.base_commit_sha}`",
+        f"- Contract sha256: `{contract.content_sha256}`",
+        f"- Patch sha256: `{payload['patch_sha256']}`",
+        f"- Verification attempt: `{payload['verification_id']}`",
+        "",
+        "## Summary",
+        "",
+        payload["summary"],
+        "",
+        "## Checks",
+        "",
+        "| gate | check | outcome | required | evidence |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for check in checks:
+        evidence = check.artifact_id or ("command" if check.command else "recorded result")
+        lines.append(
+            f"| `{check.gate.value}` | `{check.key}` | `{check.outcome.value}` | "
+            f"{'yes' if check.required else 'no'} | {evidence} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Acceptance criteria",
+            "",
+            "| id | criterion | status | evidence |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for item in criteria:
+        note = item.note.replace("|", "\\|")
+        text = item.text.replace("|", "\\|")
+        lines.append(f"| {item.criterion_id} | {text} | `{item.status.value}` | {note} |")
+    findings = [finding for check in checks for finding in check.findings]
+    lines.extend(["", "## Findings", ""])
+    if findings:
+        for finding in findings:
+            location = finding.path or ""
+            if finding.line:
+                location += f":{finding.line}"
+            lines.append(
+                f"- **{finding.severity.value}** `{finding.code}` {location} — {finding.message}"
+            )
+    else:
+        lines.append("- No findings were recorded.")
+
+    reviewer = payload.get("reviewer")
+    lines.extend(["", "## Independent review", ""])
+    if reviewer and not reviewer.get("skipped_reason"):
+        lines.append(
+            f"- Assessment: **{reviewer.get('assessment', 'INCONCLUSIVE')}** "
+            f"({reviewer.get('reviewer_provider')}/{reviewer.get('reviewer_model')})"
+        )
+        if reviewer.get("same_model_as_implementer"):
+            lines.append(
+                "- The reviewer is the same model as the implementer; this is not "
+                "an independent check."
+            )
+        for item in reviewer.get("findings", []):
+            lines.append(
+                f"- {str(item.get('severity')).upper()} `{item.get('code')}` "
+                f"{item.get('path') or ''} — {item.get('message')}"
+            )
+        if reviewer.get("rejected_findings"):
+            lines.append(
+                f"- {len(reviewer['rejected_findings'])} reviewer finding(s) were rejected "
+                "as ungrounded."
+            )
+    else:
+        lines.append("- Not run or unavailable: " + str((reviewer or {}).get("skipped_reason", "not requested")))
+
+    lines.extend(["", "## What is actually established", ""])
+    classification = payload.get("evidence_classification", {})
+    implemented = classification.get("implemented", {})
+    lines.append(
+        f"- **Implemented:** {implemented.get('value')} ({implemented.get('basis', '')}). "
+        "A diff is not a working behaviour."
+    )
+    checked = classification.get("deterministically_checked", {})
+    lines.append(
+        f"- **Deterministically checked:** {checked.get('value')} "
+        f"({', '.join(checked.get('basis', [])) or 'no passing functional check'})."
+    )
+    lines.append(
+        "- **Experimentally observed:** false — no experiment was run for this task; "
+        "a passing check is not an experiment result."
+    )
+    model_assessed = classification.get("model_assessed", {})
+    lines.append(
+        f"- **Model-assessed:** {model_assessed.get('value')} "
+        f"({model_assessed.get('basis')}). Advisory only."
+    )
+    lines.append("- **Human-confirmed:** recorded separately by `maya task finish`.")
+    unverified = classification.get("unverified", [])
+    lines.append(
+        "- **Unverified:** " + (", ".join(unverified) if unverified else "no check was left unverified")
+    )
+
+    lines.extend(["", "## Limitations and assumptions", ""])
+    if payload["limitations"]:
+        lines.extend(f"- {item}" for item in payload["limitations"])
+    else:
+        lines.append("- None recorded.")
+    if payload["blocking"]:
+        lines.extend(["", "## Blocking reasons", ""])
+        lines.extend(f"- {item}" for item in payload["blocking"])
+    lines.extend(
+        [
+            "",
+            "## Reproduce",
+            "",
+            "```bash",
+            f"maya task diff {run.id}",
+            f"maya verify run {run.id}",
+            f"maya verify bundle {run.id} <new-directory>",
+            "```",
+            "",
+            "This report was generated from recorded checks. It does not claim that "
+            "unlisted checks ran, and it does not treat model review as proof.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def canonical_sha256(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _now_iso() -> str:
+    from mayaworkbench.clock import utcnow
+
+    return utcnow().isoformat()
+
+
+__all__ = [
+    "criteria_from_contract",
+    "assess_criteria",
+    "decide",
+    "build_evidence_links",
+    "build_report_payload",
+    "render_markdown",
+    "evidence_classification",
+    "canonical_sha256",
+    "FUNCTIONAL_KINDS",
+]

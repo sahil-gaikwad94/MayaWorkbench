@@ -1,9 +1,9 @@
 # Implementation gap analysis
 
-This document compares the master specification's Phase 0 and Phase 1
-deliverables with what is actually implemented, and states what is deliberately
-absent. "Implemented" means: exercised by the test suite or the recorded CLI
-run, with failure behaviour included.
+This document compares the master specification's Phase 0–4 deliverables with
+what is actually implemented, and states what is deliberately absent.
+"Implemented" means: exercised by the test suite or the recorded CLI run, with
+failure behaviour included.
 
 ## 1. Phase 0 deliverables
 
@@ -58,14 +58,15 @@ or commands would imply capability that does not exist.
 
 | Deferred | Phase | Why now is the wrong time | Prerequisite already in place |
 | --- | --- | --- | --- |
-| Task contracts and acceptance criteria | 3 | Needs snapshot + QA contracts to reference | snapshot IDs, events, artifacts |
-| Approval gates and authority rules | 3 | Needs a task object to approve | policy layer, event log |
-| Agent worktrees/branches | 3 | Needs task identity and isolation policy | Git adapter, snapshot capture |
-| Patch verification (diff, tests) | 4 | Running repository code is arbitrary execution; needs sandboxing | artifact store, snapshot identity |
-| Test runner integration | 4 | Same execution boundary as above | — |
-| Multi-repository projects | 3+ | Changes snapshot identity/grouping semantics | repository model |
-| Embeddings/vector search | 2+ | Exact identifiers must be correct first; false confidence is worse than none | lexical search, symbol index |
-| Hosted API/UI, auth, tenancy | 3+ | Product is local-first; no security model for multi-user yet | clean service layer, JSON contracts |
+| Labelled evaluation corpus and CI scoring | 4+ | Needs real run bundles and human judgements to score against | verification reports, evidence bundles, decision rules |
+| Multi-repository projects | 5+ | Changes snapshot identity/grouping semantics | repository model |
+| Embeddings/vector search | 5+ | Exact identifiers must be correct first; false confidence is worse than none | lexical search, symbol index |
+| Hosted API/UI, auth, tenancy | 5+ | Product is local-first; no security model for multi-user yet | clean service layer, JSON contracts |
+| Multi-host execution | 5+ | SQLite and worktrees are same-host by design | local filesystem guard, worker leases |
+
+Task contracts, approvals, worktrees, patch capture, test execution, ML
+invariants, independent review, reports and bundles are implemented in Phases
+3–4; see [phase-4-report.md](phase-4-report.md).
 
 ## 4. Deviations from the spec text
 
@@ -99,7 +100,9 @@ or commands would imply capability that does not exist.
 7. **Single-user local state.** No authentication; anyone with filesystem access
    to `$MAYA_HOME` can read the index and QA history.
 8. **No automated evaluation harness yet.** `docs/evaluation-plan.md` defines
-   the metrics; the labelled corpora and CI scoring are Phase 2 work.
+   the metrics; the labelled corpora and CI scoring are not implemented. Per-run
+   evidence (checks, criteria, decisions, bundles) is now recorded, so a corpus
+   can be scored without adding new product surface.
 9. **English-centric tokenisation.** Identifier splitting is ASCII-oriented;
    natural-language tokenisation is `unicode61` but stopwords and compound
    generation are English.
@@ -110,7 +113,7 @@ or commands would imply capability that does not exist.
 
 | Risk | Mitigation |
 | --- | --- |
-| Task contracts designed without real patch-verification data | Run the Phase 4 evaluation corpus manually first; keep contract v0 internal |
+| Claiming verification effectiveness without corpus data | Collect exported bundles and human decisions; do not generalise from one repository |
 | Worktree isolation colliding with user's own uncommitted work | Require a clean base or a dedicated worktree root; test both |
 | Test execution becoming an escape hatch | Sandbox boundary, explicit approval, no network by default |
 | Retrieval quality plateauing | Measure Hit@5 on the labelled corpus before adding embeddings |

@@ -285,7 +285,7 @@ class ReviewService:
             "findings": [item.model_dump(mode="json") for item in findings],
             "note": (
                 "Structural review only. Functional verification and acceptance "
-                "gates are Phase 4; a clean review is not a test result."
+                "are separate (`maya verify run`); a clean review is not a test result."
             ),
             "reviewed_at": utcnow().isoformat(),
         }

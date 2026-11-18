@@ -34,6 +34,7 @@ from mayaworkbench.domain.enums import (
 )
 from mayaworkbench.domain.models import (
     ApprovalRequest,
+    CheckSpec,
     DiffFile,
     ExecutionWorkspace,
     Repository,
@@ -47,6 +48,7 @@ from mayaworkbench.domain.models import (
     TaskReview,
     TaskScope,
     WorkerJob,
+    VerificationReport,
     WorkflowEvent,
     WorkflowRun,
 )
@@ -88,6 +90,8 @@ from mayaworkbench.tasks.approvals import (
 from mayaworkbench.tasks.plans import PlanService
 from mayaworkbench.tasks.review import ReviewService
 from mayaworkbench.tasks.workflow import WorkflowService
+from mayaworkbench.verification.registry import BUILTIN_KEYS
+from mayaworkbench.verification.service import VerificationService
 from mayaworkbench.workspace.policy import PathPolicy, PolicyViolation, is_secret_path
 from mayaworkbench.workspace.worktree import WorktreeManager
 
@@ -139,6 +143,7 @@ class TaskService:
         worktrees: WorktreeManager,
         documents: ResearchDocumentStore,
         claims: ResearchClaimStore,
+        verification: VerificationService,
     ):
         self.paths = paths
         self.settings = settings
@@ -167,6 +172,7 @@ class TaskService:
         self.worktrees = worktrees
         self.documents = documents
         self.claims = claims
+        self.verification = verification
 
     # ------------------------------------------------------------------ create
     def create_task(
@@ -186,6 +192,7 @@ class TaskService:
         research_document_ids: list[str] | None = None,
         claim_ids: list[str] | None = None,
         mapping_artifact_id: str | None = None,
+        verification_checks: list[CheckSpec] | None = None,
         created_by: str = "local-user",
     ) -> tuple[Task, TaskContract]:
         project = self.projects.get(project_id)
@@ -234,6 +241,43 @@ class TaskService:
                 "READ_ONLY/STATIC_ANALYSIS profiles cannot require command execution approval"
             )
 
+        checks = list(verification_checks or [])
+        seen_keys: set[str] = set()
+        criterion_ids = {f"AC{index}" for index in range(1, len(criteria) + 1)}
+        for spec in checks:
+            if spec.key in seen_keys:
+                raise TaskError(f"Duplicate verification check key: {spec.key}")
+            if spec.key in BUILTIN_KEYS:
+                raise TaskError(
+                    f"Verification key {spec.key} is reserved for a built-in check"
+                )
+            seen_keys.add(spec.key)
+            unknown = sorted(set(spec.criteria) - criterion_ids)
+            if unknown:
+                raise TaskError(
+                    f"Check {spec.key} references unknown criteria: {', '.join(unknown)}",
+                    hint=f"Available criteria: {', '.join(sorted(criterion_ids))}.",
+                )
+            if spec.kind.value == "COMMAND" and ApprovalAction.COMMAND_EXECUTION not in approvals:
+                raise TaskError(
+                    f"Check {spec.key} runs a command, but the contract does not require "
+                    "COMMAND_EXECUTION approval",
+                    hint="Verification commands are never authorized implicitly.",
+                )
+            if spec.kind.value == "COMMAND" and parsed_constraints.compute_profile in {
+                "READ_ONLY",
+                "STATIC_ANALYSIS",
+            }:
+                raise TaskError(
+                    f"Check {spec.key} runs a command under a profile that forbids execution"
+                )
+            if spec.timeout_seconds > parsed_constraints.max_runtime_seconds:
+                raise TaskError(
+                    f"Check {spec.key} allows {spec.timeout_seconds}s, but the task's "
+                    f"max_runtime_seconds is {parsed_constraints.max_runtime_seconds}",
+                    hint="A check timeout above the run budget would always be refused.",
+                )
+
         research_context = self._build_research_context(
             project=project,
             document_ids=research_document_ids or [],
@@ -265,6 +309,7 @@ class TaskService:
                 research_context.model_dump(mode="json") if research_context else None
             ),
             "required_approvals": [action.value for action in approvals],
+            "verification_checks": [spec.model_dump(mode="json") for spec in checks],
             "contract_version": "1.0",
         }
         contract = TaskContract(
@@ -281,6 +326,7 @@ class TaskService:
             acceptance_criteria=criteria,
             unknowns=unknowns or [],
             research_context=research_context,
+            verification_checks=checks,
             required_approvals=approvals,
             content_sha256=canonical_sha256(payload),
             created_by=created_by,
@@ -797,6 +843,21 @@ class TaskService:
         )
         return review
 
+    def verify_run(
+        self,
+        run_id: str,
+        *,
+        extra_checks: list[CheckSpec] | None = None,
+        include_review: bool = True,
+    ) -> tuple[VerificationReport, list[Any]]:
+        """Capture the patch if needed and create a new verification attempt."""
+        run = self.runs.get(run_id)
+        if self.diffs.get_by_run(run.id) is None:
+            self.capture_diff(run.id)
+        return self.verification.verify(
+            run.id, extra_checks=extra_checks, include_review=include_review
+        )
+
     def finish_run(
         self,
         run_id: str,
@@ -804,6 +865,7 @@ class TaskService:
         accept: bool,
         reason: str,
         actor: str = "local-user",
+        override: bool = False,
     ) -> WorkflowRun:
         run = self.runs.get(run_id)
         if run.state != WorkflowState.REVIEWING:
@@ -837,12 +899,46 @@ class TaskService:
                 "The candidate patch has blocking review findings; it cannot be accepted",
                 hint="Fix the findings in a new run, or reject this run.",
             )
+        report = self.verification.latest_report(run.id)
+        if report is None:
+            raise TaskError(
+                "Run has no verification report; acceptance requires recorded evidence",
+                hint=f"Run `maya verify run {run.id}` first, or reject this run.",
+            )
+        verified_ok = report.decision.value in {
+            "ACCEPTED",
+            "COMPLETED_WITH_LIMITATIONS",
+        }
+        if not verified_ok and not override:
+            raise TaskError(
+                f"Verification decision is {report.decision.value}; acceptance is refused",
+                hint=(
+                    "Resolve the blocking checks, or pass --override with an explicit "
+                    "reason to record a human override (the report is not changed)."
+                ),
+            )
         warnings = [finding for finding in review.findings if finding.severity == "WARNING"]
         target = (
-            WorkflowState.COMPLETED_WITH_LIMITATIONS
-            if warnings or run.limitations
-            else WorkflowState.COMPLETED
+            WorkflowState.COMPLETED
+            if report.decision.value == "ACCEPTED"
+            and not warnings
+            and not run.limitations
+            and not report.limitations
+            else WorkflowState.COMPLETED_WITH_LIMITATIONS
         )
+        limitations = list(run.limitations)
+        if override and not verified_ok:
+            limitations.append(
+                f"The user overrode verification decision {report.decision.value}: {reason}"
+            )
+        # Limitations belong to the finished run even when the report's decision
+        # is ACCEPTED. Otherwise a report that says "independent review did not
+        # run" could be attached to a run recorded as plain COMPLETED.
+        limitations.extend(
+            item for item in report.limitations if item not in limitations
+        )
+        if limitations != run.limitations:
+            self.runs.update_progress(run.id, limitations=limitations)
         updated = self.workflow.transition(
             run.id,
             target,
@@ -850,7 +946,13 @@ class TaskService:
             actor_kind=ActorKind.USER,
             actor_name=actor,
             finished=True,
-            payload={"review_id": review.id, "warnings": len(warnings)},
+            payload={
+                "review_id": review.id,
+                "verification_report_id": report.id,
+                "verification_decision": report.decision.value,
+                "override": bool(override and not verified_ok),
+                "warnings": len(warnings),
+            },
         )
         self.runs.update_progress(
             run.id,
@@ -858,12 +960,25 @@ class TaskService:
                 **self.runs.get(run.id).details,
                 "decision": target.value,
                 "decision_reason": reason,
-                "verification_note": (
-                    "Phase 3 structural review only. Functional checks and verification "
-                    "gates are Phase 4 and were not applied."
-                ),
+                "verification_report_id": report.id,
+                "verification_decision": report.decision.value,
+                "verification_json_sha256": report.json_sha256,
+                "verification_override": bool(override and not verified_ok),
             },
         )
+        if override and not verified_ok:
+            self._event(
+                EventType.VERIFICATION_OVERRIDDEN,
+                task=self.tasks.get(run.task_id),
+                run_id=run.id,
+                entity_type="verification",
+                entity_id=report.id,
+                payload={
+                    "decision": report.decision.value,
+                    "reason": reason,
+                    "blocking": report.blocking,
+                },
+            )
         self._event(
             EventType.TASK_COMPLETED,
             task=self.tasks.get(run.task_id),
@@ -874,6 +989,9 @@ class TaskService:
                 "decision": target.value,
                 "reason": reason,
                 "review_id": review.id,
+                "verification_report_id": report.id,
+                "verification_decision": report.decision.value,
+                "override": bool(override and not verified_ok),
                 "warnings": len(warnings),
             },
         )
@@ -898,6 +1016,7 @@ class TaskService:
         plan = self.plans.get(run.plan_id) if run.plan_id else None
         diff = self.diffs.get_by_run(run.id)
         review = self.reviews.get_by_run(run.id)
+        verification_report = self.verification.latest_report(run.id)
         target = Path(destination).expanduser().resolve()
         if target.exists() and any(target.iterdir()):
             raise TaskError(
@@ -938,7 +1057,21 @@ class TaskService:
             payloads["review.json"] = json.dumps(
                 review.model_dump(mode="json"), indent=2, sort_keys=True
             )
-        payloads["report.md"] = self._report_markdown(run, task, contract, plan, diff, review)
+        if verification_report is not None:
+            payloads["verification.json"] = json.dumps(
+                {
+                    "report": verification_report.model_dump(mode="json"),
+                    "checks": [
+                        item.model_dump(mode="json")
+                        for item in self.verification.report_checks(verification_report)
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        payloads["report.md"] = self._report_markdown(
+            run, task, contract, plan, diff, review, verification_report
+        )
         hashes: list[str] = []
         for name, content in sorted(payloads.items()):
             path = target / name
@@ -965,6 +1098,7 @@ class TaskService:
         plan: TaskPlan | None,
         diff: TaskDiff | None,
         review: TaskReview | None,
+        verification: VerificationReport | None = None,
     ) -> str:
         lines = [
             f"# Task report: {task.title}",
@@ -1014,10 +1148,22 @@ class TaskService:
             "## Verification status",
             "",
             (
-                "This bundle is Phase 3 output. It contains a patch and a structural "
-                "diff review, not a verification decision. Commands may have been run, "
-                "but their results were not gates and are not asserted as proof. "
-                "Phase 4 adds deterministic checks and the evidence graph."
+                f"Decision `{verification.decision.value}` from verification attempt "
+                f"`{verification.verification_id}` (report `{verification.id}`, "
+                f"sha256 `{verification.json_sha256}`). Exit summary: "
+                + ("; ".join(verification.blocking) if verification.blocking else "no blocking reason")
+                + "."
+                if verification is not None
+                else "No verification report exists for this run. This bundle "
+                "contains a patch and a structural review only; nothing here is proof "
+                "that the change works."
+            ),
+            "",
+            (
+                "## Verification limitations\n\n"
+                + "\n".join(f"- {item}" for item in verification.limitations)
+                if verification is not None and verification.limitations
+                else ""
             ),
             "",
         ]
@@ -1043,6 +1189,7 @@ class TaskService:
         diff = self.diffs.get_by_run(run.id)
         review = self.reviews.get_by_run(run.id)
         job = self.jobs.get_by_run(run.id)
+        verification_report = self.verification.latest_report(run.id)
         return {
             "run": run.model_dump(mode="json"),
             "task": task.model_dump(mode="json"),
@@ -1056,6 +1203,17 @@ class TaskService:
             "diff": diff.model_dump(mode="json") if diff else None,
             "review": review.model_dump(mode="json") if review else None,
             "worker_job": job.model_dump(mode="json") if job else None,
+            "verification": (
+                {
+                    **verification_report.model_dump(mode="json"),
+                    "checks": [
+                        check.model_dump(mode="json")
+                        for check in self.verification.report_checks(verification_report)
+                    ],
+                }
+                if verification_report
+                else None
+            ),
             "tool_calls": [
                 item.model_dump(mode="json")
                 for item in self.calls.list_by_run(run.id, limit=200)
