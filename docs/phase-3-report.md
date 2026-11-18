@@ -163,7 +163,7 @@ following fixes are implemented and covered by regression tests.
 
 **Environment:** Python 3.12.3, Git 2.43.0, SQLite 3.45.1.
 **Command:** `PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest --tb=no -p no:cacheprovider`
-**Result:** `191 passed in 17.69s` (whole suite).
+**Result:** `198 passed in 17.56s` (whole suite).
 
 - **MWB-001** — `maya task …` and `maya worker` are registered by
   `cli/task_commands.py`; `tests/test_task_cli.py` exercises create → start →
@@ -198,3 +198,42 @@ following fixes are implemented and covered by regression tests.
 `network_access="ALLOW_WITH_APPROVAL"` contract. That is a deliberate contract
 choice, not a weakened assertion: the fail-closed `DENY_BY_DEFAULT` path has its
 own regression test.
+
+## 7. Scale and concurrency hardening (18 November 2026)
+
+Measured, not asserted. Indexing this repository itself through the installed
+CLI on Python 3.12.3 / SQLite 3.45.1:
+
+| Metric | Value |
+| --- | --- |
+| Files / lines indexed | 131 files, 40,611 lines, 1,571,442 bytes |
+| Symbols / edges | 1,799 symbols, 10,196 edges (3,159 resolved) |
+| Index duration | 1,711 ms |
+| Database size after index | 22.7 MB (WAL) |
+| Re-index (same snapshot) | 2.2 s wall clock |
+
+Guarantees added in this pass, each with a regression test in
+`tests/test_concurrency.py`:
+
+- **One active run per task.** The active-run check and the run insert share a
+  `BEGIN IMMEDIATE` transaction, so two CLI processes starting the same task
+  cannot both create a run. The write lock is held only for the reservation,
+  never across model planning.
+- **One active worker job per run.** Enqueue is transactional, and `claim`
+  refuses a run whose other job still holds a live lease. A duplicate queued row
+  left by an older build can no longer cause two workers to execute one run.
+- **No infinite crash loop.** A job that crashes its worker `MAX_ATTEMPTS = 5`
+  times is reaped as `FAILED` and its run is transitioned to `FAILED`, instead of
+  being reclaimed forever and leaving the run stuck in `IMPLEMENTING`.
+- **State change and audit event commit together.** `WorkflowService.transition`
+  runs the compare-and-set and the `workflow_events` append in one transaction;
+  a failure to write the event rolls the state back.
+- **A stale worker cannot settle a run.** Before writing any run state the
+  worker re-checks that it still owns the job lease; if another worker took
+  over after a stall, settlement raises `LeaseLost` and writes nothing.
+- **Thread-safe database access.** `Database` guards its single connection with
+  a re-entrant lock and opens it with `check_same_thread=False`; a thread pool
+  can share one process-level `Database` without SQLite `ProgrammingError`.
+- **Research memos describe evidence gaps.** A project with registered documents
+  but zero extracted claims now produces a memo that states the gap, instead of
+  raising "no claims or research documents".

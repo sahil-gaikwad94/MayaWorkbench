@@ -316,7 +316,7 @@ def test_memo_append_refuses_a_tampered_interpretation(services, project, paper)
 
 
 def test_memo_without_claims_or_documents_is_refused(services, project):
-    with pytest.raises(ConflictError, match="no claims or research documents"):
+    with pytest.raises(ConflictError, match="no research documents"):
         services.memo_service.build(project)
 
 
@@ -338,3 +338,31 @@ def test_rejected_claims_are_visible_in_the_memo(services, project, paper):
     build = services.memo_service.build(project, document=paper.document)
     assert "REJECTED" in build.markdown
     assert "misread the paper" in build.markdown
+
+
+def test_memo_describes_a_document_that_has_no_claims(
+    services, project, tmp_path
+):
+    """A document without normative sentences is still memo-able.
+
+    The memo must record the evidence gap (zero claims) instead of refusing,
+    which used to happen because the guard tested the explicitly-passed
+    document rather than the documents actually stored for the project.
+    """
+    path = tmp_path / "background.md"
+    path.write_text(
+        "# Background\n\nThis note describes the surrounding context only.\n",
+        encoding="utf-8",
+    )
+    document = services.ingestion.ingest_file(project, path).document
+    assert services.claims.count(project_id=project.id) == 0
+
+    build = services.memo_service.build(project)
+    assert build.memo.document_id is None
+    assert build.memo.project_id == project.id
+    # The memo records the gap instead of pretending evidence exists.
+    assert "claims" in build.memo.body_markdown.lower()
+    assert services.artifacts.read_text(build.memo.artifact_id).startswith("# Research memo")
+    assert document.id in {
+        item.id for item in services.documents.list_by_project(project.id)
+    }

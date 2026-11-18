@@ -147,10 +147,12 @@ class MemoService:
         title: str | None = None,
     ) -> MemoBuild:
         context = self._gather(project, document=document, snapshot=snapshot)
-        if not context.claims and not document:
+        # A registered document with no extracted claims is a legitimate state:
+        # the memo must report that gap rather than refusing to describe it.
+        if not context.claims and not context.documents:
             raise ConflictError(
-                "This project has no claims or research documents to memo",
-                hint="Register a document with `maya research add` and extract claims first.",
+                "This project has no research documents to memo",
+                hint="Register a document with `maya research add` first.",
             )
         claims = context.claims
         dag = context.dag

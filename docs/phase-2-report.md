@@ -256,7 +256,7 @@ exist. This section records the measured build result, not a narrative claim.
 
 **Environment:** Python 3.12.3, Git 2.43.0, SQLite 3.45.1.
 **Command:** `PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest --tb=no -p no:cacheprovider`
-**Result:** `191 passed in 17.69s` (whole suite, all phases; the per-file counts
+**Result:** `198 passed in 17.56s` (whole suite, all phases; the per-file counts
 in the table above describe the original report and are not re-asserted here).
 
 Phase 2 fixes delivered in this change:

@@ -57,6 +57,18 @@ class Worker:
     # ------------------------------------------------------------------- queue
     def run(self, *, once: bool = True, run_id: str | None = None) -> int:
         processed = 0
+        # Do not reclaim a job that keeps crashing its worker forever. Reaping
+        # happens before claiming so an exhausted run settles instead of
+        # staying IMPLEMENTING with no live worker.
+        for exhausted in self.services.jobs.reap_exhausted():
+            log.error(
+                "worker job exhausted its attempts",
+                extra={"job_id": exhausted.id, "run_id": exhausted.run_id},
+            )
+            self._fail_run(
+                exhausted,
+                f"worker job {exhausted.id} failed {exhausted.attempts} attempts; the run was failed",
+            )
         while True:
             job = self.services.jobs.claim(
                 owner=self.owner, lease_seconds=600, run_id=run_id
@@ -225,6 +237,10 @@ class Worker:
         self._settle(job, outcome)
 
     def _settle(self, job: WorkerJob, outcome: AgentOutcome) -> None:
+        # A stalled worker may resume after its lease expired and another worker
+        # took over. Settlement must not let the stale worker write run state.
+        if not self.services.jobs.heartbeat(job.id, owner=self.owner, lease_seconds=600):
+            raise LeaseLost(f"job {job.id} lease was reclaimed before settlement")
         run = self.services.runs.get(job.run_id)
         self.services.runs.update_progress(
             run.id,

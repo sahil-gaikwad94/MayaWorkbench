@@ -6,11 +6,12 @@ could and could not understand, and answers questions using only retrieved
 evidence from that snapshot — with every claim traceable to a file, line range
 and verified quote.
 
-Phase 0 (product/architecture contracts), Phase 1 (repository intelligence) and
-Phase 2 (research intelligence and claim-to-code mapping) are implemented and
-covered by tests. Later phases (task contracts, isolated worktrees, patch
-verification, evaluation harness for agent runs) are designed but deliberately
-not stubbed — see
+Phase 0 (product/architecture contracts), Phase 1 (repository intelligence),
+Phase 2 (research intelligence and claim-to-code mapping) and Phase 3 (task
+contracts, approvals, isolated worktrees, patch verification and the bounded
+agent loop) are implemented and covered by tests. The evaluation harness for
+agent runs (Phase 4) and hosted multi-user hardening are designed but
+deliberately not stubbed — see
 [docs/implementation-gap-analysis.md](docs/implementation-gap-analysis.md).
 
 ## The problem

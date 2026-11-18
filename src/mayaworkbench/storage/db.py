@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,20 +34,29 @@ class MigrationResult:
 class Database:
     """One local SQLite database.
 
-    A ``Database`` owns a single connection. The CLI process is single-threaded
-    for write operations (model calls are blocking I/O, not threads), so this
-    keeps transaction semantics obvious. Long-running indexing runs in the same
-    process during Phase 1; the runner boundary arrives with Phase 3.
+    A ``Database`` owns a single connection. SQLite serializes writes anyway, so
+    the connection is guarded by one re-entrant lock: callers may use the same
+    ``Database`` from several threads (a future HTTP layer, a thread pool) and
+    every statement still sees a consistent connection. Transactions hold the
+    lock for their whole scope, which matches SQLite's own writer semantics.
+
+    The lock is per ``Database`` and does not coordinate processes; WAL plus
+    ``BEGIN IMMEDIATE`` handle cross-process serialization.
     """
 
     def __init__(self, path: Path, *, busy_timeout_ms: int = 10_000):
         self.path = Path(path)
         self._busy_timeout_ms = busy_timeout_ms
         self._conn: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ conn
     @property
     def conn(self) -> sqlite3.Connection:
+        with self._lock:
+            return self._connection_locked()
+
+    def _connection_locked(self) -> sqlite3.Connection:
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -59,6 +69,7 @@ class Database:
                     str(self.path),
                     timeout=self._busy_timeout_ms / 1000,
                     isolation_level=None,
+                    check_same_thread=False,
                 )
             except sqlite3.Error as exc:  # pragma: no cover - fs failure
                 raise DatabaseError(f"Cannot open database at {self.path}: {exc}") from exc
@@ -77,11 +88,12 @@ class Database:
         return self._conn
 
     def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            finally:
-                self._conn = None
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
 
     def __enter__(self) -> "Database":
         return self
@@ -91,6 +103,10 @@ class Database:
 
     # -------------------------------------------------------------- migrations
     def migrate(self) -> list[MigrationResult]:
+        with self._lock:
+            return self._migrate_locked()
+
+    def _migrate_locked(self) -> list[MigrationResult]:
         migrations = load_migrations()
         if not migrations:
             raise DatabaseError("No migrations were packaged with this installation")
@@ -144,6 +160,7 @@ class Database:
 
     def _apply(self, migration: Migration) -> None:
         conn = self.conn
+        # Caller (migrate) already holds the re-entrant lock.
         try:
             conn.execute("BEGIN IMMEDIATE")
             for statement in _split_statements(migration.sql):
@@ -166,14 +183,17 @@ class Database:
             ) from exc
 
     def schema_version(self) -> int:
-        return int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+        with self._lock:
+            return int(self.conn.execute("PRAGMA user_version").fetchone()[0])
 
     def applied_migrations(self) -> list[sqlite3.Row]:
-        return list(
-            self.conn.execute(
-                "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version"
+        with self._lock:
+            return list(
+                self.conn.execute(
+                    "SELECT version, name, checksum, applied_at FROM schema_migrations "
+                    "ORDER BY version"
+                )
             )
-        )
 
     # ------------------------------------------------------------- transactions
     @contextmanager
@@ -184,26 +204,28 @@ class Database:
         treat any exception as aborting the whole unit of work, which is what
         the indexing/event flows require.
         """
-        conn = self.conn
-        if conn.in_transaction:
-            yield conn
-            return
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-        except BaseException:
+        with self._lock:
+            conn = self.conn
+            if conn.in_transaction:
+                yield conn
+                return
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:  # pragma: no cover
-                pass
-            raise
-        else:
-            conn.execute("COMMIT")
+                yield conn
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:  # pragma: no cover
+                    pass
+                raise
+            else:
+                conn.execute("COMMIT")
 
     # ----------------------------------------------------------------- queries
     def execute(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> sqlite3.Cursor:
         try:
-            return self.conn.execute(sql, params)
+            with self._lock:
+                return self.conn.execute(sql, params)
         except sqlite3.IntegrityError as exc:
             raise ConflictError(f"Database constraint violated: {exc}") from exc
         except sqlite3.Error as exc:
@@ -213,7 +235,8 @@ class Database:
         self, sql: str, params: Sequence[Sequence[Any]] | Sequence[dict[str, Any]]
     ) -> sqlite3.Cursor:
         try:
-            return self.conn.executemany(sql, params)
+            with self._lock:
+                return self.conn.executemany(sql, params)
         except sqlite3.IntegrityError as exc:
             raise ConflictError(f"Database constraint violated: {exc}") from exc
         except sqlite3.Error as exc:
@@ -221,7 +244,8 @@ class Database:
 
     def fetchall(self, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> list[sqlite3.Row]:
         try:
-            return list(self.conn.execute(sql, params).fetchall())
+            with self._lock:
+                return list(self.conn.execute(sql, params).fetchall())
         except sqlite3.IntegrityError as exc:
             raise ConflictError(f"Database constraint violated: {exc}") from exc
         except sqlite3.Error as exc:
@@ -231,7 +255,8 @@ class Database:
         self, sql: str, params: Sequence[Any] | dict[str, Any] = ()
     ) -> sqlite3.Row | None:
         try:
-            return self.conn.execute(sql, params).fetchone()
+            with self._lock:
+                return self.conn.execute(sql, params).fetchone()
         except sqlite3.IntegrityError as exc:
             raise ConflictError(f"Database constraint violated: {exc}") from exc
         except sqlite3.Error as exc:
@@ -241,11 +266,12 @@ class Database:
     def health(self) -> dict[str, Any]:
         info: dict[str, Any] = {"path": str(self.path), "exists": self.path.exists()}
         try:
-            conn = self.conn
-            info["sqlite_version"] = conn.execute("SELECT sqlite_version()").fetchone()[0]
-            info["journal_mode"] = conn.execute("PRAGMA journal_mode").fetchone()[0]
-            info["foreign_keys"] = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
-            info["fts5"] = True
+            with self._lock:
+                conn = self.conn
+                info["sqlite_version"] = conn.execute("SELECT sqlite_version()").fetchone()[0]
+                info["journal_mode"] = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                info["foreign_keys"] = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+                info["fts5"] = True
         except sqlite3.Error as exc:
             info["fts5"] = False
             info["error"] = str(exc)

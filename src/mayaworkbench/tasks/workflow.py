@@ -102,42 +102,46 @@ class WorkflowService:
                 hint=f"Allowed from {run.state.value}: "
                 + (", ".join(sorted(state.value for state in allowed)) or "none"),
             )
-        changed = self.runs.compare_and_set_state(
-            run_id,
-            expected=[run.state],
-            new_state=to_state,
-            started=started,
-            finished=finished or to_state.is_terminal,
-            error=error,
-        )
-        if not changed:
-            current = self.runs.get(run_id)
-            raise TaskError(
-                f"Run state changed concurrently to {current.state.value}; retry",
-                hint="Another process moved this run. Inspect `maya task status`.",
+        # The compare-and-set and its audit event are one unit of work. A crash
+        # between them would otherwise leave a state change with no event, and
+        # the append-only log is the record operators rely on.
+        with self.runs.db.transaction():
+            changed = self.runs.compare_and_set_state(
+                run_id,
+                expected=[run.state],
+                new_state=to_state,
+                started=started,
+                finished=finished or to_state.is_terminal,
+                error=error,
             )
-        updated = self.runs.get(run_id)
-        self.events.append(
-            WorkflowEvent(
-                event_id="evt_" + new_ulid(),
-                event_type=EventType.TASK_STATE_CHANGED,
-                project_id=run.project_id,
-                repository_id=run.repository_id,
-                snapshot_id=run.snapshot_id,
-                task_id=run.task_id,
-                run_id=run.id,
-                entity_type="run",
-                entity_id=run.id,
-                actor_kind=actor_kind,
-                actor_name=actor_name,
-                payload={
-                    "from": run.state.value,
-                    "to": to_state.value,
-                    "reason": reason,
-                    **(payload or {}),
-                },
+            if not changed:
+                current = self.runs.get(run_id)
+                raise TaskError(
+                    f"Run state changed concurrently to {current.state.value}; retry",
+                    hint="Another process moved this run. Inspect `maya task status`.",
+                )
+            updated = self.runs.get(run_id)
+            self.events.append(
+                WorkflowEvent(
+                    event_id="evt_" + new_ulid(),
+                    event_type=EventType.TASK_STATE_CHANGED,
+                    project_id=run.project_id,
+                    repository_id=run.repository_id,
+                    snapshot_id=run.snapshot_id,
+                    task_id=run.task_id,
+                    run_id=run.id,
+                    entity_type="run",
+                    entity_id=run.id,
+                    actor_kind=actor_kind,
+                    actor_name=actor_name,
+                    payload={
+                        "from": run.state.value,
+                        "to": to_state.value,
+                        "reason": reason,
+                        **(payload or {}),
+                    },
+                )
             )
-        )
         return updated
 
     def pause(self, run_id: str) -> WorkflowRun:

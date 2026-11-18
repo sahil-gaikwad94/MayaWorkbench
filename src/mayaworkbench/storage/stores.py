@@ -2198,17 +2198,23 @@ class ReviewStore:
 class WorkerJobStore:
     JSON = {"details": ("details_json", {})}
 
+    #: A job that crashes the worker this many times is not retried again.
+    MAX_ATTEMPTS = 5
+
     def __init__(self, db: Database):
         self.db = db
 
     def enqueue(self, job: WorkerJob) -> WorkerJob:
-        existing = self.db.fetchone(
-            "SELECT * FROM worker_jobs WHERE run_id = ? AND status IN ('QUEUED','LEASED')",
-            (job.run_id,),
-        )
-        if existing is not None:
-            return _row_to_model(WorkerJob, existing, json_fields=self.JSON)
-        _insert(self.db, "worker_jobs", _model_to_row(job, json_fields=self.JSON))
+        # Checking for an active job and inserting must be one transaction:
+        # otherwise two CLI processes can each see no job and enqueue one.
+        with self.db.transaction():
+            existing = self.db.fetchone(
+                "SELECT * FROM worker_jobs WHERE run_id = ? AND status IN ('QUEUED','LEASED')",
+                (job.run_id,),
+            )
+            if existing is not None:
+                return _row_to_model(WorkerJob, existing, json_fields=self.JSON)
+            _insert(self.db, "worker_jobs", _model_to_row(job, json_fields=self.JSON))
         return job
 
     def get(self, job_id: str) -> WorkerJob:
@@ -2230,14 +2236,27 @@ class WorkerJobStore:
         now = utcnow()
         now_iso = to_iso(now)
         expires = to_iso(now + timedelta(seconds=lease_seconds))
-        run_clause = " AND run_id = ?" if run_id is not None else ""
+        run_clause = " AND j.run_id = ?" if run_id is not None else ""
         with self.db.transaction():
+            # A run may have at most one live worker, even if an older build or
+            # a racing enqueue left duplicate job rows behind. The NOT EXISTS
+            # also prevents a second worker from picking a duplicate job while
+            # the first worker's lease is still valid.
             row = self.db.fetchone(
-                "SELECT * FROM worker_jobs WHERE (status = 'QUEUED' OR "
-                "(status = 'LEASED' AND lease_expires_at < ?))"
+                "SELECT j.* FROM worker_jobs AS j WHERE (j.status = 'QUEUED' OR "
+                "(j.status = 'LEASED' AND j.lease_expires_at < ?)) "
+                "AND j.attempts < ?"
                 + run_clause
-                + " ORDER BY enqueued_at LIMIT 1",
-                (now_iso, *([run_id] if run_id is not None else [])),
+                + " AND NOT EXISTS (SELECT 1 FROM worker_jobs AS o "
+                "WHERE o.run_id = j.run_id AND o.id <> j.id AND o.status = 'LEASED' "
+                "AND o.lease_expires_at >= ?)"
+                " ORDER BY j.enqueued_at LIMIT 1",
+                (
+                    now_iso,
+                    self.MAX_ATTEMPTS,
+                    *([run_id] if run_id is not None else []),
+                    now_iso,
+                ),
             )
             if row is None:
                 return None
@@ -2245,14 +2264,45 @@ class WorkerJobStore:
             cursor = self.db.execute(
                 "UPDATE worker_jobs SET status = 'LEASED', lease_owner = ?, "
                 "lease_expires_at = ?, attempts = attempts + 1, "
-                "started_at = COALESCE(started_at, ?) WHERE id = ? AND "
+                "started_at = COALESCE(started_at, ?) WHERE id = ? AND attempts = ? AND "
                 "(status = 'QUEUED' OR (status = 'LEASED' AND lease_expires_at < ?))",
-                (owner, expires, now_iso, job.id, now_iso),
+                (owner, expires, now_iso, job.id, job.attempts, now_iso),
             )
             if cursor.rowcount != 1:
                 return None
             claimed = self.get(job.id)
         return claimed
+
+    def reap_exhausted(
+        self, *, max_attempts: int | None = None
+    ) -> list[WorkerJob]:
+        """Fail jobs that crashed the worker too many times.
+
+        Without this, a job that reliably kills its worker is reclaimed after
+        every lease expiry forever, and the run it belongs to never settles.
+        """
+        limit = self.MAX_ATTEMPTS if max_attempts is None else int(max_attempts)
+        finished = to_iso(utcnow())
+        reaped: list[WorkerJob] = []
+        with self.db.transaction():
+            rows = self.db.fetchall(
+                "SELECT * FROM worker_jobs WHERE status IN ('QUEUED','LEASED') "
+                "AND attempts >= ?",
+                (limit,),
+            )
+            for row in rows:
+                job_id = str(row["id"])
+                self.db.execute(
+                    "UPDATE worker_jobs SET status = 'FAILED', finished_at = ?, "
+                    "error = ?, lease_owner = NULL, lease_expires_at = NULL WHERE id = ?",
+                    (
+                        finished,
+                        f"exceeded {limit} attempts without completing",
+                        job_id,
+                    ),
+                )
+                reaped.append(self.get(job_id))
+        return reaped
 
     def heartbeat(self, job_id: str, *, owner: str, lease_seconds: int = 120) -> bool:
         now = utcnow()

@@ -384,27 +384,21 @@ class TaskService:
         )
 
     # ------------------------------------------------------------------- start
-    def start_task(
+    def _reserve_run(
         self,
-        task_id: str,
         *,
-        plan_file: str | Path | None = None,
-        approval_ttl_seconds: int = 24 * 3600,
-    ) -> StartResult:
-        task = self.tasks.get(task_id)
-        contract = self.contracts.latest(task_id)
-        active = [
-            run
-            for run in self.runs.list(task_id=task_id, limit=20)
-            if not run.state.is_terminal
-        ]
-        if active:
-            raise ConflictError(
-                f"Task already has an active run: {active[0].id} ({active[0].state.value})",
-                hint="Resume, cancel or review that run before starting another.",
-            )
-        snapshot = self.snapshots.get(contract.snapshot_id)
-        repository = self.repositories.get(contract.repository_id)
+        task: Task,
+        contract: TaskContract,
+        repository: Repository,
+        snapshot: RepositorySnapshot,
+    ) -> WorkflowRun:
+        """Create the run for a task if no other run is active.
+
+        The active-run check and the insert share one ``BEGIN IMMEDIATE``
+        transaction, so two CLI processes starting the same task cannot both
+        observe "no active run" and create a second one. Holding the write lock
+        only for this reservation (never across planning) keeps it short.
+        """
         run = WorkflowRun(
             id="run_" + new_ulid(),
             task_id=task.id,
@@ -415,12 +409,42 @@ class TaskService:
             state=WorkflowState.CREATED,
             base_commit_sha=contract.scope.base_commit_sha,
         )
-        self.runs.create(run)
-        self.workflow.transition(
-            run.id,
-            WorkflowState.CONTRACTED,
-            reason="contract attached",
-            started=True,
+        with self.db.transaction():
+            active = [
+                candidate
+                for candidate in self.runs.list(task_id=task.id, limit=20)
+                if not candidate.state.is_terminal
+            ]
+            if active:
+                raise ConflictError(
+                    f"Task already has an active run: {active[0].id} ({active[0].state.value})",
+                    hint="Resume, cancel or review that run before starting another.",
+                )
+            self.runs.create(run)
+            self.workflow.transition(
+                run.id,
+                WorkflowState.CONTRACTED,
+                reason="contract attached",
+                started=True,
+            )
+        return self.runs.get(run.id)
+
+    def start_task(
+        self,
+        task_id: str,
+        *,
+        plan_file: str | Path | None = None,
+        approval_ttl_seconds: int = 24 * 3600,
+    ) -> StartResult:
+        task = self.tasks.get(task_id)
+        contract = self.contracts.latest(task_id)
+        snapshot = self.snapshots.get(contract.snapshot_id)
+        repository = self.repositories.get(contract.repository_id)
+        run = self._reserve_run(
+            task=task,
+            contract=contract,
+            repository=repository,
+            snapshot=snapshot,
         )
         self.workflow.transition(
             run.id, WorkflowState.PLANNING, reason="implementation planning started"
