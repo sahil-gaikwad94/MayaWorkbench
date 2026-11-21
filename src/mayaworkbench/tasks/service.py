@@ -185,6 +185,8 @@ class TaskService:
         snapshot_id: str,
         allowed_paths: list[str],
         excluded_paths: list[str] | None = None,
+        workspace_id: str | None = None,
+        resource_ids: list[str] | None = None,
         acceptance_criteria: list[str] | None = None,
         constraints: dict[str, Any] | None = None,
         unknowns: list[str] | None = None,
@@ -215,12 +217,28 @@ class TaskService:
             parsed_constraints = TaskConstraints.model_validate(constraint_values)
         except Exception as exc:
             raise TaskError(f"Invalid task constraints: {exc}") from exc
+        if workspace_id is not None:
+            from mayaworkbench.storage.stores import EngineeringWorkspaceStore
+
+            workspace = EngineeringWorkspaceStore(self.db).get_workspace(workspace_id)
+            if workspace.project_id != project.id:
+                raise TaskError("The workspace belongs to a different project")
+            attached = {
+                item.id for item in EngineeringWorkspaceStore(self.db).resources(workspace_id)
+            }
+            unknown = sorted(set(resource_ids or []) - attached)
+            if unknown:
+                raise TaskError(f"Resource(s) are not attached to the workspace: {unknown}")
+        elif resource_ids:
+            raise TaskError("resource_ids require a workspace_id")
         try:
             scope = TaskScope(
                 allowed_paths=allowed_paths,
                 excluded_paths=excluded_paths or [],
                 base_commit_sha=snapshot.commit_sha,
                 include_working_tree_patch=snapshot.includes_worktree_patch,
+                workspace_id=workspace_id,
+                resource_ids=list(resource_ids or []),
             )
         except Exception as exc:
             raise TaskError(f"Invalid task scope: {exc}") from exc

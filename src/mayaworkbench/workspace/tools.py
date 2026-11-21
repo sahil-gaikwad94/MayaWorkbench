@@ -64,6 +64,7 @@ from mayaworkbench.workspace.runner import CommandPolicy, CommandResult, Command
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mayaworkbench.tasks.inloop import DeclaredCheckRunner
+    from mayaworkbench.workspace.sessions import SessionManager
 
 ToolName = Literal[
     "read_file",
@@ -77,7 +78,48 @@ ToolName = Literal[
     "git_diff",
     "run_command",
     "run_check",
+    "open_session",
+    "stream_session",
+    "send_input",
+    "stop_session",
+    "session_status",
+    "session_replay",
+    "api_request",
+    "db_query",
+    "env_detect",
+    "logs_read",
+    "notebook_inspect",
+    "skill_list",
+    "skill_run",
 ]
+
+#: Capability required by each tool. A non-empty contract grant list is closed.
+TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    "read_file": ("file.read",),
+    "list_files": ("file.read",),
+    "search_text": ("file.read",),
+    "find_symbol": ("file.read",),
+    "git_status": ("file.read",),
+    "git_diff": ("file.read",),
+    "apply_patch": ("file.write",),
+    "write_file": ("file.write",),
+    "delete_file": ("file.write",),
+    "run_command": ("process.execute",),
+    "run_check": ("process.execute",),
+    "open_session": ("process.session",),
+    "stream_session": ("process.session",),
+    "send_input": ("process.session",),
+    "stop_session": ("process.session",),
+    "session_status": ("process.session",),
+    "session_replay": ("process.session",),
+    "api_request": ("tool.advanced",),
+    "db_query": ("tool.advanced",),
+    "env_detect": ("tool.advanced",),
+    "logs_read": ("tool.advanced",),
+    "notebook_inspect": ("tool.advanced",),
+    "skill_list": ("skill.use",),
+    "skill_run": ("skill.use",),
+}
 
 MAX_READ_BYTES = 300_000
 MAX_WRITE_BYTES = 2_000_000
@@ -194,6 +236,71 @@ class RunCommandArgs(Record):
     timeout_seconds: int = Field(default=120, ge=1, le=86_400)
 
 
+class OpenSessionArgs(Record):
+    argv: list[str] = Field(min_length=1, max_length=64)
+    timeout_seconds: int = Field(default=120, ge=1, le=86_400)
+    idle_timeout: int = Field(default=300, ge=1, le=86_400)
+    max_lifetime: int = Field(default=3600, ge=2, le=172_800)
+    use_pty: bool = False
+
+
+class SessionArgs(Record):
+    session_id: str = Field(min_length=1, max_length=120)
+
+
+class StreamSessionArgs(SessionArgs):
+    after_seq: int = Field(default=0, ge=0)
+
+
+class SendInputArgs(SessionArgs):
+    data: str = Field(min_length=1, max_length=4096)
+
+
+class StopSessionArgs(SessionArgs):
+    reason: str = Field(default="agent requested stop", max_length=200)
+
+
+class ApiRequestArgs(Record):
+    url: str = Field(min_length=8, max_length=1000)
+    method: Literal["GET", "POST", "PUT", "DELETE"] = "GET"
+    body_json: str | None = Field(default=None, max_length=100_000)
+
+    @field_validator("url")
+    @classmethod
+    def _https(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("api_request requires an https URL")
+        return value
+
+
+class DbQueryArgs(Record):
+    path: str = Field(min_length=1, max_length=1000)
+    sql: str = Field(min_length=1, max_length=4000)
+    max_rows: int = Field(default=50, ge=1, le=500)
+
+
+class LogsReadArgs(Record):
+    path: str = Field(min_length=1, max_length=1000)
+    lines: int = Field(default=50, ge=1, le=500)
+
+
+class EnvDetectArgs(Record):
+    path: str = "."
+
+
+class NotebookInspectArgs(Record):
+    path: str = Field(min_length=1, max_length=1000)
+
+
+class SkillListArgs(Record):
+    category: str | None = Field(default=None, max_length=60)
+
+
+class SkillRunArgs(Record):
+    skill_id: str = Field(min_length=1, max_length=120)
+    context_json: str | None = Field(default=None, max_length=20_000)
+
+
 @dataclass
 class ToolResult:
     tool: str
@@ -238,6 +345,11 @@ class ToolGateway:
         expected_command_spec: str,
         cancel_requested: Any | None = None,
         check_runner: "DeclaredCheckRunner | None" = None,
+        session_manager: "SessionManager | None" = None,
+        allowed_api_hosts: tuple[str, ...] = (),
+        allowed_db_dirs: tuple[str, ...] = (),
+        allowed_log_dirs: tuple[str, ...] = (),
+        http: Callable[[str, str, dict[str, str], bytes | None], dict[str, Any]] | None = None,
         symbol_lookup: Callable[[str, int], list[dict[str, Any]]] | None = None,
     ):
         self.run = run
@@ -255,6 +367,11 @@ class ToolGateway:
         self.expected_command_spec = expected_command_spec
         self.cancel_requested = cancel_requested
         self.check_runner = check_runner
+        self.session_manager = session_manager
+        self.allowed_api_hosts = frozenset(host.lower() for host in allowed_api_hosts)
+        self.allowed_db_dirs = tuple(allowed_db_dirs)
+        self.allowed_log_dirs = tuple(allowed_log_dirs)
+        self.http = http
         self.symbol_lookup = symbol_lookup
         self._cancelled = False
 
@@ -272,6 +389,19 @@ class ToolGateway:
             "run_command",
             "run_check",
             "find_symbol",
+            "open_session",
+            "stream_session",
+            "send_input",
+            "stop_session",
+            "session_status",
+            "session_replay",
+            "api_request",
+            "db_query",
+            "env_detect",
+            "logs_read",
+            "notebook_inspect",
+            "skill_list",
+            "skill_run",
         }:
             raise ToolError(f"unknown tool: {tool}")
         parsed = self._parse(tool, arguments)
@@ -363,6 +493,19 @@ class ToolGateway:
             "run_command": RunCommandArgs,
             "run_check": RunCheckArgs,
             "find_symbol": FindSymbolArgs,
+            "open_session": OpenSessionArgs,
+            "stream_session": StreamSessionArgs,
+            "send_input": SendInputArgs,
+            "stop_session": StopSessionArgs,
+            "session_status": SessionArgs,
+            "session_replay": SessionArgs,
+            "api_request": ApiRequestArgs,
+            "db_query": DbQueryArgs,
+            "env_detect": EnvDetectArgs,
+            "logs_read": LogsReadArgs,
+            "notebook_inspect": NotebookInspectArgs,
+            "skill_list": SkillListArgs,
+            "skill_run": SkillRunArgs,
         }
         try:
             return models[tool].model_validate(arguments).model_dump(mode="json")
@@ -395,6 +538,24 @@ class ToolGateway:
         if tool in {"search_text", "find_symbol"}:
             return {**args, "query": redact(str(args.get("query", "")))}
         return dict(args)
+
+    def _require_capability(self, tool: str) -> None:
+        """Every invocation must pass the contract's closed capability grant.
+
+        A legacy contract with no grants keeps the approval/path policy as the
+        authority. A non-empty grant list is a closed allowlist: no prompt, file
+        content, or tool output can widen it.
+        """
+        granted = set(getattr(self.contract.constraints, "capabilities", ()) or ())
+        if not granted:
+            return
+        required = TOOL_CAPABILITIES.get(tool, ())
+        missing = [capability for capability in required if capability not in granted]
+        if missing:
+            raise ToolBlocked(
+                f"tool {tool!r} requires capability {', '.join(missing)} which this "
+                "task contract does not grant"
+            )
 
     def _require_write(self) -> None:
         approval = self.write_approval
@@ -431,6 +592,7 @@ class ToolGateway:
 
     # ---------------------------------------------------------------- dispatch
     def _dispatch(self, tool: str, args: dict[str, Any], call: ToolCall) -> ToolResult:
+        self._require_capability(tool)
         if tool == "read_file":
             return self._read_file(args)
         if tool == "list_files":
@@ -447,6 +609,25 @@ class ToolGateway:
             return self._run_command(args, call)
         if tool == "run_check":
             return self._run_check(args)
+        if tool in {
+            "open_session",
+            "stream_session",
+            "send_input",
+            "stop_session",
+            "session_status",
+            "session_replay",
+        }:
+            return self._session_tool(tool, args, call)
+        if tool in {
+            "api_request",
+            "db_query",
+            "env_detect",
+            "logs_read",
+            "notebook_inspect",
+            "skill_list",
+            "skill_run",
+        }:
+            return self._advanced_tool(tool, args)
         self._require_write()
         if tool == "apply_patch":
             return self._apply_patch(args)
@@ -905,6 +1086,9 @@ class ToolGateway:
                 "network_isolated": result.network_isolated,
                 "network_enforcement": result.network_enforcement,
                 "limits_enforcement": result.limits_enforcement,
+                "limits": {
+                    name: item.as_dict() for name, item in sorted(result.limits.items())
+                },
                 "cleanup_required": result.cleanup_required,
                 "cleanup_succeeded": result.cleanup_succeeded,
                 "env_names": result.env_names,
@@ -944,10 +1128,275 @@ class ToolGateway:
                 "network_isolated": result.network_isolated,
                 "network_enforcement": result.network_enforcement,
                 "limits_enforcement": result.limits_enforcement,
+                "limits": {
+                    name: item.as_dict() for name, item in sorted(result.limits.items())
+                },
                 "cleanup_required": result.cleanup_required,
                 "cleanup_succeeded": result.cleanup_succeeded,
                 "output_truncated": result.output_truncated,
             },
+        )
+
+    def _session_tool(self, tool: str, args: dict[str, Any], call: ToolCall) -> ToolResult:
+        """Typed session operations, gated like any other command execution."""
+        self._require_command()
+        manager = self.session_manager
+        if manager is None:
+            raise ToolBlocked("this runtime does not provide process sessions")
+        max_runtime = self.contract.constraints.max_runtime_seconds
+        if tool == "open_session":
+            timeout = min(args["timeout_seconds"], max_runtime)
+            ref = manager.open(
+                args["argv"],
+                timeout_seconds=timeout,
+                idle_timeout=min(args["idle_timeout"], max_runtime),
+                max_lifetime=min(args["max_lifetime"], max_runtime),
+                cancel_requested=self._cancel_check,
+                use_pty=bool(args.get("use_pty", False)),
+            )
+            data = {
+                "session_id": ref.id,
+                "argv": list(ref.argv),
+                "cwd": ref.cwd,
+                "env_sha256": ref.env_sha256,
+            }
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Session {ref.id} opened",
+                output=json.dumps(data, ensure_ascii=False, sort_keys=True),
+                data=data,
+            )
+        session_id = args["session_id"]
+        if tool == "stream_session":
+            events = manager.stream(session_id, after_seq=args["after_seq"])
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"{len(events)} event(s) after seq {args['after_seq']}",
+                output="\n".join(
+                    f"[{item['seq']}] {item['kind']}: {item['data']}" for item in events
+                ),
+                data={"session_id": session_id, "events": events, "call_id": call.id},
+            )
+        if tool == "send_input":
+            manager.send_input(session_id, args["data"])
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Sent {len(args['data'])} character(s) to {session_id}",
+                data={"session_id": session_id},
+            )
+        if tool == "stop_session":
+            result = manager.stop(session_id, reason=args["reason"])
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Session {session_id} stopped",
+                output=json.dumps(result, ensure_ascii=False, sort_keys=True),
+                data={"session_id": session_id, **result},
+            )
+        if tool == "session_replay":
+            record = manager.export_session(session_id)
+            events = manager.replay_session(record)
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Durable record for {session_id}",
+                output=record,
+                data={"session_id": session_id, "events": events, "note": "record replay; not a live process reattach"},
+            )
+        status = manager.status(session_id)
+        return ToolResult(
+            tool=tool,
+            status=ToolCallStatus.SUCCEEDED,
+            summary=f"Session {session_id}: {status['state']}",
+            output=json.dumps(status, ensure_ascii=False, sort_keys=True),
+            data=status,
+        )
+
+    def _advanced_tool(self, tool: str, args: dict[str, Any]) -> ToolResult:
+        """Typed, bounded advanced operations. All are read-only except no side effects at all."""
+        if tool == "api_request":
+            import hashlib
+            import ipaddress
+            import socket
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(args["url"])
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme != "https" or parsed.username or parsed.password:
+                raise ToolBlocked("api_request requires an https URL without credentials")
+            if parsed.port not in (None, 443):
+                raise ToolBlocked("api_request allows only the default HTTPS port")
+            if host not in self.allowed_api_hosts:
+                raise ToolBlocked(
+                    f"host {host!r} is not in the connector allowlist; no request was sent"
+                )
+            if self.http is None:
+                raise ToolBlocked(
+                    "api_request has no configured HTTP executor; no request was sent"
+                )
+            body = args.get("body_json")
+            if body is not None:
+                json.loads(body)  # reject malformed JSON before any network call
+            # SSRF: resolve every answer and reject private/reserved addresses.
+            try:
+                infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+            except socket.gaierror as exc:
+                raise ToolBlocked(f"could not resolve {host}: {exc}") from exc
+            for info in infos:
+                raw = info[4][0]
+                try:
+                    address = ipaddress.ip_address(raw.split("%")[0])
+                except ValueError as exc:
+                    raise ToolBlocked(f"unparsable address for {host}: {raw}") from exc
+                if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_multicast or address.is_unspecified:
+                    raise ToolBlocked(
+                        f"refusing api_request to non-public address {raw} for {host}"
+                    )
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            request_payload = {
+                "method": args["method"],
+                "url": args["url"],
+                "headers": headers,
+                "body": body,
+            }
+            request_hash = hashlib.sha256(
+                json.dumps(request_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            reply = self.http(
+                args["method"], args["url"], headers, body.encode("utf-8") if body else None
+            )
+            response_bytes = bytes(reply.get("body", b""))
+            cap = max(1024, self.runner.policy.max_output_bytes)
+            truncated = len(response_bytes) > cap
+            if truncated:
+                response_bytes = response_bytes[:cap]
+            text = response_bytes.decode("utf-8", errors="replace")
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                data = {"raw": text[:1000], "note": "response was not valid JSON"}
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"{args['method']} {host} -> {reply.get('status', 'unknown')}",
+                output=text,
+                data={
+                    "status_code": reply.get("status"),
+                    "request_sha256": request_hash,
+                    "response_sha256": hashlib.sha256(response_bytes).hexdigest(),
+                    "truncated": truncated,
+                    "data": data,
+                },
+            )
+        if tool == "db_query":
+            import sqlite3
+
+            resolved = Path(args["path"]).resolve()
+            if not any(
+                resolved.is_relative_to(Path(directory).resolve())
+                for directory in self.allowed_db_dirs
+            ):
+                raise ToolBlocked("database path is not in the allowed directories")
+            sql = args["sql"].strip().rstrip(";")
+            if not sql.lower().startswith("select") or any(
+                token in sql.lower()
+                for token in ("attach", "insert", "update", "delete", "drop", "pragma")
+            ):
+                raise ToolBlocked("only a bounded SELECT is permitted")
+            connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+            try:
+                cursor = connection.execute(sql)
+                rows = cursor.fetchmany(args["max_rows"])
+            finally:
+                connection.close()
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Read {len(rows)} row(s) from {resolved.name}",
+                output=json.dumps(rows, ensure_ascii=False, sort_keys=True),
+                data={"rows": rows, "path": str(resolved)},
+            )
+        if tool == "logs_read":
+            resolved = Path(args["path"]).resolve()
+            if not any(
+                resolved.is_relative_to(Path(directory).resolve())
+                for directory in self.allowed_log_dirs
+            ):
+                raise ToolBlocked("log path is not in the allowed directories")
+            text = redact(resolved.read_text(encoding="utf-8", errors="replace"))
+            lines = text.splitlines()[-args["lines"]:]
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Read {len(lines)} redacted log line(s)",
+                output="\n".join(lines),
+                data={"path": str(resolved), "lines": lines},
+            )
+        if tool == "env_detect":
+            root = (self.workspace / args["path"]).resolve()
+            markers = {
+                "python": "pyproject.toml",
+                "node": "package.json",
+                "rust": "Cargo.toml",
+                "go": "go.mod",
+            }
+            detected = [
+                {"ecosystem": name, "descriptor": marker, "present": (root / marker).is_file()}
+                for name, marker in markers.items()
+                if (root / marker).is_file()
+            ]
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Detected {len(detected)} ecosystem(s)",
+                output=json.dumps(detected, ensure_ascii=False, sort_keys=True),
+                data={"detected": detected},
+            )
+        if tool == "notebook_inspect":
+            resolved = (self.workspace / args["path"]).resolve()
+            if not resolved.is_relative_to(self.workspace):
+                raise ToolBlocked("notebook path is outside the workspace")
+            document = json.loads(resolved.read_text(encoding="utf-8"))
+            cells = document.get("cells", []) if isinstance(document, dict) else []
+            summary = {
+                "cells": len(cells),
+                "types": [cell.get("cell_type") for cell in cells],
+                "kernelspec": (document.get("metadata") or {}).get("kernelspec"),
+                "outputs": sum(len(cell.get("outputs", [])) for cell in cells),
+            }
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"Notebook has {summary['cells']} cell(s)",
+                output=json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                data=summary,
+            )
+        from mayaworkbench.skills.executor import execute_skill
+        from mayaworkbench.skills.service import SkillsService
+
+        service = SkillsService(self.calls.db)
+        if tool == "skill_list":
+            skills = service.list(self.run.project_id, category=args.get("category"))
+            return ToolResult(
+                tool=tool,
+                status=ToolCallStatus.SUCCEEDED,
+                summary=f"{len(skills)} skill(s) available",
+                output="\n".join(f"{item.effective_key}: {item.title}" for item in skills),
+                data={"skills": [item.model_dump(mode="json") for item in skills]},
+            )
+        skill = service.get(args["skill_id"])
+        context = json.loads(args["context_json"]) if args.get("context_json") else {}
+        result = execute_skill(skill, **context)
+        status = ToolCallStatus.SUCCEEDED if result.status != "FAILED" else ToolCallStatus.FAILED
+        return ToolResult(
+            tool=tool,
+            status=status,
+            summary=f"Skill {skill.effective_key}: {result.status}",
+            output=result.output,
+            data=result.model_dump(mode="json"),
         )
 
     def _cancel_check(self) -> bool:
@@ -966,6 +1415,13 @@ class ToolGateway:
             f"blocked: {result.blocked}\n"
             f"network_enforcement: {result.network_enforcement}\n"
             f"limits_enforcement: {result.limits_enforcement}\n"
+            + "\n".join(
+                f"limit.{name}: {item.status}"
+                + (f" ({item.mechanism})" if item.mechanism else "")
+                + (f" — {item.detail}" if item.detail else "")
+                for name, item in sorted(result.limits.items())
+            )
+            + "\n"
             f"--- stdout ---\n{result.stdout}\n"
             f"--- stderr ---\n{result.stderr}"
             + ("\n[output truncated]" if result.output_truncated else "")

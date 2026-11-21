@@ -25,6 +25,16 @@ from dataclasses import dataclass, field
 
 from mayaworkbench.errors import ExtractionError
 
+
+class EncryptedPdfError(ExtractionError):
+    """A PDF is encrypted and no usable credentials were supplied.
+
+    This is a distinct failure reason so a parser fallback can never be used to
+    bypass the encrypted-document policy. The builtin parser does not implement
+    decryption, so it must refuse the same documents.
+    """
+
+
 #: Marker prefixed to tool names so a memo can state exactly what produced its quotes.
 BUILTIN_TOOL = "maya-pdf-text"
 BUILTIN_VERSION = "1.1.0"
@@ -49,6 +59,9 @@ _PAGE_TYPE_RE = re.compile(rb"/Type\s*/Page(?![s\w])")
 _PAGES_TYPE_RE = re.compile(rb"/Type\s*/Pages(?![s\w])")
 _TYPE0_FONT_RE = re.compile(rb"/Subtype\s*/Type0")
 _TO_UNICODE_RE = re.compile(rb"/ToUnicode")
+# An encryption dictionary is a policy signal, independent of which parser reads
+# the file. Both extraction paths must refuse these documents.
+_ENCRYPT_RE = re.compile(rb"/Encrypt\b")
 
 #: Content operators that end a text-showing operation.
 _SHOW_OPERATORS = {"Tj", "TJ", "'", '"'}
@@ -94,9 +107,30 @@ def extract_pdf_text(data: bytes) -> PdfExtraction:
             hint="Register it as a text or Markdown document, or check the file.",
         )
     pypdf = _load_pypdf()
-    if pypdf is not None:
+    if pypdf is None:
+        return _extract_builtin(data)
+    try:
+        # A file that pypdf parses but from which no text is extractable (for
+        # example a scanned image) is a valid result with page-level warnings,
+        # not a parser failure. Only actual parse/read failures fall back.
         return _extract_with_pypdf(pypdf, data)
-    return _extract_builtin(data)
+    except EncryptedPdfError:
+        # Encryption policy is absolute: never try another parser.
+        raise
+    except ExtractionError as primary_error:
+        try:
+            fallback = _extract_builtin(data)
+        except EncryptedPdfError:
+            raise
+        except ExtractionError as fallback_error:
+            raise ExtractionError(
+                f"pypdf failed ({primary_error}); built-in fallback also failed "
+                f"({fallback_error})"
+            ) from fallback_error
+        fallback.warnings.insert(
+            0, f"pypdf parser failed; built-in fallback used: {primary_error}"
+        )
+        return fallback
 
 
 def _load_pypdf():  # type: ignore[no-untyped-def]
@@ -123,14 +157,22 @@ def _extract_with_pypdf(pypdf, data: bytes) -> PdfExtraction:  # type: ignore[no
                 "The PDF is encrypted; extraction used the empty user password."
             )
         except Exception as exc:  # noqa: BLE001
-            raise ExtractionError(
+            raise EncryptedPdfError(
                 "The PDF is encrypted and cannot be read without a password",
                 hint="Decrypt the document first; MayaWorkbench never stores PDF passwords.",
             ) from exc
 
     pages: list[PdfPage] = []
     total_chars = 0
-    for index, page in enumerate(reader.pages, start=1):
+    def _pages():  # type: ignore[no-untyped-def]
+        # A malformed page tree can fail while iterating, not just when the
+        # ``pages`` property is first read. Both must be fallback-eligible.
+        try:
+            yield from enumerate(reader.pages, start=1)
+        except Exception as exc:  # noqa: BLE001 - library raises many shapes
+            raise ExtractionError(f"pypdf could not read the page tree: {exc}") from exc
+
+    for index, page in _pages():
         if index > MAX_PAGES:
             warnings.append(
                 f"The PDF has more than {MAX_PAGES} pages; later pages were not extracted."
@@ -191,6 +233,11 @@ def _extract_with_pypdf(pypdf, data: bytes) -> PdfExtraction:  # type: ignore[no
 
 # ------------------------------------------------------------------------- builtin
 def _extract_builtin(data: bytes) -> PdfExtraction:
+    if _ENCRYPT_RE.search(data):
+        raise EncryptedPdfError(
+            "The PDF is encrypted and cannot be read without a password",
+            hint="Decrypt the document first; MayaWorkbench never stores PDF passwords.",
+        )
     warnings: list[str] = []
     objects = _parse_objects(data, warnings)
     if not objects:

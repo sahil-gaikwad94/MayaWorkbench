@@ -191,6 +191,65 @@ def register_verification_commands(sub: argparse._SubParsersAction) -> None:  # 
     check_bundle.add_argument("directory")
     check_bundle.set_defaults(func=cmd_verify_check_bundle)
 
+    attest = verify_sub.add_parser(
+        "attest", help="Sign a verified bundle with a key from MAYA_SIGNING_KEY"
+    )
+    attest.add_argument("directory")
+    attest.set_defaults(func=cmd_verify_attest)
+
+    check_attest = verify_sub.add_parser(
+        "check-attestation", help="Verify a bundle signature with the supplied key"
+    )
+    check_attest.add_argument("directory")
+    check_attest.set_defaults(func=cmd_verify_check_attestation)
+
+    proof = verify_sub.add_parser("proof", help="Write a .maya-proof.json envelope")
+    proof.add_argument("directory")
+    proof.add_argument(
+        "--level",
+        choices=["SIGNED_BY_USER", "SIGNED_BY_CI"],
+        default="SIGNED_BY_USER",
+    )
+    proof.add_argument("--identity")
+    proof.set_defaults(func=cmd_verify_proof)
+
+    check_proof = verify_sub.add_parser("check-proof", help="Verify a proof envelope")
+    check_proof.add_argument("directory")
+    check_proof.set_defaults(func=cmd_verify_check_proof)
+
+    mutation = verify_sub.add_parser(
+        "mutation", help="Show mutation probe results for the latest verification"
+    )
+    mutation.add_argument("identifier", help="Run id (run_…) or task id")
+    mutation.set_defaults(func=cmd_verify_mutation)
+
+    security = verify_sub.add_parser(
+        "security", help="Show the deterministic security report for a verification"
+    )
+    security.add_argument("identifier", help="Run id (run_…) or task id")
+    security.set_defaults(func=cmd_verify_security)
+
+
+def cmd_verify_proof(args: argparse.Namespace) -> int:
+    from mayaworkbench.verification.attestation import write_proof
+
+    console = args.console
+    payload = write_proof(args.directory, level=args.level, identity=args.identity)
+    console.json(payload) if console.json_mode else console.print(
+        f"Wrote {payload['level']} proof for {payload['root_sha256'][:12]} "
+        f"(identity {payload['identity']})"
+    )
+    return 0
+
+
+def cmd_verify_check_proof(args: argparse.Namespace) -> int:
+    from mayaworkbench.verification.attestation import verify_proof
+
+    console = args.console
+    payload = verify_proof(args.directory)
+    console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+    return 0 if payload.get("ok", False) else 1
+
 
 # ----------------------------------------------------------------- handlers
 def cmd_verify_checks(args: argparse.Namespace) -> int:
@@ -482,4 +541,138 @@ def cmd_verify_check_bundle(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
-__all__ = ["register_verification_commands", "parse_invariant_expression"]
+def cmd_verify_attest(args: argparse.Namespace) -> int:
+    from mayaworkbench.verification.attestation import sign_bundle
+
+    console = args.console
+    payload = sign_bundle(args.directory)
+    if console.json_mode:
+        console.json(payload)
+    else:
+        console.print(f"Signed bundle as {payload['level']} (key {payload['key_id']})")
+        console.note(payload["claim"])
+    return 0
+
+
+def cmd_verify_check_attestation(args: argparse.Namespace) -> int:
+    from mayaworkbench.verification.attestation import verify_attestation
+
+    console = args.console
+    payload = verify_attestation(args.directory)
+    if console.json_mode:
+        console.json(payload)
+    else:
+        console.print(f"Attestation: {payload['level']} verified={payload['verified']}")
+        if payload.get("error"):
+            console.error(payload["error"])
+    return 0 if payload.get("ok", False) else 1
+
+
+def _evidence_artifact(svc, report, key: str):  # type: ignore[no-untyped-def]
+    artifact_id = report.details.get(f"{key}_artifact_id")
+    if not artifact_id:
+        raise UsageError(
+            f"The report for {report.id} has no {key} evidence artifact",
+            hint="Run `maya verify run <identifier>` with a current build first.",
+        )
+    return artifact_id
+
+
+def cmd_verify_mutation(args: argparse.Namespace) -> int:
+    """Show structured mutation-probe results from the latest verification."""
+    console = args.console
+    svc = _services(args)
+    run, report = _latest(svc, args.identifier)
+    artifact_id = _evidence_artifact(svc, report, "mutation")
+    payload = json.loads(svc.artifacts.read_text(artifact_id))
+    if console.json_mode:
+        console.json({"run": run.id, "report": report.id, "mutation": payload})
+        return 0
+    counts = payload.get("counts", {})
+    console.heading(f"Mutation probes for {run.id}")
+    console.kv(
+        [
+            ("report", report.id),
+            ("declared critical tests", len(payload.get("declared", []))),
+            ("KILLED", counts.get("KILLED", 0)),
+            ("SURVIVED", counts.get("SURVIVED", 0)),
+            ("SKIPPED", counts.get("SKIPPED", 0)),
+            ("baseline files pinned", len(payload.get("baseline", {}).get("files", {}))),
+            ("bypass flag", "YES" if payload.get("bypass_detected") else "no"),
+        ]
+    )
+    console.section("Probes")
+    console.table(
+        ["mutation id", "kind", "location", "test", "outcome", "reason", "artifact"],
+        [
+            [
+                str(item.get("mutation_id", "")),
+                str(item.get("kind", "")),
+                f"{item.get('file', '')}:{item.get('line', 0)}",
+                str(item.get("test", "")),
+                str(item.get("outcome", "")),
+                str(item.get("reason", "")),
+                str(item.get("artifact_id") or "-"),
+            ]
+            for item in payload.get("results", [])
+        ],
+        max_column=60,
+    )
+    for bypass in payload.get("bypass_details", []):
+        console.warning(
+            f"Critical-test baseline changed for {bypass.get('path')}: "
+            f"{bypass.get('reason', '')}"
+        )
+    console.note(
+        "Mutation is property-level evidence, not semantic proof. A SURVIVED "
+        "declared critical test is a blind spot and can only downgrade the "
+        "decision; SKIPPED is never a pass."
+    )
+    return 0
+
+
+def cmd_verify_security(args: argparse.Namespace) -> int:
+    """Show the deterministic security report from the latest verification."""
+    console = args.console
+    svc = _services(args)
+    run, report = _latest(svc, args.identifier)
+    artifact_id = _evidence_artifact(svc, report, "security")
+    payload = json.loads(svc.artifacts.read_text(artifact_id))
+    if console.json_mode:
+        console.json({"run": run.id, "report": report.id, "security": payload})
+        return 0
+    console.heading(f"Security report for {run.id}")
+    console.kv(
+        [
+            ("report", report.id),
+            ("findings", len(payload.get("findings", []))),
+            ("artifact", artifact_id),
+            ("model required", "no"),
+        ]
+    )
+    console.section("Findings")
+    console.table(
+        ["category", "severity", "code", "path", "message"],
+        [
+            [
+                str(item.get("category", "")),
+                str(item.get("severity", "")),
+                str(item.get("code", "")),
+                str(item.get("path") or "-"),
+                str(item.get("message", "")),
+            ]
+            for item in payload.get("findings", [])
+        ],
+        max_column=60,
+    )
+    console.note(
+        "Deterministic checks over recorded evidence only; no model is used. "
+        "This is not a penetration test and an empty result is not a security guarantee."
+    )
+    return 0
+
+
+__all__ = [
+    "register_verification_commands",
+    "parse_invariant_expression",
+]

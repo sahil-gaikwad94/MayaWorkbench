@@ -14,6 +14,7 @@ baseline that must work first (§8.5). Diagnostics name everything that happened
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 
 from mayaworkbench.config import RetrievalSettings
 from mayaworkbench.errors import UsageError
@@ -172,6 +173,9 @@ class RetrievalService:
         budget: int | None = None,
         mode: SearchMode = "auto",
         expand_relationships: bool = True,
+        selection: str = "greedy",
+        use_semantic: bool = False,
+        use_ppr: bool = False,
     ) -> RetrievalBundle:
         budget = budget or self.settings.default_token_budget
         if budget < MIN_TOKEN_BUDGET:
@@ -230,6 +234,39 @@ class RetrievalService:
         ordered_hits = sorted(hits, key=lambda hit: (-hit.score, hit.path, hit.line_no))[
             : self.settings.max_hits
         ]
+        if use_ppr and ordered_symbols:
+            from mayaworkbench.retrieval.semantic import ppr_scores
+
+            graph: dict[str, list[str]] = defaultdict(list)
+            for symbol in ordered_symbols:
+                for relation in self.search.symbols.edges_from(symbol.symbol_id):
+                    target_name = str(relation.get("target_name") or "")
+                    if target_name:
+                        graph[symbol.qualified_name].append(target_name)
+            seeds = [symbol.qualified_name for symbol in ordered_symbols[:3]]
+            scores = ppr_scores(graph, seeds)
+            if scores:
+                for symbol in ordered_symbols:
+                    symbol.score = round(
+                        symbol.score + 0.5 * scores.get(symbol.qualified_name, 0.0), 6
+                    )
+                ordered_symbols.sort(
+                    key=lambda hit: (-hit.score, hit.path, hit.start_line)
+                )
+                notes.append("damped PPR applied to symbol ranking (optional mode)")
+        if use_semantic:
+            from mayaworkbench.retrieval.semantic import LexicalReranker
+
+            ranker = LexicalReranker()
+            ordered_hits = [
+                SearchHit(**item)
+                for item in ranker.rerank(
+                    question,
+                    [hit.model_dump() for hit in ordered_hits],
+                    limit=self.settings.max_hits,
+                )
+            ]
+            notes.append("optional deterministic reranker applied to retrieved spans")
         if not ordered_hits and not ordered_symbols:
             notes.append("no lexical or symbol evidence matched this question")
 
@@ -237,6 +274,9 @@ class RetrievalService:
             hits=ordered_hits,
             symbols=ordered_symbols,
             budget=budget,
+            snapshot_id=snapshot_id,
+            query=question,
+            selection=selection,  # type: ignore[arg-type]
         )
         if pack.truncated:
             notes.append(f"context was truncated to a {budget}-token budget")

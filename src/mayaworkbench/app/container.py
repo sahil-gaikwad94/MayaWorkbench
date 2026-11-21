@@ -20,6 +20,8 @@ from mayaworkbench.experiments.service import ExperimentService
 from mayaworkbench.indexing.indexer import Indexer
 from mayaworkbench.indexing.map import RepositoryMapService
 from mayaworkbench.memory.service import MemoryService
+from mayaworkbench.skills.service import SkillsService
+from mayaworkbench.workspace.workspace_service import WorkspaceService
 from mayaworkbench.mapping.service import ClaimMappingService
 from mayaworkbench.tasks.approvals import ApprovalService
 from mayaworkbench.tasks.plans import PlanService
@@ -32,6 +34,7 @@ from mayaworkbench.models.gateway import ModelGateway, ProviderFactory
 from mayaworkbench.qa.service import AskService
 from mayaworkbench.repositories.snapshots import RepositoryService
 from mayaworkbench.research.claims import ClaimService
+from mayaworkbench.research.discovery import DiscoveryService
 from mayaworkbench.research.ingestion import DocumentIngestionService
 from mayaworkbench.research.memo import MemoService
 from mayaworkbench.retrieval.context import ContextPacker
@@ -53,6 +56,7 @@ from mayaworkbench.storage.stores import (
     VerificationStore,
     WorkerJobStore,
     WorkspaceStore,
+    EngineeringWorkspaceStore,
     ExperimentStore,
     MemoryStore,
     FileStore,
@@ -66,6 +70,7 @@ from mayaworkbench.storage.stores import (
     ResearchExtractionStore,
     ResearchMemoStore,
     SnapshotStore,
+    SourceMetadataStore,
     SourcePassageStore,
     SymbolStore,
 )
@@ -108,6 +113,8 @@ class Services:
     extractions: ResearchExtractionStore
     ingestion: DocumentIngestionService
     claim_service: ClaimService
+    source_metadata: SourceMetadataStore
+    discovery_service: DiscoveryService
     mapping_service: ClaimMappingService
     memo_service: MemoService
     task_store: TaskStore
@@ -131,6 +138,9 @@ class Services:
     experiment_service: ExperimentService
     memory_store: MemoryStore
     memory_service: MemoryService
+    engineering_workspaces: "EngineeringWorkspaceStore"
+    workspace_service: "WorkspaceService"
+    skills: SkillsService
     task_service: TaskService
 
     @classmethod
@@ -203,6 +213,7 @@ class Services:
         documents = ResearchDocumentStore(db)
         passages = SourcePassageStore(db)
         claims = ResearchClaimStore(db)
+        source_metadata = SourceMetadataStore(db)
         mappings = ClaimMappingStore(db)
         memos = ResearchMemoStore(db)
         extractions = ResearchExtractionStore(db)
@@ -259,6 +270,16 @@ class Services:
             events=events,
             settings=settings,
         )
+        discovery_service = DiscoveryService(
+            db,
+            projects=projects,
+            documents=documents,
+            claims=claims,
+            sources=source_metadata,
+            artifacts=artifacts,
+            events=events,
+            fetcher=ingestion.fetcher,
+        )
 
         task_store = TaskStore(db)
         contracts = ContractStore(db)
@@ -273,6 +294,14 @@ class Services:
         verification_store = VerificationStore(db)
         experiment_store = ExperimentStore(db)
         memory_store = MemoryStore(db)
+        engineering_workspaces = EngineeringWorkspaceStore(db)
+        workspace_service = WorkspaceService(
+            store=engineering_workspaces,
+            events=events,
+            projects=projects,
+            repositories=repositories,
+        )
+        skills = SkillsService(db)
         memory_service = MemoryService(
             store=memory_store,
             events=events,
@@ -409,6 +438,8 @@ class Services:
             extractions=extractions,
             ingestion=ingestion,
             claim_service=claim_service,
+            source_metadata=source_metadata,
+            discovery_service=discovery_service,
             mapping_service=mapping_service,
             memo_service=memo_service,
             task_store=task_store,
@@ -432,6 +463,9 @@ class Services:
             experiment_service=experiment_service,
             memory_store=memory_store,
             memory_service=memory_service,
+            engineering_workspaces=engineering_workspaces,
+            workspace_service=workspace_service,
+            skills=skills,
             task_service=task_service,
         )
 
@@ -480,6 +514,10 @@ class Services:
     @property
     def memory(self) -> MemoryService:
         return self.memory_service
+
+    @property
+    def skill_service(self) -> SkillsService:
+        return self.skills
 
     def close(self) -> None:
         self.db.close()

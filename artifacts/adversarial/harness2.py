@@ -29,6 +29,7 @@ from tests.conftest import (  # noqa: E402
     git,
     write,
 )
+from artifacts.adversarial._cli import maya_argv  # noqa: E402
 
 RESULTS: list[dict] = []
 
@@ -471,15 +472,14 @@ def main() -> int:
         for i in range(6):
             procs.append(
                 subprocess.Popen(
-                    [
-                        str(ROOT / ".venv" / "bin" / "maya"),
+                    maya_argv(
                         "--home", str(home),
                         "memory", "add",
                         "--project", project.id,
                         "--kind", "FACT",
                         "--title", f"concurrent {i}",
                         "--statement", f"writer {i}",
-                    ],
+                    ),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -584,11 +584,11 @@ def main() -> int:
         cwd = base / "init-cwd"
         cwd.mkdir()
         first = subprocess.run(
-            [str(ROOT / ".venv" / "bin" / "maya"), "--home", str(base / "init-home"), "init", "--project", "twice"],
+            maya_argv("--home", str(base / "init-home"), "init", "--project", "twice"),
             cwd=cwd, capture_output=True, text=True, timeout=60,
         )
         second = subprocess.run(
-            [str(ROOT / ".venv" / "bin" / "maya"), "--home", str(base / "init-home"), "init", "--project", "twice"],
+            maya_argv("--home", str(base / "init-home"), "init", "--project", "twice"),
             cwd=cwd, capture_output=True, text=True, timeout=60,
         )
         assert first.returncode == 0, first.stderr[-300:]

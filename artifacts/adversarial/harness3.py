@@ -30,6 +30,7 @@ from mayaworkbench.models.gateway import ModelGateway  # noqa: E402
 from mayaworkbench.verification.registry import command_check  # noqa: E402
 from mayaworkbench.worker import Worker  # noqa: E402
 from tests.conftest import ScriptedTaskProvider, enable_virtual_model, git, write  # noqa: E402
+from artifacts.adversarial._cli import maya_argv  # noqa: E402
 
 RESULTS: list[dict] = []
 
@@ -390,7 +391,7 @@ def main() -> int:
         broken_home.mkdir()
         (broken_home / "maya.db").write_bytes(copy.read_bytes())
         result = subprocess.run(
-            [str(ROOT / ".venv" / "bin" / "maya"), "--home", str(broken_home), "db", "info"],
+            maya_argv("--home", str(broken_home), "db", "info"),
             capture_output=True, text=True, timeout=60,
         )
         assert result.returncode != 0, "future schema version opened as if current"
@@ -408,9 +409,11 @@ def main() -> int:
         for i in range(10):
             procs.append(
                 subprocess.Popen(
-                    [str(ROOT / ".venv" / "bin" / "maya"), "--home", str(kill_home), "memory", "add",
-                     "--project", kill_project.id, "--kind", "FACT", "--title", f"kill {i}",
-                     "--statement", f"s{i}"],
+                    maya_argv(
+                        "--home", str(kill_home), "memory", "add",
+                        "--project", kill_project.id, "--kind", "FACT", "--title", f"kill {i}",
+                        "--statement", f"s{i}",
+                    ),
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
             )
@@ -421,7 +424,7 @@ def main() -> int:
         integrity = con.execute("PRAGMA integrity_check").fetchone()[0]
         assert integrity == "ok", f"integrity_check after SIGKILL: {integrity}"
         result = subprocess.run(
-            [str(ROOT / ".venv" / "bin" / "maya"), "--home", str(kill_home), "--json", "project", "list"],
+            maya_argv("--home", str(kill_home), "--json", "project", "list"),
             capture_output=True, text=True, timeout=60,
         )
         assert result.returncode == 0, result.stderr[-300:]

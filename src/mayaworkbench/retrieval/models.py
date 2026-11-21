@@ -58,13 +58,29 @@ class ExcludedItem(BaseModel):
     reason: str
 
 
+class CandidateDecision(BaseModel):
+    """Why a ranked candidate was admitted or excluded from the pack (§6.3)."""
+
+    path: str
+    start_line: int
+    end_line: int
+    score: float
+    reason: str
+    decision: Literal["included", "excluded"]
+    exclusion_reason: str | None = None
+
+
 class ContextPack(BaseModel):
+    snapshot_id: str | None = None
+    query: str | None = None
     items: list[ContextItem] = Field(default_factory=list)
     token_estimate: int = 0
     token_budget: int = 0
     estimator: str = ""
     files_covered: list[str] = Field(default_factory=list)
     excluded: list[ExcludedItem] = Field(default_factory=list)
+    candidates_manifest: list[CandidateDecision] = Field(default_factory=list)
+    ambiguities: list[str] = Field(default_factory=list)
     truncated: bool = False
 
     def has_evidence(self) -> bool:
@@ -129,6 +145,7 @@ __all__ = [
     "SymbolHit",
     "ContextItem",
     "ExcludedItem",
+    "CandidateDecision",
     "ContextPack",
     "RetrievalDiagnostics",
     "RetrievalBundle",

@@ -42,6 +42,10 @@ DOCUMENT_CONTENT_TYPES = {
     "text/restructuredtext",
 }
 
+#: Metadata APIs return JSON. The same SSRF/address-pinning path is reused, but
+#: only these media types are accepted on it.
+JSON_CONTENT_TYPES = {"application/json", "application/vnd.api+json"}
+
 DOI_RE = r"^10\.\d{4,9}/\S+$"
 
 
@@ -142,7 +146,14 @@ class DocumentFetcher:
             retrieved_at=utcnow(),
         )
 
-    def _fetch_pinned(self, requested: str) -> FetchedDocument:
+    def fetch_json(self, url: str) -> FetchedDocument:
+        """Fetch a JSON metadata response through the same SSRF-bounded path."""
+        requested = self._validate_url(url, resolve=False)
+        return self._fetch_pinned(requested, allowed_types=JSON_CONTENT_TYPES)
+
+    def _fetch_pinned(
+        self, requested: str, *, allowed_types: set[str] | None = None
+    ) -> FetchedDocument:
         """Fetch by connecting to the *validated* address, not a re-resolution.
 
         A hostile DNS answer can change between validation and connection. This
@@ -211,7 +222,7 @@ class DocumentFetcher:
                     f"The server returned HTTP {status} for {current}",
                     hint="Check the URL, or download the document and register the file instead.",
                 )
-            self._check_content_type(content_type, data, current)
+            self._check_content_type(content_type, data, current, allowed_types=allowed_types)
             return FetchedDocument(
                 requested_url=requested,
                 final_url=current,
@@ -353,11 +364,23 @@ class DocumentFetcher:
             )
         return addresses[0]
 
-    def _check_content_type(self, content_type: str, data: bytes, url: str) -> None:
+    def _check_content_type(
+        self,
+        content_type: str,
+        data: bytes,
+        url: str,
+        *,
+        allowed_types: set[str] | None = None,
+    ) -> None:
         cleaned = content_type.split(";")[0].strip().lower()
-        if cleaned in DOCUMENT_CONTENT_TYPES:
+        accepted = DOCUMENT_CONTENT_TYPES if allowed_types is None else allowed_types
+        if cleaned in accepted:
             return
-        if cleaned in ("application/octet-stream", "") and data[:1024].lstrip().startswith(b"%PDF-"):
+        if (
+            allowed_types is None
+            and cleaned in ("application/octet-stream", "")
+            and data[:1024].lstrip().startswith(b"%PDF-")
+        ):
             return
         if cleaned in ("text/html", "application/xhtml+xml"):
             raise FetchError(
@@ -369,7 +392,7 @@ class DocumentFetcher:
             )
         raise FetchError(
             f"Unsupported content type {cleaned or '<none>'} from {url}",
-            hint="Accepted types: PDF, Markdown, plain text and reStructuredText.",
+            hint="Accepted types: " + ", ".join(sorted(accepted)) + ".",
         )
 
 
@@ -397,7 +420,13 @@ def fetcher_from_settings(settings: Settings) -> DocumentFetcher:
     )
 
 
-__all__ = ["FetchedDocument", "DocumentFetcher", "DOCUMENT_CONTENT_TYPES", "fetcher_from_settings"]
+__all__ = [
+    "FetchedDocument",
+    "DocumentFetcher",
+    "DOCUMENT_CONTENT_TYPES",
+    "JSON_CONTENT_TYPES",
+    "fetcher_from_settings",
+]
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):

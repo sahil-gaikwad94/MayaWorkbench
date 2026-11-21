@@ -70,6 +70,21 @@ class EdgeType(StrEnum):
     DECORATES = "DECORATES"
 
 
+class RelationSource(StrEnum):
+    """How a symbol/edge relation was discovered (WP5).
+
+    Currently only AST (Python) and HEURISTIC (JS/TS/Go/Rust) are produced;
+    the remaining values describe future adapters and language-server data.
+    """
+
+    AST_IMPORT = "AST_IMPORT"
+    TYPE_REFERENCE = "TYPE_REFERENCE"
+    CALL_SITE = "CALL_SITE"
+    BUILD_DEPENDENCY = "BUILD_DEPENDENCY"
+    CONFIG_REFERENCE = "CONFIG_REFERENCE"
+    HEURISTIC = "HEURISTIC"
+
+
 class EdgeConfidence(StrEnum):
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
@@ -107,11 +122,14 @@ class ArtifactKind(StrEnum):
     UNTRACKED_MANIFEST = "UNTRACKED_MANIFEST"
     FILE_MANIFEST = "FILE_MANIFEST"
     INDEX_MAP = "INDEX_MAP"
+    INDEX_FILE_CACHE = "INDEX_FILE_CACHE"
     QA_ANSWER = "QA_ANSWER"
     CONTEXT_PACK = "CONTEXT_PACK"
     SOURCE_DOCUMENT = "SOURCE_DOCUMENT"
     SOURCE_TEXT = "SOURCE_TEXT"
+    SOURCE_METADATA = "SOURCE_METADATA"
     EXTRACTION_REPORT = "EXTRACTION_REPORT"
+    SOURCE_OCR = "SOURCE_OCR"
     CLAIM_SET = "CLAIM_SET"
     CLAIM_MATRIX = "CLAIM_MATRIX"
     RESEARCH_MEMO = "RESEARCH_MEMO"
@@ -251,6 +269,13 @@ class EventType(StrEnum):
     MEMORY_UPDATED = "MEMORY_UPDATED"
     MEMORY_DELETED = "MEMORY_DELETED"
     MEMORY_STALE = "MEMORY_STALE"
+    # WP4 — Engineering Workspace
+    WORKSPACE_CREATED = "WORKSPACE_CREATED"
+    RESOURCE_ATTACHED = "RESOURCE_ATTACHED"
+    ENVIRONMENT_SPECIFIED = "ENVIRONMENT_SPECIFIED"
+    WORKSPACE_SESSION_OPENED = "WORKSPACE_SESSION_OPENED"
+    WORKSPACE_SESSION_CLOSED = "WORKSPACE_SESSION_CLOSED"
+    EVIDENCE_ATTACHED = "EVIDENCE_ATTACHED"
 
 
 # ------------------------------------------------------------ task workflow
@@ -273,10 +298,15 @@ class WorkflowState(StrEnum):
     CREATED = "CREATED"
     CONTRACTED = "CONTRACTED"
     PLANNING = "PLANNING"
+    AWAITING_PLAN_REVIEW = "AWAITING_PLAN_REVIEW"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    ENVIRONMENT_PROVISIONING = "ENVIRONMENT_PROVISIONING"
     IMPLEMENTING = "IMPLEMENTING"
+    REPAIRING = "REPAIRING"
     PAUSED = "PAUSED"
     REVIEWING = "REVIEWING"
+    EVIDENCE_BUILDING = "EVIDENCE_BUILDING"
+    PUBLISHING_DRAFT = "PUBLISHING_DRAFT"
     COMPLETED = "COMPLETED"
     COMPLETED_WITH_LIMITATIONS = "COMPLETED_WITH_LIMITATIONS"
     FAILED = "FAILED"
@@ -322,6 +352,66 @@ class ExecutionProfile(StrEnum):
     STATIC_ANALYSIS = "STATIC_ANALYSIS"
     CPU_SMOKE = "CPU_SMOKE"
     USER_APPROVED_LOCAL = "USER_APPROVED_LOCAL"
+
+
+class ResourceKind(StrEnum):
+    """Typed attachments to an Engineering Workspace."""
+
+    REPOSITORY = "REPOSITORY"
+    DOCUMENT_SET = "DOCUMENT_SET"
+    DATASET = "DATASET"
+    NOTEBOOK = "NOTEBOOK"
+    SERVICE = "SERVICE"
+    DATABASE_SCHEMA = "DATABASE_SCHEMA"
+    INFRASTRUCTURE = "INFRASTRUCTURE"
+    EXPERIMENT_TRACKER = "EXPERIMENT_TRACKER"
+    CONNECTOR = "CONNECTOR"
+
+
+class WorkspaceSessionState(StrEnum):
+    OPEN = "OPEN"
+    STOPPED = "STOPPED"
+    EXPIRED = "EXPIRED"
+
+
+class EvidenceStatus(StrEnum):
+    UNVERIFIED = "UNVERIFIED"
+    VERIFIED = "VERIFIED"
+    CONTESTED = "CONTESTED"
+
+
+class ToolCapability(StrEnum):
+    """Typed grants a task contract can give to the tool gateway.
+
+    An empty grant list means "legacy contract": the gateway still enforces
+    approvals and path/command policy, but does not narrow the old tool set. A
+    non-empty list is a closed allowlist.
+    """
+
+    FILE_READ = "file.read"
+    FILE_WRITE = "file.write"
+    PROCESS_EXECUTE = "process.execute"
+    PROCESS_SESSION = "process.session"
+    NETWORK_FETCH = "network.fetch"
+    EXPERIMENT_RUN = "experiment.run"
+    CONNECTOR_READ = "connector.read"
+    ADVANCED_TOOL = "tool.advanced"
+    SKILL_USE = "skill.use"
+
+
+class ExecutionTrust(StrEnum):
+    """Where and under what boundary project code executes.
+
+    ``LOCAL_TRUSTED`` is the only profile currently implemented. It is the
+    local user's privileges, not a sandbox. The isolated profiles are declared
+    so policy can refuse an untrusted task instead of silently downgrading it.
+    """
+
+    READ_ONLY_ANALYSIS = "READ_ONLY_ANALYSIS"
+    LOCAL_TRUSTED = "LOCAL_TRUSTED"
+    ROOTLESS_CONTAINER = "ROOTLESS_CONTAINER"
+    REMOTE_MICROVM = "REMOTE_MICROVM"
+    GPU_RUNNER = "GPU_RUNNER"
 
 
 class NetworkPolicy(StrEnum):
@@ -405,12 +495,69 @@ class PassageKind(StrEnum):
 
 
 class ClaimType(StrEnum):
-    """Claim categories from the specification (§9.2). Never merged."""
+    """Legacy claim categories from the specification (§9.2). Never merged.
+
+    Kept as the persisted compatibility axis of the typed claim graph: every
+    typed :class:`ClaimKind` still maps to exactly one of these values so older
+    callers and stored rows remain valid.
+    """
 
     EXPLICIT_SOURCE_CLAIM = "EXPLICIT_SOURCE_CLAIM"
     INFERRED_REQUIREMENT = "INFERRED_REQUIREMENT"
     USER_REQUIREMENT = "USER_REQUIREMENT"
     IMPLEMENTATION_DECISION = "IMPLEMENTATION_DECISION"
+
+
+class ClaimKind(StrEnum):
+    """Typed claim kinds of the versioned research-to-implementation graph.
+
+    These are the six kinds from audit §7.1. They are *not* merged with each
+    other, and a paper claim never silently becomes a requirement.
+    """
+
+    PAPER_METHOD = "PAPER_METHOD"
+    PAPER_RESULT = "PAPER_RESULT"
+    REPRODUCTION_REQUIREMENT = "REPRODUCTION_REQUIREMENT"
+    USER_REQUIREMENT = "USER_REQUIREMENT"
+    INFERRED_REQUIREMENT = "INFERRED_REQUIREMENT"
+    VALIDATION_CLAIM = "VALIDATION_CLAIM"
+
+
+#: The legacy type a typed claim presents to older validation/storage code.
+LEGACY_CLAIM_TYPE_FOR_KIND: dict[ClaimKind, ClaimType] = {
+    ClaimKind.PAPER_METHOD: ClaimType.EXPLICIT_SOURCE_CLAIM,
+    ClaimKind.PAPER_RESULT: ClaimType.EXPLICIT_SOURCE_CLAIM,
+    ClaimKind.REPRODUCTION_REQUIREMENT: ClaimType.IMPLEMENTATION_DECISION,
+    ClaimKind.USER_REQUIREMENT: ClaimType.USER_REQUIREMENT,
+    ClaimKind.INFERRED_REQUIREMENT: ClaimType.INFERRED_REQUIREMENT,
+    ClaimKind.VALIDATION_CLAIM: ClaimType.USER_REQUIREMENT,
+}
+
+#: The closest typed kind for a legacy claim type (used for stored rows and
+#: callers that have not opted into ``--kind`` yet).
+KIND_FOR_LEGACY_CLAIM_TYPE: dict[ClaimType, ClaimKind] = {
+    ClaimType.EXPLICIT_SOURCE_CLAIM: ClaimKind.PAPER_METHOD,
+    ClaimType.INFERRED_REQUIREMENT: ClaimKind.INFERRED_REQUIREMENT,
+    ClaimType.USER_REQUIREMENT: ClaimKind.USER_REQUIREMENT,
+    ClaimType.IMPLEMENTATION_DECISION: ClaimKind.REPRODUCTION_REQUIREMENT,
+}
+
+
+class ClaimExplicitness(StrEnum):
+    """Whether a claim states what the source says or is Maya's inference."""
+
+    EXPLICIT = "EXPLICIT"
+    INFERRED = "INFERRED"
+
+
+class ClaimTargetKind(StrEnum):
+    """What a claim's ``target_resources`` entry points at."""
+
+    SYMBOL = "SYMBOL"
+    FILE = "FILE"
+    DIRECTORY = "DIRECTORY"
+    TEST = "TEST"
+    DATA = "DATA"
 
 
 class ClaimAuthor(StrEnum):
@@ -452,6 +599,9 @@ class ClaimMappingStatus(StrEnum):
     UNCERTAIN = "UNCERTAIN"
     CONFLICTING = "CONFLICTING"
     NOT_APPLICABLE = "NOT_APPLICABLE"
+    #: No mapping check has been performed. Never emitted by deterministic
+    #: rules and never used as a synonym for UNCERTAIN or ABSENT.
+    NOT_CHECKED = "NOT_CHECKED"
 
 
 class MappingEvidenceRelation(StrEnum):
@@ -779,6 +929,11 @@ __all__ = [
     "ExtractionStatus",
     "PassageKind",
     "ClaimType",
+    "ClaimKind",
+    "LEGACY_CLAIM_TYPE_FOR_KIND",
+    "KIND_FOR_LEGACY_CLAIM_TYPE",
+    "ClaimExplicitness",
+    "ClaimTargetKind",
     "ClaimAuthor",
     "ClaimConfidence",
     "ClaimReviewStatus",
@@ -794,6 +949,12 @@ __all__ = [
     "ApprovalAction",
     "ApprovalStatus",
     "ExecutionProfile",
+    "ExecutionTrust",
+    "ToolCapability",
+    "RelationSource",
+    "ResourceKind",
+    "WorkspaceSessionState",
+    "EvidenceStatus",
     "NetworkPolicy",
     "DependencyPolicy",
     "WorkspaceStatus",

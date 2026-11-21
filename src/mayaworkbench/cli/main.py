@@ -184,6 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--repo")
     ask.add_argument("--snapshot")
     ask.add_argument("--budget", type=int, help="Context token budget")
+    ask.add_argument("--semantic", action="store_true", help="Use optional deterministic reranker")
+    ask.add_argument("--ppr", action="store_true", help="Use optional damped PPR symbol ranking")
+    ask.add_argument(
+        "--selection",
+        choices=["greedy", "submodular"],
+        default="greedy",
+        help="Context candidate selection policy",
+    )
     ask.add_argument("--no-model", action="store_true", help="Return retrieval evidence only")
     ask.set_defaults(func=cmd_ask)
 
@@ -260,6 +268,16 @@ def build_parser() -> argparse.ArgumentParser:
     from mayaworkbench.cli.experiment_commands import register_experiment_commands
     from mayaworkbench.cli.memory_commands import register_memory_commands
     from mayaworkbench.cli.research_commands import register_research_commands
+    from mayaworkbench.cli.api_commands import register_api_commands
+    from mayaworkbench.cli.environment_commands import register_environment_commands
+    from mayaworkbench.cli.evaluation_commands import register_evaluation_commands
+    from mayaworkbench.cli.experience_commands import register_experience_commands
+    from mayaworkbench.cli.model_commands import register_model_commands
+    from mayaworkbench.cli.runner_bundle_commands import register_runner_bundle_commands
+    from mayaworkbench.cli.runner_commands import register_runner_commands
+    from mayaworkbench.cli.semantic_commands import register_semantic_commands
+    from mayaworkbench.cli.skill_commands import register_skill_commands
+    from mayaworkbench.cli.workspace_commands import register_workspace_commands
     from mayaworkbench.cli.task_commands import register_task_commands
     from mayaworkbench.cli.verification_commands import register_verification_commands
 
@@ -268,6 +286,16 @@ def build_parser() -> argparse.ArgumentParser:
     register_verification_commands(sub)
     register_experiment_commands(sub)
     register_memory_commands(sub)
+    register_runner_commands(sub)
+    register_workspace_commands(sub)
+    register_experience_commands(sub)
+    register_evaluation_commands(sub)
+    register_environment_commands(sub)
+    register_api_commands(sub)
+    register_model_commands(sub)
+    register_runner_bundle_commands(sub)
+    register_skill_commands(sub)
+    register_semantic_commands(sub)
 
     worker = sub.add_parser("worker", help="Run the durable task worker process")
     worker.add_argument("--once", action="store_true", help="Process one job and exit")
@@ -1089,6 +1117,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
         args.question,
         token_budget=args.budget,
         use_model=not args.no_model,
+        selection=args.selection,
+        use_semantic=bool(getattr(args, "semantic", False)),
+        use_ppr=bool(getattr(args, "ppr", False)),
     )
     record = result.record
     payload = {

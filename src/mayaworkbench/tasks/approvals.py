@@ -133,19 +133,31 @@ class ApprovalService:
         for existing in self.approvals.find_pending(run.id, action.value):
             if existing.spec_sha256 == spec_hash:
                 return existing
+        from mayaworkbench.tasks.approval_tokens import approval_message, sign_approval
+
+        expires_at_value = utcnow() + timedelta(seconds=ttl_seconds)
+        token_message = approval_message(
+            approval_id="apr_" + new_ulid(),
+            spec_sha256=spec_hash,
+            nonce=secrets.token_hex(24),
+            expires_at=to_iso(expires_at_value),
+            action=action.value,
+        )
+        envelope = sign_approval(token_message)
         approval = ApprovalRequest(
-            id="apr_" + new_ulid(),
+            id=token_message["approval_id"],
             run_id=run.id,
             task_id=run.task_id,
             project_id=run.project_id,
             action=action,
             resource_scope=spec,
             spec_sha256=spec_hash,
-            nonce=secrets.token_hex(24),
-            expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+            nonce=token_message["nonce"],
+            expires_at=expires_at_value,
             details={
                 "contract_id": contract.id,
                 "plan_id": plan.id if plan is not None else None,
+                "approval_hmac": envelope,
             },
         )
         self.approvals.create(approval)
@@ -269,6 +281,18 @@ class ApprovalService:
             raise ApprovalError(
                 f"Approval {approval_id} expired at {to_iso(approval.expires_at)}"
             )
+        from mayaworkbench.tasks.approval_tokens import approval_message, verify_approval
+
+        envelope = (approval.details or {}).get("approval_hmac")
+        message = approval_message(
+            approval_id=approval.id,
+            spec_sha256=approval.spec_sha256,
+            nonce=approval.nonce,
+            expires_at=to_iso(approval.expires_at),
+            action=approval.action.value,
+        )
+        if not verify_approval(message, envelope):
+            raise ApprovalError("Approval signature is invalid or its signing key is unavailable")
         consumed = self.approvals.consume(
             approval_id,
             spec_sha256=spec_sha256,

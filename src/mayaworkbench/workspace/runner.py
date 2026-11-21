@@ -7,6 +7,15 @@ multi-tenant sandbox: repository code runs with the user's privileges and can
 still read files the user can read. The implementation makes that limitation
 explicit in every result rather than implying stronger isolation.
 
+Execution trust is explicit (see :class:`ExecutionTrust`). Only
+``LOCAL_TRUSTED`` is implemented; read-only and isolated profiles refuse to
+start a command rather than silently executing with host privileges. Every
+result reports enforcement *per limit*, with the mechanism observed at runtime.
+``RLIMIT_NPROC`` is deliberately not used: it is a per-UID ceiling that the
+kernel does not enforce for privileged processes and whose headroom calculation
+can also block legitimate children with ``EAGAIN``. Process-tree limits are
+reported as ``unsupported`` until a verified cgroup/container backend exists.
+
 Safety properties actually enforced here:
 
 * executable allowlist and profile check;
@@ -22,8 +31,9 @@ Safety properties actually enforced here:
 * network namespace isolation when the host supports it. Under
   ``DENY_BY_DEFAULT`` the runner **fails closed**: if isolation cannot be
   established *and verified*, the command is not started;
-* OS resource limits (CPU time, address space, file size, open files and new
-  processes) applied through ``resource.setrlimit`` before ``exec``.
+* OS resource limits (CPU time, address space, file size and open files)
+  applied through ``resource.setrlimit`` before ``exec`` and read back for
+  evidence; process count is reported as unsupported, never claimed.
 """
 
 from __future__ import annotations
@@ -32,14 +42,17 @@ import hashlib
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from mayaworkbench.domain.enums import ExecutionTrust
 from mayaworkbench.domain.models import TaskConstraints
 from mayaworkbench.errors import PolicyError
 
@@ -54,18 +67,71 @@ MAX_ARG_LENGTH = 4096
 MAX_TOTAL_ARG_BYTES = 16_384
 OUTPUT_READ_CHUNK = 65_536
 
-#: A netns probe that succeeds only when the namespace has no default route.
-#: `/proc/net/route` is per-network-namespace, so this verifies the child
-#: namespace rather than assuming that ``unshare`` itself worked.
-_NETWORK_PROBE = r"""
+#: Limit names reported in ``CommandResult.limits``. The set is fixed so a
+#: consumer can distinguish "not checked" from "checked and unsupported".
+LIMIT_NAMES = (
+    "wall_time",
+    "cpu",
+    "memory",
+    "process_count",
+    "file_size",
+    "open_files",
+)
+
+
+@dataclass(frozen=True)
+class LimitEnforcement:
+    """Evidence for one resource limit.
+
+    ``status`` is one of ``enforced``, ``unsupported``, ``not_applied``.
+    ``mechanism`` is only set when enforcement was actually observed.
+    """
+
+    status: str
+    mechanism: str | None = None
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {"status": self.status, "mechanism": self.mechanism, "detail": self.detail}
+
+
+def summarize_limits(limits: dict[str, LimitEnforcement]) -> str:
+    """Derive the aggregate claim from per-limit evidence, never the reverse."""
+    if not limits:
+        return "not_applied"
+    statuses = {item.status for item in limits.values()}
+    if statuses == {"enforced"}:
+        return "all_enforced"
+    if statuses == {"not_applied"}:
+        return "not_applied"
+    if "enforced" in statuses:
+        return "partially_enforced"
+    return "not_enforced"
+
+#: Positive network-isolation probe. ``unshare -n`` can report success while the
+#: child still shares the parent's loopback (observed on container hosts with no
+#: default route). A namespace is only accepted when the child CANNOT reach a
+#: listener owned by the parent, plus the original no-default-route check.
+def _network_probe_script(port: int) -> str:
+    return f"""
+import socket
 import sys
 
+# Positive proof: a child in a different network namespace cannot reach the
+# parent's loopback listener. If it connects, isolation did not happen.
+try:
+    connection = socket.create_connection(("127.0.0.1", {int(port)}), timeout=1)
+    connection.close()
+    sys.exit(5)  # reached the parent: NOT isolated
+except OSError:
+    pass
+
+# Secondary signal: an isolated namespace should also have no default route.
 try:
     with open("/proc/net/route", encoding="ascii", errors="replace") as handle:
         rows = handle.readlines()[1:]
 except OSError:
     sys.exit(4)
-
 for row in rows:
     fields = row.split()
     if len(fields) > 2 and fields[1] == "00000000" and fields[2] == "00000000":
@@ -79,6 +145,12 @@ class CommandPolicy:
     profile: str
     network_policy: str
     dependency_policy: str
+    #: Trust boundary for the command. Defaults to the explicitly-labelled
+    #: local trusted profile so existing callers never gain silent authority.
+    trust_profile: str = ExecutionTrust.LOCAL_TRUSTED.value
+    #: Only an isolated-runtime backend may enable this, and only for the
+    #: trusted OCI client argv it constructs. Project/task argv never uses it.
+    allow_absolute_args: bool = False
     allowed_executables: tuple[str, ...] = DEFAULT_EXECUTABLES
     max_runtime_seconds: int = 1800
     max_output_bytes: int = 200_000
@@ -99,6 +171,7 @@ class CommandPolicy:
     def from_constraints(cls, constraints: TaskConstraints) -> "CommandPolicy":
         return cls(
             profile=constraints.compute_profile,
+            trust_profile=constraints.execution_trust,
             network_policy=constraints.network_access,
             dependency_policy=constraints.dependency_install,
             max_runtime_seconds=constraints.max_runtime_seconds,
@@ -109,6 +182,8 @@ class CommandPolicy:
     def describe(self) -> dict:
         return {
             "profile": self.profile,
+            "trust_profile": self.trust_profile,
+            "allow_absolute_args": self.allow_absolute_args,
             "network_policy": self.network_policy,
             "dependency_policy": self.dependency_policy,
             "allowed_executables": list(self.allowed_executables),
@@ -137,7 +212,10 @@ class CommandResult:
     blocked_reason: str | None = None
     network_isolated: bool = False
     network_enforcement: str = "unavailable"
-    limits_enforcement: str = "unavailable"
+    #: Derived from ``limits`` by ``summarize_limits``. Values: all_enforced,
+    #: partially_enforced, not_enforced, not_applied.
+    limits_enforcement: str = "not_applied"
+    limits: dict[str, LimitEnforcement] = field(default_factory=dict)
     cleanup_required: bool = False
     cleanup_succeeded: bool = True
     env_names: list[str] = field(default_factory=list)
@@ -154,9 +232,17 @@ class CommandResult:
 
 
 class CommandRunner:
-    def __init__(self, workspace: Path, *, policy: CommandPolicy, run_home: Path):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        policy: CommandPolicy,
+        run_home: Path,
+        cgroup_scope: Any | None = None,
+    ):
         self.workspace = Path(workspace).resolve()
         self.policy = policy
+        self.cgroup_scope = cgroup_scope
         self.run_home = Path(run_home).resolve()
         self.run_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._tmp = self.run_home / "tmp"
@@ -165,7 +251,34 @@ class CommandRunner:
         self._network_prefix: list[str] | None = None
 
     # ------------------------------------------------------------------ policy
+    def _validate_trust_profile(self) -> None:
+        """Fail closed when the requested boundary is unavailable.
+
+        An isolated runtime must never be silently downgraded to host-user
+        execution: that would let an untrusted repository read the user's files
+        while the result claimed isolation.
+        """
+        trust = self.policy.trust_profile
+        if trust not in {profile.value for profile in ExecutionTrust}:
+            raise PolicyError(f"unknown execution trust profile: {trust}")
+        if trust == ExecutionTrust.READ_ONLY_ANALYSIS.value:
+            raise PolicyError(
+                "READ_ONLY_ANALYSIS does not permit command execution",
+                hint="Use read-only indexing/search tools for this profile.",
+            )
+        if trust in {
+            ExecutionTrust.ROOTLESS_CONTAINER.value,
+            ExecutionTrust.REMOTE_MICROVM.value,
+            ExecutionTrust.GPU_RUNNER.value,
+        }:
+            raise PolicyError(
+                f"{trust} runtime is not available on this host",
+                hint="Execution is blocked rather than downgraded to host privileges. "
+                "Use LOCAL_TRUSTED only for code you trust.",
+            )
+
     def validate(self, argv: list[str], *, timeout_seconds: int) -> list[str]:
+        self._validate_trust_profile()
         if self.policy.profile not in {"CPU_SMOKE", "USER_APPROVED_LOCAL"}:
             raise PolicyError(
                 f"Execution profile {self.policy.profile} does not allow commands",
@@ -198,7 +311,10 @@ class CommandRunner:
         if len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pip", "ensurepip"}:
             raise PolicyError("dependency installation is not permitted in this task")
         for arg in argv[1:]:
-            if arg.startswith(("/", "\\")) or (len(arg) > 2 and arg[1] == ":"):
+            if (
+                not self.policy.allow_absolute_args
+                and (arg.startswith(("/", "\\")) or (len(arg) > 2 and arg[1] == ":"))
+            ):
                 candidate = Path(arg).resolve(strict=False)
                 if not candidate.is_relative_to(self.workspace):
                     raise PolicyError(
@@ -283,32 +399,53 @@ class CommandRunner:
             (["-Urn"], "network_namespace_user"),
         ]
         failures: list[str] = []
-        for flags, enforcement in attempts:
-            try:
-                probe = subprocess.run(
-                    [unshare, *flags, sys.executable, "-c", _NETWORK_PROBE],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    timeout=10,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                failures.append(f"{' '.join(flags)}: {exc}")
-                continue
-            if probe.returncode != 0:
-                detail = (probe.stderr or b"").decode("utf-8", errors="replace").strip()
-                failures.append(
-                    " ".join(flags)
-                    + ": "
-                    + {
-                        "3": "the isolated namespace still has a default route",
-                        "4": "the isolated namespace could not be inspected",
-                    }.get(str(probe.returncode), detail or f"probe exited {probe.returncode}")
-                )
-                continue
-            self._network_prefix = [unshare, *flags, "--"]
-            self._network_state = (True, enforcement)
-            return self._network_state
+        # The parent owns a loopback listener. A genuinely isolated child cannot
+        # connect to it; that is positive evidence of namespace separation.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(8)
+            port = int(listener.getsockname()[1])
+            for flags, enforcement in attempts:
+                try:
+                    probe = subprocess.run(
+                        [
+                            unshare,
+                            *flags,
+                            sys.executable,
+                            "-c",
+                            _network_probe_script(port),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    failures.append(f"{' '.join(flags)}: {exc}")
+                    continue
+                if probe.returncode != 0:
+                    detail = (probe.stderr or b"").decode("utf-8", errors="replace").strip()
+                    failures.append(
+                        " ".join(flags)
+                        + ": "
+                        + {
+                            "3": "the namespace still has a default route",
+                            "4": "the namespace could not be inspected",
+                            "5": "the child reached the parent loopback: namespace not isolated",
+                        }.get(
+                            str(probe.returncode),
+                            detail or f"probe exited {probe.returncode}",
+                        )
+                    )
+                    continue
+                self._network_prefix = [unshare, *flags, "--"]
+                self._network_state = (True, enforcement)
+                return self._network_state
+        except OSError as exc:  # pragma: no cover - loopback bind failure
+            failures.append(f"could not create verification listener: {exc}")
+        finally:
+            listener.close()
         self._network_state = (
             False,
             "network isolation unavailable: " + "; ".join(failures),
@@ -323,57 +460,100 @@ class CommandRunner:
             and hasattr(resource, "setrlimit")
         )
 
-    def _process_headroom(self) -> int | None:
-        """A per-uid process ceiling that leaves room for the command itself.
+    def _limit_probe(self, *, cpu_seconds: int) -> tuple[Callable[[], None], int, Path]:
+        """Build a child-side rlimit probe with a parent-readable evidence file.
 
-        ``RLIMIT_NPROC`` counts every process of the real uid. Using the total
-        host process count (the previous implementation) made the ceiling far
-        larger than the uid's actual count, so a fork bomb could create the
-        full allowance and much more before hitting it. Counting only this
-        uid's processes makes ``max_processes`` mean what it says.
+        Each ``setrlimit`` is followed by a ``getrlimit`` readback inside the
+        forked child, and the observed result is written to a private file. The
+        parent therefore reports only limits the kernel confirmed, not limits
+        we merely attempted to set. ``RLIMIT_NPROC`` is intentionally absent.
         """
-        if self.policy.max_processes <= 0:
-            return None
-        current = _uid_process_count()
-        if current is None:
-            try:
-                current = len(os.listdir("/proc"))
-            except OSError:
-                return None
-        return max(1, current + self.policy.max_processes)
+        evidence = self.run_home / f"limits-{uuid.uuid4().hex}.jsonl"
+        limits_fd = os.open(evidence, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        specs = [
+            ("cpu", getattr(resource, "RLIMIT_CPU", None), cpu_seconds),
+            (
+                "memory",
+                getattr(resource, "RLIMIT_AS", None),
+                self.policy.memory_limit_mb * 1024 * 1024,
+            ),
+            ("open_files", getattr(resource, "RLIMIT_NOFILE", None), self.policy.max_open_files),
+            (
+                "file_size",
+                getattr(resource, "RLIMIT_FSIZE", None),
+                self.policy.max_file_size_mb * 1024 * 1024,
+            ),
+        ]
 
-    def _preexec(self, *, cpu_seconds: int, nproc: int | None):  # type: ignore[no-untyped-def]
         def apply() -> None:  # pragma: no cover - runs in the forked child
-            try:
-                resource.setrlimit(
-                    resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1)
-                )
-            except (ValueError, OSError):
-                pass
-            memory = self.policy.memory_limit_mb * 1024 * 1024
-            try:
-                resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
-            except (ValueError, OSError):
-                pass
-            try:
-                resource.setrlimit(
-                    resource.RLIMIT_NOFILE,
-                    (self.policy.max_open_files, self.policy.max_open_files),
-                )
-            except (ValueError, OSError):
-                pass
-            file_size = self.policy.max_file_size_mb * 1024 * 1024
-            try:
-                resource.setrlimit(resource.RLIMIT_FSIZE, (file_size, file_size))
-            except (ValueError, OSError):
-                pass
-            if nproc is not None and hasattr(resource, "RLIMIT_NPROC"):
+            for name, resource_id, requested in specs:
+                if resource_id is None:
+                    line = f"{name}\tunsupported\t\tresource is unavailable on this host\n"
+                else:
+                    try:
+                        resource.setrlimit(resource_id, (requested, requested))
+                        observed = resource.getrlimit(resource_id)
+                        if observed == (requested, requested):
+                            line = (
+                                f"{name}\tenforced\trlimit-{name}\t"
+                                f"{observed[0]}\t{observed[1]}\n"
+                            )
+                        else:
+                            line = (
+                                f"{name}\tunsupported\t\treadback {observed!r} "
+                                f"did not match requested {requested}\n"
+                            )
+                    except (ValueError, OSError) as exc:
+                        line = f"{name}\tunsupported\t\t{type(exc).__name__}: {exc}\n"
                 try:
-                    resource.setrlimit(resource.RLIMIT_NPROC, (nproc, nproc))
-                except (ValueError, OSError):
+                    os.write(limits_fd, line.encode("utf-8", errors="replace"))
+                except OSError:
                     pass
 
-        return apply
+        return apply, limits_fd, evidence
+
+    @staticmethod
+    def _read_limit_probe(evidence: Path) -> dict[str, LimitEnforcement]:
+        try:
+            lines = evidence.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return {}
+        observed: dict[str, LimitEnforcement] = {}
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) < 2 or parts[0] not in LIMIT_NAMES:
+                continue
+            observed[parts[0]] = LimitEnforcement(
+                status=parts[1],
+                mechanism=parts[2] or None,
+                detail="\t".join(parts[3:]),
+            )
+        return observed
+
+    @staticmethod
+    def _complete_limits(observed: dict[str, LimitEnforcement]) -> dict[str, LimitEnforcement]:
+        limits: dict[str, LimitEnforcement] = {}
+        for name in LIMIT_NAMES:
+            if name == "wall_time":
+                limits[name] = LimitEnforcement(
+                    "enforced",
+                    "supervisor",
+                    "wall clock polled by the parent; the process group is killed on "
+                    "timeout or cancellation",
+                )
+            elif name == "process_count":
+                limits[name] = LimitEnforcement(
+                    "unsupported",
+                    None,
+                    "RLIMIT_NPROC is a per-UID ceiling that the kernel does not enforce "
+                    "for privileged processes, and its headroom calculation can block "
+                    "legitimate children; no cgroup/container backend is available",
+                )
+            else:
+                limits[name] = observed.get(
+                    name, LimitEnforcement("unsupported", None, "no runtime evidence recorded")
+                )
+        return limits
 
     # ---------------------------------------------------------------- execution
     def run_script(
@@ -466,14 +646,13 @@ class CommandRunner:
                 network=(network_isolated, network_reason),
             )
 
-        preexec = self._preexec(
+        preexec, limits_fd, evidence = self._limit_probe(
             cpu_seconds=max(
                 1,
                 self.policy.cpu_seconds
                 if self.policy.cpu_seconds is not None
                 else int(timeout_seconds) + 5,
-            ),
-            nproc=self._process_headroom(),
+            )
         )
         try:
             process = subprocess.Popen(
@@ -488,9 +667,31 @@ class CommandRunner:
                 preexec_fn=preexec,
             )
         except OSError as exc:
+            os.close(limits_fd)
             raise PolicyError(f"Could not start command: {exc}") from exc
+        finally:
+            # The child keeps its own copy; the parent must close its copy so
+            # the evidence file is complete when we read it after the wait.
+            try:
+                os.close(limits_fd)
+            except OSError:  # pragma: no cover - already closed on failure
+                pass
         if on_start is not None:
             on_start(process.pid, resolved)
+
+        cgroup_active = False
+        if self.cgroup_scope is not None:
+            try:
+                self.cgroup_scope.create(self.policy.max_processes)
+                self.cgroup_scope.attach(process.pid)
+                cgroup_active = True
+            except Exception as exc:  # noqa: BLE001 - fail closed on cgroup setup
+                self._kill_group(process.pid)
+                process.wait(timeout=5)
+                raise PolicyError(
+                    f"Process-tree limit could not be established: {exc}",
+                    hint="Use a rootless container backend or disable the cgroup request.",
+                ) from exc
 
         # ``start_new_session`` makes the leader the process-group id, so the
         # group can still be addressed after the leader has been reaped.
@@ -535,10 +736,20 @@ class CommandRunner:
         # The leader exiting must not leave descendants behind: a command could
         # start a server or daemon and return immediately.
         cleanup_required, cleanup_succeeded = self._cleanup_descendants(pgid)
+        if cgroup_active and self.cgroup_scope is not None:
+            try:
+                self.cgroup_scope.cleanup()
+            except Exception:  # noqa: BLE001 - cleanup must not mask the result
+                cleanup_succeeded = False
 
         for reader in readers:
             reader.join(timeout=5)
         duration_ms = int((time.monotonic() - started) * 1000)
+        limits = self._complete_limits(self._read_limit_probe(evidence))
+        if cgroup_active:
+            limits["process_count"] = LimitEnforcement(
+                "enforced", "cgroup-v2", f"pids.max={self.policy.max_processes}"
+            )
         for stream in (process.stdout, process.stderr):
             try:
                 stream.close()  # type: ignore[union-attr]
@@ -556,7 +767,8 @@ class CommandRunner:
             cancelled=cancelled,
             network_isolated=network_isolated,
             network_enforcement=network_reason,
-            limits_enforcement="rlimit",
+            limits_enforcement=summarize_limits(limits),
+            limits=limits,
             cleanup_required=cleanup_required,
             cleanup_succeeded=cleanup_succeeded,
             env_names=sorted(env),
@@ -573,6 +785,10 @@ class CommandRunner:
         network: tuple[bool, str] | None = None,
     ) -> CommandResult:
         isolated, enforcement = network or (False, "unavailable")
+        blocked_limits = {
+            name: LimitEnforcement("not_applied", None, "command blocked before start")
+            for name in LIMIT_NAMES
+        }
         return CommandResult(
             argv=argv,
             exit_code=None,
@@ -585,7 +801,8 @@ class CommandRunner:
             blocked_reason=reason,
             network_isolated=isolated,
             network_enforcement=enforcement,
-            limits_enforcement="not_applied",
+            limits_enforcement=summarize_limits(blocked_limits),
+            limits=blocked_limits,
             env_names=sorted(env),
             cwd=str(self.workspace),
         )
@@ -697,4 +914,12 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
-__all__ = ["CommandPolicy", "CommandResult", "CommandRunner", "DEFAULT_EXECUTABLES"]
+__all__ = [
+    "CommandPolicy",
+    "CommandResult",
+    "CommandRunner",
+    "DEFAULT_EXECUTABLES",
+    "LimitEnforcement",
+    "LIMIT_NAMES",
+    "summarize_limits",
+]

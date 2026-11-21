@@ -36,6 +36,9 @@ def test_parsing_runs_outside_the_index_write_transaction(
         return real_parse(*args, **kwargs)
 
     monkeypatch.setattr(indexer_module, "parse_python", wrapped)
+    # Force a cache miss: incremental indexing would otherwise replay prepared
+    # rows without re-parsing, which is the point of the cache.
+    monkeypatch.setattr(indexer_module, "INDEXER_VERSION", "test-cache-miss")
     report = services.indexer.index(indexed.snapshot.id)
     assert observed, "the fixture should contain Python files"
     assert not any(observed), "a file was parsed while the rebuild transaction was open"

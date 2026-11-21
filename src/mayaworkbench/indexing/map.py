@@ -15,7 +15,10 @@ from pydantic import BaseModel, Field
 from mayaworkbench.clock import utcnow
 from mayaworkbench.domain.models import Repository, RepositorySnapshot
 from mayaworkbench.errors import NotFoundError
-from mayaworkbench.indexing.languages import LANGUAGES_WITH_AST
+from mayaworkbench.indexing.languages import (
+    LANGUAGES_WITH_AST,
+    LANGUAGES_WITH_HEURISTIC_SYMBOLS,
+)
 from mayaworkbench.storage.db import Database
 from mayaworkbench.storage.stores import (
     FileStore,
@@ -109,6 +112,7 @@ class RepositoryMap(BaseModel):
     parse_coverage: dict[str, int] = Field(default_factory=dict)
     ast_languages: list[str] = Field(default_factory=list)
     lexical_only_languages: list[str] = Field(default_factory=list)
+    heuristic_languages: list[str] = Field(default_factory=list)
     entry_points: list[MapEntryPoint] = Field(default_factory=list)
     package_managers: list[str] = Field(default_factory=list)
     test_files: list[str] = Field(default_factory=list)
@@ -190,17 +194,22 @@ class RepositoryMapService:
         ast_languages = sorted(
             {row.language for row in languages if row.language in LANGUAGES_WITH_AST}
         )
+        heuristic_languages = sorted(
+            {row.language for row in languages if row.language in LANGUAGES_WITH_HEURISTIC_SYMBOLS}
+        )
         lexical_only = sorted(
             {
                 file.language
                 for file in indexed
                 if file.language not in LANGUAGES_WITH_AST
+                and file.language not in LANGUAGES_WITH_HEURISTIC_SYMBOLS
                 and file.language not in ("unknown",)
             }
         )
         limitations = [
-            "Python is parsed with the standard-library AST; other languages are indexed "
-            "lexically only and are labelled as such.",
+            "Python is parsed with the standard-library AST; JavaScript/TypeScript/Go/Rust/"
+            "C/C++/CUDA use bounded heuristic declaration discovery with LOW-confidence symbols and "
+            "HEURISTIC relation provenance; every other language is lexical-only.",
             "Static call graphs are incomplete in a dynamic language; unresolved edges are "
             "reported with LOW confidence rather than omitted.",
         ]
@@ -239,6 +248,7 @@ class RepositoryMapService:
             parse_coverage=coverage,
             ast_languages=ast_languages,
             lexical_only_languages=lexical_only,
+            heuristic_languages=heuristic_languages,
             entry_points=self._entry_points(snapshot, indexed),
             package_managers=self._package_managers(indexed),
             test_files=tests[:200],

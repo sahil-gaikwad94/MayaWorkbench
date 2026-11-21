@@ -15,6 +15,7 @@ from typing import Any, TypeVar
 from mayaworkbench.clock import to_iso, utcnow
 from mayaworkbench.domain.enums import (
     ApprovalStatus,
+    ClaimKind,
     ClaimReviewStatus,
     ClaimType,
     IssueKind,
@@ -42,6 +43,7 @@ from mayaworkbench.domain.models import (
     ResearchDocument,
     ResearchExtraction,
     ResearchMemo,
+    SourceMetadata,
     SourcePassage,
     Symbol,
     SymbolEdge,
@@ -68,6 +70,11 @@ from mayaworkbench.domain.models import (
     WorkflowEvent,
     WorkflowRun,
     WorkerJob,
+    Workspace,
+    ResourceAttachment,
+    EnvironmentSpec,
+    WorkspaceSession,
+    EvidenceItem,
 )
 from mayaworkbench.errors import ConflictError, DatabaseError, NotFoundError
 from mayaworkbench.ids import short_hash
@@ -561,6 +568,22 @@ class FileStore:
             (file_id, start_line, end_line),
         )
         return [(int(row["line_no"]), str(row["text"])) for row in rows]
+
+    def get_index_cache(self, cache_key: str) -> str | None:
+        """Return the artifact id holding prepared rows for this cache key."""
+        row = self.db.fetchone(
+            "SELECT artifact_id FROM index_file_cache WHERE cache_key = ?", (cache_key,)
+        )
+        return None if row is None else str(row["artifact_id"])
+
+    def set_index_cache(self, cache_key: str, artifact_id: str, snapshot_id: str) -> None:
+        self.db.execute(
+            "INSERT INTO index_file_cache (cache_key, artifact_id, snapshot_id, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET "
+            "artifact_id = excluded.artifact_id, snapshot_id = excluded.snapshot_id, "
+            "created_at = excluded.created_at",
+            (cache_key, artifact_id, snapshot_id, to_iso(utcnow())),
+        )
 
     def main_guard_paths(self, snapshot_id: str) -> list[str]:
         rows = self.db.fetchall(
@@ -1172,6 +1195,9 @@ class ResearchClaimStore:
         "target_symbols": ("target_symbols_json", []),
         "missing_details": ("missing_details_json", []),
         "validation_methods": ("validation_methods_json", []),
+        "target_resources": ("target_resources_json", []),
+        "validation_ids": ("validation_ids_json", []),
+        "uncertainty": ("uncertainty_json", []),
     }
 
     def __init__(self, db: Database):
@@ -1202,6 +1228,7 @@ class ResearchClaimStore:
         document_ids: Sequence[str] | None = None,
         include_project_level: bool = False,
         claim_type: ClaimType | None = None,
+        kind: ClaimKind | None = None,
         review_status: ClaimReviewStatus | None = None,
         limit: int = 500,
     ) -> list[ResearchClaim]:
@@ -1229,6 +1256,9 @@ class ResearchClaimStore:
         if claim_type is not None:
             clauses.append("claim_type = ?")
             params.append(claim_type.value)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind.value)
         if review_status is not None:
             clauses.append("review_status = ?")
             params.append(review_status.value)
@@ -1260,6 +1290,7 @@ class ResearchClaimStore:
         project_id: str | None = None,
         document_id: str | None = None,
         claim_type: ClaimType | None = None,
+        kind: ClaimKind | None = None,
         review_status: ClaimReviewStatus | None = None,
     ) -> int:
         clauses: list[str] = []
@@ -1273,6 +1304,9 @@ class ResearchClaimStore:
         if claim_type is not None:
             clauses.append("claim_type = ?")
             params.append(claim_type.value)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind.value)
         if review_status is not None:
             clauses.append("review_status = ?")
             params.append(review_status.value)
@@ -1403,6 +1437,58 @@ class ResearchClaimStore:
             f"SELECT * FROM claim_risk_factors {where} ORDER BY claim_id, category", params
         )
         return [ClaimRiskFactor.model_validate(dict(row)) for row in rows]
+
+
+# ------------------------------------------------------- discovery provenance
+class SourceMetadataStore:
+    """Append-only index over immutable, content-addressed source metadata.
+
+    No update or delete method exists on purpose: a retrieval record describes
+    what was observed at a point in time and must not be rewritten.
+    """
+
+    JSON = {"authors": ("authors_json", [])}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, metadata: SourceMetadata) -> SourceMetadata:
+        _insert(self.db, "source_metadata", _model_to_row(metadata, json_fields=self.JSON))
+        return metadata
+
+    def get(self, metadata_id: str) -> SourceMetadata:
+        row = self.db.fetchone("SELECT * FROM source_metadata WHERE id = ?", (metadata_id,))
+        if row is None:
+            raise NotFoundError(f"Source metadata {metadata_id!r} not found")
+        return _row_to_model(SourceMetadata, row, json_fields=self.JSON)
+
+    def find_by_hash(
+        self, *, project_id: str, document_key: str, metadata_sha256: str
+    ) -> SourceMetadata | None:
+        row = self.db.fetchone(
+            "SELECT * FROM source_metadata WHERE project_id = ? AND document_key = ? "
+            "AND metadata_sha256 = ? ORDER BY created_at LIMIT 1",
+            (project_id, document_key, metadata_sha256),
+        )
+        return _row_to_model(SourceMetadata, row, json_fields=self.JSON) if row else None
+
+    def list_by_key(self, project_id: str, document_key: str) -> list[SourceMetadata]:
+        rows = self.db.fetchall(
+            "SELECT * FROM source_metadata WHERE project_id = ? AND document_key = ? "
+            "ORDER BY created_at DESC, id DESC",
+            (project_id, document_key),
+        )
+        return [_row_to_model(SourceMetadata, row, json_fields=self.JSON) for row in rows]
+
+    def count(self, *, project_id: str | None = None) -> int:
+        if project_id is None:
+            row = self.db.fetchone("SELECT COUNT(*) AS n FROM source_metadata")
+        else:
+            row = self.db.fetchone(
+                "SELECT COUNT(*) AS n FROM source_metadata WHERE project_id = ?",
+                (project_id,),
+            )
+        return int(row["n"])
 
 
 # ------------------------------------------------------------ claim mappings
@@ -3162,7 +3248,113 @@ class VerificationStore:
         ]
 
 
+class EngineeringWorkspaceStore:
+    """Persistence for the durable, multi-resource Engineering Workspace."""
+
+    WORKSPACE_JSON = {"description": ("description_json", {})}
+    RESOURCE_JSON = {"details": ("details_json", {})}
+    ENVIRONMENT_JSON = {"toolchain": ("toolchain_json", {})}
+    SESSION_JSON = {"command": ("command_json", []), "details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create_workspace(self, workspace: Workspace) -> Workspace:
+        _insert(self.db, "workspaces", _model_to_row(workspace, json_fields=self.WORKSPACE_JSON))
+        return workspace
+
+    def get_workspace(self, workspace_id: str) -> Workspace:
+        row = self.db.fetchone("SELECT * FROM workspaces WHERE id = ?", (workspace_id,))
+        if row is None:
+            raise NotFoundError(f"Workspace {workspace_id!r} does not exist")
+        return _row_to_model(Workspace, row, json_fields=self.WORKSPACE_JSON)
+
+    def list_workspaces(self, project_id: str | None = None) -> list[Workspace]:
+        sql = "SELECT * FROM workspaces"
+        params: tuple = ()
+        if project_id:
+            sql += " WHERE project_id = ?"
+            params = (project_id,)
+        sql += " ORDER BY created_at, id"
+        return [
+            _row_to_model(Workspace, row, json_fields=self.WORKSPACE_JSON)
+            for row in self.db.fetchall(sql, params)
+        ]
+
+    def attach_resource(self, resource: ResourceAttachment) -> ResourceAttachment:
+        _insert(self.db, "resource_attachments", _model_to_row(resource, json_fields=self.RESOURCE_JSON))
+        return resource
+
+    def resources(self, workspace_id: str) -> list[ResourceAttachment]:
+        rows = self.db.fetchall(
+            "SELECT * FROM resource_attachments WHERE workspace_id = ? ORDER BY attached_at, id",
+            (workspace_id,),
+        )
+        return [
+            _row_to_model(ResourceAttachment, row, json_fields=self.RESOURCE_JSON)
+            for row in rows
+        ]
+
+    def add_environment(self, spec: EnvironmentSpec) -> EnvironmentSpec:
+        _insert(self.db, "environment_specs", _model_to_row(spec, json_fields=self.ENVIRONMENT_JSON))
+        return spec
+
+    def environments(self, workspace_id: str) -> list[EnvironmentSpec]:
+        rows = self.db.fetchall(
+            "SELECT * FROM environment_specs WHERE workspace_id = ? ORDER BY created_at, id",
+            (workspace_id,),
+        )
+        return [
+            _row_to_model(EnvironmentSpec, row, json_fields=self.ENVIRONMENT_JSON)
+            for row in rows
+        ]
+
+    def create_session(self, session: WorkspaceSession) -> WorkspaceSession:
+        _insert(self.db, "workspace_sessions", _model_to_row(session, json_fields=self.SESSION_JSON))
+        return session
+
+    def close_session(self, session: WorkspaceSession) -> None:
+        self.db.execute(
+            "UPDATE workspace_sessions SET state = ?, details_json = ? WHERE id = ?",
+            (session.state.value, _dump_json(session.details), session.id),
+        )
+
+    def sessions(self, workspace_id: str) -> list[WorkspaceSession]:
+        rows = self.db.fetchall(
+            "SELECT * FROM workspace_sessions WHERE workspace_id = ? ORDER BY started_at, id",
+            (workspace_id,),
+        )
+        return [
+            _row_to_model(WorkspaceSession, row, json_fields=self.SESSION_JSON)
+            for row in rows
+        ]
+
+    def add_evidence(self, item: EvidenceItem) -> EvidenceItem:
+        _insert(self.db, "evidence_items", _model_to_row(item))
+        return item
+
+    def evidence(self, workspace_id: str) -> list[EvidenceItem]:
+        rows = self.db.fetchall(
+            "SELECT * FROM evidence_items WHERE workspace_id = ? ORDER BY created_at, id",
+            (workspace_id,),
+        )
+        return [_row_to_model(EvidenceItem, row) for row in rows]
+
+    def graph(self, workspace_id: str) -> dict:
+        workspace = self.get_workspace(workspace_id)
+        return {
+            "workspace": workspace.model_dump(mode="json"),
+            "resources": [item.model_dump(mode="json") for item in self.resources(workspace_id)],
+            "environments": [
+                item.model_dump(mode="json") for item in self.environments(workspace_id)
+            ],
+            "sessions": [item.model_dump(mode="json") for item in self.sessions(workspace_id)],
+            "evidence": [item.model_dump(mode="json") for item in self.evidence(workspace_id)],
+        }
+
+
 __all__ = [
+    "EngineeringWorkspaceStore",
     "ProjectStore",
     "RepositoryStore",
     "SnapshotStore",

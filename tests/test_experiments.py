@@ -70,29 +70,24 @@ def experiment_env(services: Services, project, repo):
 
 
 def _requires_network_namespace() -> bool:
-    import shutil
+    """Use the runner's positive isolation proof, not a static assumption."""
+    import tempfile
+    from pathlib import Path
 
-    from mayaworkbench.workspace.runner import _NETWORK_PROBE
-    import subprocess
-    import sys
+    from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
 
-    unshare = shutil.which("unshare")
-    if not unshare:
-        return False
-    for flags in (["-n"], ["-Urn"]):
-        try:
-            probe = subprocess.run(
-                [unshare, *flags, sys.executable, "-c", _NETWORK_PROBE],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
-            )
-        except Exception:  # noqa: BLE001 - a probe failure means unavailable
-            continue
-        if probe.returncode == 0:
-            return True
-    return False
+    runner = CommandRunner(
+        Path(tempfile.mkdtemp(prefix="maya-netns-")),
+        policy=CommandPolicy(
+            profile="CPU_SMOKE",
+            network_policy="DENY_BY_DEFAULT",
+            dependency_policy="DENY",
+            max_runtime_seconds=10,
+        ),
+        run_home=Path(tempfile.mkdtemp(prefix="maya-netns-home-")),
+    )
+    isolated, _reason = runner._network_isolation()
+    return isolated
 
 
 NETWORK_NAMESPACE = pytest.mark.skipif(

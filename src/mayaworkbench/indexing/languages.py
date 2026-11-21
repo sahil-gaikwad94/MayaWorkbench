@@ -94,6 +94,11 @@ FILENAME_LANGUAGES: dict[str, str] = {
 }
 
 LANGUAGES_WITH_AST: frozenset[str] = frozenset({"python"})
+#: Languages with heuristic (regular-expression) symbol discovery. These are
+#: explicitly not AST: coverage is PARTIAL and relations are LOW confidence.
+LANGUAGES_WITH_HEURISTIC_SYMBOLS: frozenset[str] = frozenset(
+    {"javascript", "typescript", "jsx", "tsx", "go", "rust", "c", "cpp", "cuda"}
+)
 
 CONFIG_EXTENSIONS = {
     ".toml",
@@ -191,17 +196,18 @@ def module_name_for_path(path: str) -> str:
 def coverage_for(language: str, parse_failed: bool = False) -> str:
     if language in LANGUAGES_WITH_AST and not parse_failed:
         return "FULL"
-    if parse_failed:
+    if parse_failed or language in LANGUAGES_WITH_HEURISTIC_SYMBOLS:
         return "PARTIAL"
     return "LEXICAL_ONLY"
 
 
 __all__ = [
     "detect_language",
+    "LANGUAGES_WITH_AST",
+    "LANGUAGES_WITH_HEURISTIC_SYMBOLS",
     "is_test_path",
     "is_doc_path",
     "is_config_path",
     "module_name_for_path",
-    "LANGUAGES_WITH_AST",
     "coverage_for",
 ]

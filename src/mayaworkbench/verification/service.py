@@ -82,7 +82,14 @@ from mayaworkbench.storage.stores import (
 from mayaworkbench.tasks.approvals import expected_command_sha, expected_write_sha
 from mayaworkbench.tasks.budget import BudgetController
 from mayaworkbench.tasks.review import ReviewService, is_test_path
-from mayaworkbench.verification import execution, integrity, registry, report as report_mod
+from mayaworkbench.verification import (
+    execution,
+    integrity,
+    mutation as mutation_mod,
+    registry,
+    report as report_mod,
+    security_report as security_mod,
+)
 from mayaworkbench.verification.bundle import BundleResult, write_bundle
 from mayaworkbench.verification.reviewer import ReviewResult, run_independent_review
 from mayaworkbench.workspace.runner import CommandResult
@@ -205,6 +212,10 @@ class VerificationService:
         workspace = self.workspaces.get_by_run(run.id)
         criteria = report_mod.criteria_from_contract(contract)
         declared = self._build_plan(contract, extra_checks or [], criteria)
+        # WP9 — critical tests are declared in CheckSpec.details, so old contracts
+        # (where the key is absent) simply produce no mutation probes.
+        critical_tests, parse_errors = mutation_mod.critical_tests_from_specs(declared)
+        critical_baseline = self._critical_test_baseline(critical_tests, run)
         plan_payload = {
             "run_id": run.id,
             "contract_sha256": contract.content_sha256,
@@ -234,6 +245,7 @@ class VerificationService:
                 "extra_checks": len(extra_checks or []),
                 "include_review": include_review,
                 "actor": actor,
+                "critical_test_baseline": critical_baseline,
             },
         )
         self.store.create_attempt(attempt)
@@ -305,6 +317,29 @@ class VerificationService:
                     run, contract, diff, checks, declared, criteria, attempt
                 )
             )
+            # WP9 — additional evidence. These checks are non-required, so their
+            # outcomes cannot hard-fail a run; a SURVIVED declared mutation is
+            # handled explicitly below.
+            mutation_check, mutation_payload = self._mutation_evidence(
+                run=run,
+                contract=contract,
+                attempt=attempt,
+                declared=declared,
+                critical_tests=critical_tests,
+                parse_errors=parse_errors,
+                workspace=workspace,
+                baseline=critical_baseline,
+            )
+            checks.append(mutation_check)
+            security_check, security_payload = self._security_evidence(
+                run=run,
+                contract=contract,
+                diff=diff,
+                attempt=attempt,
+                workspace=workspace,
+                checks=checks,
+            )
+            checks.append(security_check)
             criteria_assessments = report_mod.assess_criteria(criteria, checks)
             reviewer_details = review_result.details if review_result else None
             if review_result is not None:
@@ -323,6 +358,11 @@ class VerificationService:
                 reviewer=reviewer_details,
                 declared_specs=declared,
             )
+            # The only decision-rule change in WP9: a declared critical test that
+            # SURVIVES mutation probing cannot support an unqualified ACCEPTED.
+            decision, limitations = report_mod.apply_mutation_downgrade(
+                decision, limitations, mutation_payload
+            )
             report_id = "vreport_" + new_ulid()
             payload = report_mod.build_report_payload(
                 attempt_id=attempt.id,
@@ -340,6 +380,8 @@ class VerificationService:
                 reviewer=reviewer_details,
                 declared_specs=declared,
                 experiment=experiment_summary,
+                mutation=mutation_payload,
+                security=security_payload,
             )
             report_json = json.dumps(
                 payload, indent=2, sort_keys=True, ensure_ascii=False
@@ -367,6 +409,8 @@ class VerificationService:
                 criteria=criteria_assessments,
                 reviewer=reviewer_details,
                 patch_sha256=diff.patch_sha256,
+                mutation=mutation_payload,
+                security=security_payload,
             )
             report = VerificationReport(
                 id=report_id,
@@ -390,6 +434,9 @@ class VerificationService:
                     "plan_artifact_id": plan_artifact.id,
                     "attempt": attempt.attempt,
                     "declared_checks": [item.key for item in declared],
+                    "mutation_artifact_id": mutation_payload.get("artifact_id"),
+                    "security_artifact_id": security_payload.get("artifact_id"),
+                    "critical_test_baseline": critical_baseline,
                 },
             )
             self.store.create_report(report, links)
@@ -402,6 +449,9 @@ class VerificationService:
                     "checks": len(checks),
                     "blocking": len(blocking),
                     "limitations": len(limitations),
+                    "mutation_artifact_id": mutation_payload.get("artifact_id"),
+                    "security_artifact_id": security_payload.get("artifact_id"),
+                    "critical_test_baseline": critical_baseline,
                 },
             )
             self.runs.update_progress(
@@ -995,6 +1045,10 @@ class VerificationService:
             details: dict[str, Any] = {
                 "network_enforcement": candidate_result.network_enforcement,
                 "limits_enforcement": candidate_result.limits_enforcement,
+                "limits": {
+                    name: item.as_dict()
+                    for name, item in sorted(candidate_result.limits.items())
+                },
                 "output_truncated": candidate_result.output_truncated,
                 "cleanup_succeeded": candidate_result.cleanup_succeeded,
                 "baseline_available": baseline_result is not None,
@@ -1329,6 +1383,256 @@ class VerificationService:
                 ),
             },
         )
+
+    # ---------------------------------------------------------- WP9 evidence
+    def _critical_test_baseline(
+        self, critical_tests: list[mutation_mod.CriticalTest], run: WorkflowRun
+    ) -> dict[str, Any]:
+        """Pin declared critical test files at the base revision."""
+        repository = self.repositories.get(run.repository_id)
+        root = Path(repository.root_path)
+
+        def reader(path: str, tree: str) -> str | None:
+            if tree != "base":
+                return None
+            try:
+                return self._git_show(root, run.base_commit_sha, path)
+            except MayaError:  # an unsafe/missing path is reported as unavailable
+                return None
+
+        return mutation_mod.critical_baseline(critical_tests, reader)
+
+    @staticmethod
+    def _mutation_limits(declared: list[CheckSpec]) -> dict[str, Any]:
+        max_probes = mutation_mod.DEFAULT_MAX_PROBES
+        max_seconds = mutation_mod.DEFAULT_MAX_SECONDS
+        for spec in declared:
+            details = spec.details or {}
+            if "mutation_max_probes" in details:
+                try:
+                    max_probes = int(details["mutation_max_probes"])
+                except (TypeError, ValueError):
+                    pass
+            if "mutation_max_seconds" in details:
+                try:
+                    max_seconds = float(details["mutation_max_seconds"])
+                except (TypeError, ValueError):
+                    pass
+        return {"max_probes": max_probes, "max_seconds": max_seconds}
+
+    def _mutation_evidence(
+        self,
+        *,
+        run: WorkflowRun,
+        contract: TaskContract,
+        attempt: VerificationRun,
+        declared: list[CheckSpec],
+        critical_tests: list[mutation_mod.CriticalTest],
+        parse_errors: list[Any],
+        workspace: Any,
+        baseline: dict[str, Any],
+    ) -> tuple[VerificationCheck, dict[str, Any]]:
+        task = self.tasks.get(run.task_id)
+        workspace_path = (
+            Path(workspace.path)
+            if workspace is not None and workspace.status.value != "REMOVED"
+            else None
+        )
+        repository = self.repositories.get(run.repository_id)
+        root = Path(repository.root_path)
+
+        def reader(path: str, tree: str) -> str | None:
+            if tree == "base":
+                try:
+                    return self._git_show(root, run.base_commit_sha, path)
+                except MayaError:
+                    return None
+            if tree == "candidate" and workspace_path is not None:
+                try:
+                    return (workspace_path / path).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    return None
+            return None
+
+        limits = self._mutation_limits(declared)
+        probe = mutation_mod.MutationProbe(
+            artifacts=self.artifacts,
+            workspace=workspace_path,
+            constraints=contract.constraints,
+            run_home=(
+                self.home
+                / "verification"
+                / run.id
+                / f"attempt-{attempt.attempt}"
+                / "mutation"
+            ),
+            max_probes=limits["max_probes"],
+            max_seconds=limits["max_seconds"],
+        )
+        result = probe.run(
+            critical_tests,
+            source_reader=reader,
+            baseline=baseline,
+            declarations=parse_errors,
+        )
+        payload = result.as_dict()
+        findings: list[VerificationFinding] = []
+        for item in result.survived_declared:
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.WARNING,
+                    code="MUTATION_SURVIVED",
+                    message=(
+                        f"Declared critical test {item.file}::{item.test} survived "
+                        f"a {item.kind} mutation; {item.reason}."
+                    ),
+                    path=item.file or None,
+                    line=item.line or None,
+                    source="deterministic",
+                    details=item.as_dict(),
+                )
+            )
+        for item in result.results:
+            if item.outcome == "SKIPPED":
+                findings.append(
+                    VerificationFinding(
+                        severity=FindingSeverity.INFO,
+                        code="MUTATION_SKIPPED",
+                        message=f"Mutation probe skipped: {item.reason}",
+                        path=item.file or None,
+                        source="deterministic",
+                        details=item.as_dict(),
+                    )
+                )
+        for bypass in result.bypass_details:
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.INFO,
+                    code="CRITICAL_TEST_BYPASS",
+                    message=(
+                        f"Declared critical test file {bypass['path']} changed between "
+                        f"the base revision and the candidate: {bypass.get('reason', '')}"
+                    ),
+                    path=bypass.get("path"),
+                    source="deterministic",
+                    details=bypass,
+                )
+            )
+        counts = result.counts()
+        if not critical_tests:
+            outcome = CheckOutcome.NOT_APPLICABLE
+            summary = "no critical tests were declared for mutation probing"
+        elif result.survived_declared:
+            outcome = CheckOutcome.PARTIAL
+            summary = (
+                f"{counts['SURVIVED']} declared critical test(s) survived mutation "
+                f"probing; {counts['KILLED']} killed, {counts['SKIPPED']} skipped"
+            )
+        elif counts["KILLED"]:
+            outcome = CheckOutcome.PASSED
+            summary = (
+                f"all executed mutation probes were killed "
+                f"({counts['KILLED']} killed, {counts['SKIPPED']} skipped)"
+            )
+        else:
+            outcome = CheckOutcome.SKIPPED
+            summary = "no mutation probe could be executed"
+        check = self._record(
+            run=run,
+            task=task,
+            attempt=attempt,
+            key="mutation.probe",
+            gate=VerificationGate.REVIEW,
+            kind=CheckKind.DETERMINISTIC,
+            title="Declared critical tests survive mutation probing",
+            method=VerificationMethod.DETERMINISTIC_TEST,
+            outcome=outcome,
+            required=False,
+            summary=summary,
+            findings=findings,
+            artifact_id=result.artifact_id,
+            details={
+                "counts": counts,
+                "declared": payload["declared"],
+                "critical_test_baseline": baseline,
+                "bypass_details": result.bypass_details,
+                "bypass_detected": result.bypass_detected,
+                "parse_errors": payload.get("parse_errors", []),
+                "max_probes": limits["max_probes"],
+                "max_seconds": limits["max_seconds"],
+                "note": payload["note"],
+            },
+        )
+        return check, payload
+
+    def _security_evidence(
+        self,
+        *,
+        run: WorkflowRun,
+        contract: TaskContract,
+        diff: Any,
+        attempt: VerificationRun,
+        workspace: Any,
+        checks: list[VerificationCheck],
+    ) -> tuple[VerificationCheck, dict[str, Any]]:
+        task = self.tasks.get(run.task_id)
+        review = self.reviews.get_by_run(run.id)
+        workspace_path = (
+            Path(workspace.path)
+            if workspace is not None and workspace.status.value != "REMOVED"
+            else None
+        )
+        payload = security_mod.build_security_report(
+            diff=diff,
+            contract=contract,
+            review=review,
+            artifacts=self.artifacts,
+            workspace=workspace_path,
+            checks=checks,
+            run=run,
+        )
+        findings: list[VerificationFinding] = []
+        severe = False
+        for item in payload["findings"]:
+            if item["severity"] in {"WARNING", "ERROR"}:
+                severe = True
+            findings.append(
+                VerificationFinding(
+                    # Original severity lives in the security report payload;
+                    # INFO here keeps this advisory check decision-neutral.
+                    severity=FindingSeverity.INFO,
+                    code=self._safe_deterministic_code("SECURITY_" + item["code"])[:80],
+                    message=f"[{item['category']}:{item['severity']}] {item['message']}",
+                    path=item.get("path"),
+                    source="deterministic",
+                    details={"evidence": item.get("evidence", {})},
+                )
+            )
+        check = self._record(
+            run=run,
+            task=task,
+            attempt=attempt,
+            key="security.report",
+            gate=VerificationGate.REVIEW,
+            kind=CheckKind.DETERMINISTIC,
+            title="Deterministic security report recorded",
+            method=VerificationMethod.STATIC_ANALYSIS,
+            outcome=CheckOutcome.PARTIAL if severe else CheckOutcome.PASSED,
+            required=False,
+            summary=(
+                f"{len(payload['findings'])} deterministic security finding(s) "
+                "across 5 categories; no model was used"
+            ),
+            findings=findings,
+            artifact_id=payload.get("artifact_id"),
+            details={
+                "categories": payload["categories"],
+                "artifact_id": payload.get("artifact_id"),
+                "model_required": False,
+                "note": payload["note"],
+            },
+        )
+        return check, payload
 
     # -------------------------------------------------------------- reviewer
     def _review(
@@ -1968,6 +2272,7 @@ class VerificationService:
             "network_isolated": result.network_isolated,
             "network_enforcement": result.network_enforcement,
             "limits_enforcement": result.limits_enforcement,
+            "limits": {name: item.as_dict() for name, item in sorted(result.limits.items())},
             "cleanup_required": result.cleanup_required,
             "cleanup_succeeded": result.cleanup_succeeded,
             "summary": summary,

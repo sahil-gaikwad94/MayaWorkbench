@@ -58,7 +58,11 @@ from mayaworkbench.mapping.models import (
     MappingAdjudicationPayload,
 )
 from mayaworkbench.mapping.prompts import build_mapping_messages
-from mayaworkbench.mapping.rules import MappingDecision, decide_mapping
+from mayaworkbench.mapping.rules import (
+    MappingDecision,
+    apply_absence_policy,
+    decide_mapping,
+)
 from mayaworkbench.mapping.signals import derive_identifiers, matched_signals
 from mayaworkbench.models.base import ModelRequest
 from mayaworkbench.models.gateway import ModelGateway
@@ -292,6 +296,11 @@ class ClaimMappingService:
                 for analysis in selected
             ]
 
+        decision = apply_absence_policy(
+            decision,
+            coverage_limited=collection.coverage_limited,
+            truncated=collection.truncated,
+        )
         mapping, evidence_rows = self._persist_mapping(
             claim=claim,
             snapshot=snapshot,
@@ -552,6 +561,12 @@ class ClaimMappingService:
                 else []
             ),
         )
+        manual_notes = ["manual mapping recorded with reviewer attribution"]
+        if status is ClaimMappingStatus.NOT_CHECKED:
+            manual_notes.append(
+                "NOT_CHECKED records that no mapping check was performed; it is neither "
+                "ABSENT nor UNCERTAIN and must not be read as an absence verdict."
+            )
         mapping, evidence_rows = self._persist_mapping(
             claim=claim,
             snapshot=snapshot,
@@ -564,7 +579,7 @@ class ClaimMappingService:
                 "reviewer": actor,
                 "rule_status": None,
             },
-            notes=["manual mapping recorded with reviewer attribution"],
+            notes=manual_notes,
             rejected_model=False,
         )
         return MappingOutcome(
@@ -573,7 +588,7 @@ class ClaimMappingService:
             decision=decision,
             model_used=False,
             model_rejected=False,
-            notes=["manual mapping recorded with reviewer attribution"],
+            notes=manual_notes,
         )
 
     # ------------------------------------------------------------- persistence

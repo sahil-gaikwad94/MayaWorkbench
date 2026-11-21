@@ -100,6 +100,17 @@ class PolicyError(MayaError):
     exit_code = 3
 
 
+class RuntimeUnavailable(MayaError):
+    """The requested isolated execution runtime cannot be established.
+
+    This is fail-closed: a caller must not silently downgrade to host-privileged
+    execution when an isolated profile was requested.
+    """
+
+    code = "RUNTIME_UNAVAILABLE"
+    exit_code = 3
+
+
 class ModelError(MayaError):
     """A model provider call failed."""
 
@@ -199,6 +210,7 @@ __all__ = [
     "SnapshotError",
     "IndexingError",
     "PolicyError",
+    "RuntimeUnavailable",
     "ModelError",
     "CitationError",
     "ExtractionError",

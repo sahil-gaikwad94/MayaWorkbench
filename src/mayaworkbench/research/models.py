@@ -23,7 +23,7 @@ from mayaworkbench.domain.enums import (
     RiskCategory,
     RiskSeverity,
 )
-from mayaworkbench.domain.models import MappingEvidence, ResearchClaim
+from mayaworkbench.domain.models import CLAIM_GRAPH_VERSION, MappingEvidence, ResearchClaim
 
 
 class Contract(BaseModel):
@@ -133,8 +133,10 @@ class ClaimDagValidation(Contract):
     protocol_version: str
     project_id: str
     document_id: str | None = None
+    graph_version: str = CLAIM_GRAPH_VERSION
     claim_count: int = 0
     edge_count: int = 0
+    claim_kind_counts: dict[str, int] = Field(default_factory=dict)
     issues: list[DagIssue] = Field(default_factory=list)
     cycles: list[list[str]] = Field(default_factory=list)
     topological_order: list[str] = Field(default_factory=list)

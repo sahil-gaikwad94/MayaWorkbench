@@ -9,11 +9,14 @@ named in the output (§8.7).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from typing import Literal
 
 from mayaworkbench.config import RetrievalSettings
 from mayaworkbench.domain.models import IndexedFile
 from mayaworkbench.retrieval.models import (
+    CandidateDecision,
     ContextItem,
     ContextPack,
     ExcludedItem,
@@ -57,6 +60,9 @@ class ContextPacker:
         symbols: list[SymbolHit],
         budget: int,
         max_items: int | None = None,
+        snapshot_id: str | None = None,
+        query: str | None = None,
+        selection: Literal["greedy", "submodular"] = "greedy",
     ) -> ContextPack:
         budget = max(200, budget)
         context_lines = self.settings.span_context_lines
@@ -112,14 +118,39 @@ class ContextPacker:
                 )
 
         merged = _merge_candidates(candidates, gap=context_lines)
-        merged.sort(key=lambda candidate: (-candidate.score, candidate.file.path, candidate.start_line))
+        if selection == "submodular":
+            merged = _submodular_order(merged, query or "")
+        else:
+            merged.sort(
+                key=lambda candidate: (-candidate.score, candidate.file.path, candidate.start_line)
+            )
 
         items: list[ContextItem] = []
         excluded: list[ExcludedItem] = []
+        manifest: list[CandidateDecision] = []
+        ambiguities: list[str] = []
         used_tokens = 0
         truncated = False
         seen_files: list[str] = []
         seen_spans: dict[str, list[tuple[int, int]]] = {}
+
+        def record(
+            candidate: _Candidate,
+            decision: str,
+            *,
+            exclusion_reason: str | None = None,
+        ) -> None:
+            manifest.append(
+                CandidateDecision(
+                    path=candidate.file.path,
+                    start_line=candidate.start_line,
+                    end_line=candidate.end_line,
+                    score=round(candidate.score, 6),
+                    reason=candidate.reason,
+                    decision=decision,  # type: ignore[arg-type]
+                    exclusion_reason=exclusion_reason,
+                )
+            )
 
         for candidate in merged:
             if len(items) >= max_items:
@@ -131,6 +162,7 @@ class ContextPacker:
                         reason=f"max_context_items={max_items} reached",
                     )
                 )
+                record(candidate, "excluded", exclusion_reason=f"max_context_items={max_items} reached")
                 truncated = True
                 continue
 
@@ -142,6 +174,11 @@ class ContextPacker:
                         end_line=candidate.end_line,
                         reason="overlaps an already selected span",
                     )
+                )
+                record(candidate, "excluded", exclusion_reason="overlaps an already selected span")
+                ambiguities.append(
+                    f"{candidate.file.path}:{candidate.start_line}-{candidate.end_line} "
+                    "overlaps an already selected span; a duplicate view was excluded"
                 )
                 continue
 
@@ -156,6 +193,7 @@ class ContextPacker:
                         reason="no indexed text for this span",
                     )
                 )
+                record(candidate, "excluded", exclusion_reason="no indexed text for this span")
                 continue
             text = _render_span(span)
             tokens = estimate_tokens(text, self.settings.chars_per_token)
@@ -170,6 +208,16 @@ class ContextPacker:
                             end_line=candidate.end_line,
                             reason="does not fit the remaining token budget",
                         )
+                    )
+                    record(
+                        candidate,
+                        "excluded",
+                        exclusion_reason="does not fit the remaining token budget",
+                    )
+                    ambiguities.append(
+                        f"{candidate.file.path}:{candidate.start_line}-{candidate.end_line} "
+                        f"(score {candidate.score:.3f}) was excluded by the token budget; "
+                        "ranking evidence is incomplete"
                     )
                     truncated = True
                     continue
@@ -186,6 +234,7 @@ class ContextPacker:
                 truncated=item_truncated,
             )
             items.append(item)
+            record(candidate, "included")
             used_tokens += tokens
             if item_truncated:
                 truncated = True
@@ -194,14 +243,57 @@ class ContextPacker:
             seen_spans.setdefault(candidate.file.id, []).append((item.start_line, item.end_line))
 
         return ContextPack(
+            snapshot_id=snapshot_id,
+            query=query,
             items=items,
             token_estimate=used_tokens,
             token_budget=budget,
             estimator=f"chars/{self.settings.chars_per_token} plus 8 tokens per span",
             files_covered=seen_files,
             excluded=excluded,
+            candidates_manifest=manifest,
+            ambiguities=ambiguities,
             truncated=truncated,
         )
+
+
+def _submodular_order(candidates: list[_Candidate], query: str) -> list[_Candidate]:
+    """Greedy maximisation of a monotone submodular coverage objective.
+
+    Value = relevance + marginal query-term coverage - redundancy with already
+    selected spans. This is a deterministic approximation (not an optimality
+    proof); the plain greedy baseline stays the default (§6.2, §6.3).
+    """
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z_][\w-]{2,}", query)}
+    remaining = list(candidates)
+    ordered: list[_Candidate] = []
+    covered: set[str] = set()
+    selected_files: set[str] = set()
+    while remaining:
+        best_index = 0
+        best_value = float("-inf")
+        for index, candidate in enumerate(remaining):
+            reason_tokens = {
+                token.lower() for token in re.findall(r"[A-Za-z_][\w-]{2,}", candidate.reason)
+            }
+            new_terms = len((reason_tokens & tokens) - covered) / max(1, len(tokens))
+            redundancy = 0.4 if candidate.file.path in selected_files else 0.0
+            value = candidate.score + 0.5 * new_terms - redundancy
+            tie = (candidate.file.path, candidate.start_line, candidate.end_line)
+            if value > best_value or (value == best_value and tie < (
+                remaining[best_index].file.path,
+                remaining[best_index].start_line,
+                remaining[best_index].end_line,
+            )):
+                best_value = value
+                best_index = index
+        chosen = remaining.pop(best_index)
+        ordered.append(chosen)
+        covered |= {
+            token.lower() for token in re.findall(r"[A-Za-z_][\w-]{2,}", chosen.reason)
+        } & tokens
+        selected_files.add(chosen.file.path)
+    return ordered
 
 
 def _cluster_lines(lines: list[int], *, gap: int) -> list[list[int]]:

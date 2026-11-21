@@ -129,6 +129,9 @@ class AskService:
         *,
         token_budget: int | None = None,
         use_model: bool = True,
+        selection: str = "greedy",
+        use_semantic: bool = False,
+        use_ppr: bool = False,
     ) -> AskResult:
         question = question.strip()
         if not question:
@@ -138,7 +141,14 @@ class AskService:
         project = self.projects.get(repository.project_id)
         budget = token_budget or self.settings.retrieval.default_token_budget
 
-        bundle = self.retrieval.retrieve(snapshot.id, question, budget=budget)
+        bundle = self.retrieval.retrieve(
+            snapshot.id,
+            question,
+            budget=budget,
+            selection=selection,  # type: ignore[arg-type]
+            use_semantic=use_semantic,
+            use_ppr=use_ppr,
+        )
         limitations = self._limitations(snapshot)
         digest = self._digest(snapshot, repository, bundle, limitations)
         status = self.gateway.status()

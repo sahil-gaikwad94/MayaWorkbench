@@ -33,13 +33,15 @@ from mayaworkbench.domain.enums import (
     WorkspaceStatus,
 )
 from mayaworkbench.domain.models import WorkerJob, WorkflowEvent
-from mayaworkbench.errors import MayaError
+from mayaworkbench.errors import MayaError, PolicyError
 from mayaworkbench.ids import new_ulid
 from mayaworkbench.observability.logging import get_logger
 from mayaworkbench.tasks.agent import AgentOutcome, ControlledAgent
 from mayaworkbench.tasks.approvals import expected_command_sha, expected_write_sha
 from mayaworkbench.tasks.inloop import DeclaredCheckRunner
 from mayaworkbench.tasks.orientation import build_orientation
+from mayaworkbench.tasks.orchestrator import RoleOrchestrator, role_plan_enabled
+from mayaworkbench.tasks.roles import build_role_plan
 from mayaworkbench.workspace.policy import PathPolicy
 from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
 from mayaworkbench.workspace.tools import ToolGateway
@@ -200,11 +202,36 @@ class Worker:
                 heartbeat()
             return cancel_state[0]
 
-        runner = CommandRunner(
-            Path(workspace.path),
-            policy=CommandPolicy.from_constraints(contract.constraints),
-            run_home=Path(workspace.path).parent / "home",
+        from dataclasses import replace
+
+        from mayaworkbench.domain.enums import ExecutionTrust
+        from mayaworkbench.workspace.backends import (
+            BackendCommandRunner,
+            RootlessContainerBackend,
         )
+
+        contract_policy = CommandPolicy.from_constraints(contract.constraints)
+        trust = contract.constraints.execution_trust
+        if trust == ExecutionTrust.ROOTLESS_CONTAINER.value:
+            # The OCI client itself is a trusted local process; the isolation
+            # boundary is the container, not this host policy.
+            runner = BackendCommandRunner(
+                RootlessContainerBackend(
+                    Path(workspace.path),
+                    Path(workspace.path).parent / "home",
+                    replace(contract_policy, trust_profile=ExecutionTrust.LOCAL_TRUSTED.value),
+                )
+            )
+        elif trust == ExecutionTrust.LOCAL_TRUSTED.value:
+            runner = CommandRunner(
+                Path(workspace.path),
+                policy=contract_policy,
+                run_home=Path(workspace.path).parent / "home",
+            )
+        else:
+            raise PolicyError(  # fail closed; never downgrade an isolated request
+                f"execution trust profile {trust!r} is not available to the worker"
+            )
         # In-loop checks are declared in the contract, not proposed by the model.
         # They may run only when the same COMMAND_EXECUTION approval that governs
         # the gateway is present; otherwise the gate records BLOCKED, honestly.
@@ -240,6 +267,15 @@ class Worker:
             hits = self.services.search.search_symbols(run.snapshot_id, query, limit=limit)
             return [hit.model_dump(mode="json") for hit in hits]
 
+        from mayaworkbench.workspace.sessions import SessionManager
+        from mayaworkbench.workspace.tools import redact as redact_tool_output
+
+        sessions = SessionManager(
+            Path(workspace.path),
+            runner,
+            redactor=redact_tool_output,
+        )
+
         gateway = ToolGateway(
             run=run,
             task=task,
@@ -256,6 +292,22 @@ class Worker:
             expected_command_spec=expected_command_sha(run=run, contract=contract),
             cancel_requested=cancel_requested,
             check_runner=checks,
+            session_manager=sessions,
+            allowed_api_hosts=tuple(
+                host.strip()
+                for host in os.environ.get("MAYA_API_HOSTS", "").split(",")
+                if host.strip()
+            ),
+            allowed_db_dirs=tuple(
+                path.strip()
+                for path in os.environ.get("MAYA_DB_DIRS", "").split(",")
+                if path.strip()
+            ),
+            allowed_log_dirs=tuple(
+                path.strip()
+                for path in os.environ.get("MAYA_LOG_DIRS", "").split(",")
+                if path.strip()
+            ),
             symbol_lookup=symbol_lookup,
         )
         agent = ControlledAgent(
@@ -274,7 +326,36 @@ class Worker:
             events=self.services.events,
         )
         heartbeat()
-        outcome = agent.run_loop()
+        try:
+            if role_plan_enabled(run):
+                # WP8: the single deterministic orchestrator walks the typed role
+                # DAG. The old single-role path below is unchanged for runs
+                # without the use_role_plan detail flag.
+                role_plan = build_role_plan(task, contract, orientation)
+                orchestrator = RoleOrchestrator(
+                    runs=self.services.runs,
+                    artifacts=self.services.artifacts,
+                    events=self.services.events,
+                    workflow=self.services.workflow,
+                    plan=role_plan,
+                    task=task,
+                    contract=contract,
+                    run=self.services.runs.get(run.id),
+                    orientation=orientation,
+                    implementation_plan=plan,
+                    tool_gateway=gateway,
+                    implementer=lambda: agent.run_loop(),
+                    patch_provider=lambda: self.services.task_service.capture_diff(run.id),
+                )
+                outcome = orchestrator.run()
+            else:
+                outcome = agent.run_loop()
+        finally:
+            # No session may outlive the run: stop every process group this
+            # worker created before capturing the patch or settling state.
+            sessions.stop_all(reason="run finished")
+            if hasattr(runner, "stop"):
+                runner.stop(reason="run finished")
         self._settle(job, outcome)
 
     def _settle(self, job: WorkerJob, outcome: AgentOutcome) -> None:

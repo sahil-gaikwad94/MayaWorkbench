@@ -48,6 +48,7 @@ class BundleVerification:
     warnings: list[str] = field(default_factory=list)
     manifest: dict[str, Any] = field(default_factory=dict)
     report: dict[str, Any] = field(default_factory=dict)
+    attestation: dict[str, Any] = field(default_factory=dict)
 
 
 def write_bundle(destination: str | Path, payloads: dict[str, bytes]) -> BundleResult:
@@ -130,7 +131,10 @@ def verify_bundle(directory: str | Path) -> BundleVerification:
     on_disk = {
         str(path.relative_to(target))
         for path in target.rglob("*")
-        if path.is_file() and path.name != MANIFEST_NAME
+        if path.is_file() and path.name not in {
+            MANIFEST_NAME,
+            "attestation.json",
+        }
     }
     for name in sorted(on_disk - set(listed)):
         errors.append(f"file is present but not listed in the manifest: {name}")
@@ -199,12 +203,18 @@ def verify_bundle(directory: str | Path) -> BundleVerification:
                 )
     else:
         errors.append("report.json is missing; the bundle has no decision")
+    from mayaworkbench.verification.attestation import verify_attestation
+
+    attestation = verify_attestation(target)
+    if not attestation.get("ok", True):
+        warnings.append(f"attestation problem: {attestation.get('error')}")
     return BundleVerification(
         ok=not errors,
         errors=errors,
         warnings=warnings,
         manifest=manifest,
         report=report,
+        attestation=attestation,
     )
 
 

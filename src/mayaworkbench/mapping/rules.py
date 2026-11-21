@@ -320,6 +320,42 @@ def decide_mapping(
     )
 
 
+def apply_absence_policy(
+    decision: MappingDecision,
+    *,
+    coverage_limited: bool,
+    truncated: bool,
+) -> MappingDecision:
+    """Downgrade every ``ABSENT`` verdict when the index coverage is incomplete.
+
+    ``ABSENT`` is only permitted after a complete search (audit §7.1). A model
+    may propose it, or deterministic rules may reach it before a late coverage
+    signal is noticed; in either case a partial index turns the result into
+    ``UNCERTAIN`` with the reason recorded rather than silently kept.
+    """
+    if decision.status is not ClaimMappingStatus.ABSENT:
+        return decision
+    if not (coverage_limited or truncated):
+        return decision
+    cause = (
+        "parser coverage in candidate files is incomplete"
+        if coverage_limited
+        else "candidate discovery was truncated"
+    )
+    gaps = list(decision.gaps)
+    gaps.append(f"ABSENT was downgraded to UNCERTAIN because {cause}.")
+    return MappingDecision(
+        status=ClaimMappingStatus.UNCERTAIN,
+        reason=(
+            f"No declared signal was found, but {cause}, so absence is not established."
+        ),
+        rationale=decision.rationale,
+        gaps=gaps,
+        counter_evidence=list(decision.counter_evidence),
+        validation_method=decision.validation_method,
+    )
+
+
 def _rationale(
     analyses: list[SpanAnalysis],
     declared: list[str],
@@ -358,4 +394,9 @@ def _rationale(
     return " ".join(parts)
 
 
-__all__ = ["MappingDecision", "decide_mapping", "DEFAULT_VALIDATION_METHOD"]
+__all__ = [
+    "MappingDecision",
+    "decide_mapping",
+    "apply_absence_policy",
+    "DEFAULT_VALIDATION_METHOD",
+]

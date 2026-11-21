@@ -242,6 +242,42 @@ def decide(
     return TaskDecision.ACCEPTED, blocking, _dedupe(limitations)
 
 
+def apply_mutation_downgrade(
+    decision: TaskDecision,
+    limitations: list[str],
+    mutation: dict[str, Any] | None,
+) -> tuple[TaskDecision, list[str]]:
+    """Apply the single WP9 decision-rule exception.
+
+    A SURVIVED mutation on a *declared* critical test is a blind spot. It can
+    only downgrade: an accepted result becomes COMPLETED_WITH_LIMITATIONS, and
+    an already failing result becomes REJECTED. Nothing else changes.
+    """
+    if not mutation or not mutation.get("counts", {}).get("SURVIVED"):
+        return decision, limitations
+    survivors = [
+        item
+        for item in mutation.get("results", [])
+        if item.get("outcome") == "SURVIVED" and item.get("declared")
+    ]
+    if not survivors:
+        return decision, limitations
+    updated = decision
+    if decision == TaskDecision.ACCEPTED:
+        updated = TaskDecision.COMPLETED_WITH_LIMITATIONS
+    elif decision == TaskDecision.FAILED:
+        updated = TaskDecision.REJECTED
+    locations = ", ".join(
+        f"{item.get('file')}::{item.get('test')}" for item in survivors[:3]
+    )
+    warning = (
+        f"mutation: {len(survivors)} declared critical test(s) SURVIVED mutation "
+        f"probing ({locations or 'locations unavailable'}); this is a blind spot, "
+        "never a pass"
+    )
+    return updated, list(limitations) + [warning]
+
+
 def _dedupe(values: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -261,6 +297,8 @@ def build_evidence_links(
     criteria: list[CriterionAssessment],
     reviewer: dict[str, Any] | None,
     patch_sha256: str,
+    mutation: dict[str, Any] | None = None,
+    security: dict[str, Any] | None = None,
 ) -> list[EvidenceLink]:
     links: list[EvidenceLink] = []
     for check in checks:
@@ -360,6 +398,58 @@ def build_evidence_links(
             sha256=patch_sha256,
         )
     )
+    # WP9 — mutation probes and the deterministic security report are evidence
+    # too. Their artifacts and individual findings enter the same graph, so a
+    # reader can follow a SURVIVED probe or a security finding to raw output.
+    for payload, check_key in ((mutation, "mutation.probe"), (security, "security.report")):
+        if not payload or not payload.get("artifact_id"):
+            continue
+        links.append(
+            EvidenceLink(
+                id="evl_" + new_ulid(),
+                verification_id=verification_id,
+                run_id=run_id,
+                report_id=report_id,
+                from_kind="CHECK",
+                from_ref=check_key,
+                relation=EvidenceRelation.RECORDED_IN,
+                to_kind="ARTIFACT",
+                to_ref=payload["artifact_id"],
+                note=check_key,
+            )
+        )
+    for item in (mutation or {}).get("results", []):
+        if not item.get("artifact_id"):
+            continue
+        links.append(
+            EvidenceLink(
+                id="evl_" + new_ulid(),
+                verification_id=verification_id,
+                run_id=run_id,
+                report_id=report_id,
+                from_kind="MUTATION",
+                from_ref=str(item.get("mutation_id", "mutation"))[:1000],
+                relation=EvidenceRelation.RECORDED_IN,
+                to_kind="ARTIFACT",
+                to_ref=item["artifact_id"],
+                note=f"{item.get('outcome')}:{item.get('kind')}",
+            )
+        )
+    for edge in (security or {}).get("evidence_links", []):
+        links.append(
+            EvidenceLink(
+                id="evl_" + new_ulid(),
+                verification_id=verification_id,
+                run_id=run_id,
+                report_id=report_id,
+                from_kind=str(edge.get("from_kind", "SECURITY_FINDING"))[:40],
+                from_ref=str(edge.get("from_ref", "security"))[:1000],
+                relation=EvidenceRelation.RECORDED_IN,
+                to_kind="ARTIFACT",
+                to_ref=str(edge.get("to_ref", ""))[:1000],
+                note=str(edge.get("note", ""))[:1000],
+            )
+        )
     return links
 
 
@@ -380,6 +470,8 @@ def build_report_payload(
     reviewer: dict[str, Any] | None,
     declared_specs: list[CheckSpec],
     experiment: dict[str, Any] | None = None,
+    mutation: dict[str, Any] | None = None,
+    security: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "1.0",
@@ -401,6 +493,8 @@ def build_report_payload(
         "declared_checks": [item.model_dump(mode="json") for item in declared_specs],
         "reviewer": reviewer,
         "experiment": experiment,
+        "mutation": mutation,
+        "security": security,
         "evidence_classification": evidence_classification(
             checks, reviewer, diff, experiment
         ),
@@ -618,6 +712,53 @@ def render_markdown(
                 ]
             )
 
+    mutation = payload.get("mutation")
+    if mutation:
+        counts = mutation.get("counts", {})
+        lines.extend(
+            [
+                "",
+                "## Mutation probes (declared critical tests)",
+                "",
+                f"- Declared: {len(mutation.get('declared', []))}; "
+                f"KILLED {counts.get('KILLED', 0)}, SURVIVED {counts.get('SURVIVED', 0)}, "
+                f"SKIPPED {counts.get('SKIPPED', 0)}.",
+                f"- Critical-test baseline: {len(mutation.get('baseline', {}).get('files', {}))} file(s) pinned at the base revision.",
+                f"- Bypass flag: {'YES' if mutation.get('bypass_detected') else 'no'}.",
+            ]
+        )
+        for item in mutation.get("results", []):
+            lines.append(
+                f"- `{item.get('outcome')}` `{item.get('kind')}` "
+                f"{item.get('file', '')}:{item.get('line', 0)} "
+                f"{item.get('test', '')} — {item.get('reason', '')} "
+                f"({item.get('artifact_id') or 'no artifact'})"
+            )
+        lines.append(
+            "- Property-level probes only: a kill shows one assertion is load-bearing "
+            "for one small fault; it is not semantic proof."
+        )
+    security = payload.get("security")
+    if security:
+        lines.extend(
+            [
+                "",
+                "## Security report (deterministic)",
+                "",
+                f"- Findings: {len(security.get('findings', []))}; artifact `{security.get('artifact_id')}`.",
+            ]
+        )
+        for item in security.get("findings", []):
+            location = f"{item.get('path')}" if item.get("path") else ""
+            lines.append(
+                f"- **{item.get('severity')}** `{item.get('code')}` "
+                f"{location} — {item.get('message', '')}"
+            )
+        lines.append(
+            "- No model is used. These are shallow deterministic checks, not a "
+            "penetration test or a security guarantee."
+        )
+
     lines.extend(["", "## Limitations and assumptions", ""])
     if payload["limitations"]:
         lines.extend(f"- {item}" for item in payload["limitations"])
@@ -666,6 +807,7 @@ __all__ = [
     "build_evidence_links",
     "build_report_payload",
     "render_markdown",
+    "apply_mutation_downgrade",
     "evidence_classification",
     "canonical_sha256",
     "FUNCTIONAL_KINDS",

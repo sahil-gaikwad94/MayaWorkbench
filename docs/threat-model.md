@@ -244,7 +244,16 @@ Residual risks:
 
 - **Local execution is not a container boundary.** A command approved by the
   user runs as the user, with the host filesystem visible outside the workspace.
-  Rlimits and path validation reduce accidents, not a determined escape.
+  Rlimits and path validation reduce accidents, not a determined escape. The
+  runner's trust profile is explicit (`LOCAL_TRUSTED`), and isolated profiles
+  are refused rather than downgraded; see `maya runner doctor`.
+- **No per-task process-count guarantee.** `RLIMIT_NPROC` is deliberately not
+  used: the kernel does not enforce it for privileged processes and the per-UID
+  headroom calculation can fail legitimate forks with `EAGAIN`. The result
+  reports `process_count: unsupported`; the wall-clock supervisor and
+  process-group cleanup bound runaway trees but are not a PID cap. Each other
+  rlimit is confirmed by a `getrlimit` readback in the child, so a failed
+  `setrlimit` can no longer be reported as enforced.
 - **Approval scope is a hash of the command/plan, not a syscall sandbox.** An
   approved interpreter can still do whatever that program does.
 - **A remote token used with an older build is still in that database.**
@@ -308,7 +317,10 @@ Residual risks:
   equivalence.
 - **Network isolation is a user namespace, not a kernel sandbox.** It removes
   routes for the child; a local kernel or privileged escape is out of scope, as
-  in Phase 3/4.
+  in Phase 3/4. The DENY_BY_DEFAULT probe now requires *positive* proof: the
+  child must fail to reach a parent-owned loopback listener. On hosts where
+  `unshare -n` reports success without actually separating the namespace, the
+  runner fails closed instead of claiming isolation.
 - **Imported results can be fabricated.** The limitation is explicit, but the
   workbench has no way to authenticate an externally produced metrics document.
 - **A bundle is not signed.** `verify-bundle` recomputes hashes and rejects

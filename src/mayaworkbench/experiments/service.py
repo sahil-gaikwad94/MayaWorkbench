@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,7 @@ from mayaworkbench.domain.models import (
     MetricObservation,
     MetricSpec,
     MetricsSource,
+    Project,
     ProjectMemory,
     Repository,
     RepositorySnapshot,
@@ -1336,6 +1338,205 @@ class ExperimentService:
             documents=documents,
             gaps=gaps,
         )
+
+    def export_run_bundle(
+        self,
+        identifier: str,
+        destination: str | Path,
+        *,
+        attestation: dict[str, Any] | None = None,
+    ) -> Any:
+        """Export one run, or a comparison's two arms, as a portable archive.
+
+        Unlike ``bundle()`` this produces a single deterministic gzip-tar that a
+        user can carry to compute this workbench does not control. The archive
+        carries exact commands, declared seeds, commit and patch hashes,
+        environment locks, a dataset fingerprint, expected output hashes and
+        hardware metadata. Nothing here claims that a remote runner is trusted.
+        """
+        from mayaworkbench.experiments.bundle import (
+            compute_dataset_fingerprint,
+            write_run_bundle,
+        )
+
+        if identifier.startswith("xcmp_"):
+            comparison = self.store.get_comparison(identifier)
+            definitions = [
+                self.store.get_definition(comparison.baseline_experiment_id),
+                self.store.get_definition(comparison.candidate_experiment_id),
+            ]
+            runs = [
+                *self.store.list_runs(definitions[0].id),
+                *self.store.list_runs(definitions[1].id),
+            ]
+            json_artifact_id = comparison.details.get("json_artifact_id")
+            comparison_payload = (
+                json.loads(self.artifacts.read_text(json_artifact_id))
+                if json_artifact_id
+                else comparison.model_dump(mode="json")
+            )
+            definition_doc: dict[str, Any] = {
+                "kind": "COMPARISON",
+                "comparison_id": comparison.id,
+                "comparison_sha256": comparison.json_sha256,
+                "comparison": comparison_payload,
+                "arms": [self._definition_document(item) for item in definitions],
+            }
+        else:
+            definition = self.resolve(identifier)
+            definitions = [definition]
+            runs = self.store.list_runs(definition.id)
+            definition_doc = {
+                **self._definition_document(definition),
+                "kind": "SINGLE",
+            }
+        definition_doc["declared_seeds"] = {
+            item.id: list(item.seeds) for item in definitions
+        }
+        definition_doc["command_templates"] = {
+            item.id: {
+                "command": list(item.command),
+                "timeout_seconds": item.timeout_seconds,
+                "profile": item.profile.value,
+                "metrics_source": item.metrics_source.kind.value,
+            }
+            for item in definitions
+        }
+        definition_doc["commit_sha_by_arm"] = {
+            item.id: item.base_commit_sha for item in definitions
+        }
+
+        run_payloads, observations, documents, manifests = self._run_documents(runs)
+        manifest_docs = [
+            json.loads(documents[f"manifests/{manifest['id']}.json"].decode("utf-8"))
+            for manifest in manifests
+        ]
+        outputs = {
+            Path(name).name: data
+            for name, data in documents.items()
+            if name.startswith("outputs/")
+        }
+        environment: dict[str, Any] = {}
+        for manifest in manifest_docs:
+            for key, value in (manifest.get("environment") or {}).items():
+                environment.setdefault(key, value)
+        environment["bundle_export"] = "portable runner bundle; execution is user-owned"
+
+        if len(definitions) == 1:
+            hardware: dict[str, Any] = definitions[0].protocol.hardware.model_dump(
+                mode="json"
+            )
+        else:
+            hardware = {
+                "note": "arms may declare different hardware; see the per-arm records",
+                "arms": {
+                    item.id: item.protocol.hardware.model_dump(mode="json")
+                    for item in definitions
+                },
+            }
+        inputs: dict[str, str] = {}
+        for item in definitions:
+            protocol = item.protocol
+            declared = {
+                "dataset": protocol.dataset.fingerprint,
+                "evaluation_script": protocol.evaluation.script_hash,
+                "lockfile": protocol.environment.lockfile_hash,
+                "config": protocol.config.hash,
+            }
+            for key, digest in declared.items():
+                if digest and re.fullmatch(r"[0-9a-f]{64}", digest):
+                    inputs[f"{item.id}/{key}"] = digest
+        dataset_fingerprint = compute_dataset_fingerprint(inputs)
+        gaps = self._reproduction_gaps(definitions, runs)
+        gaps.append(
+            "results are not locally attested evidence: a signature identifies a "
+            "key, it does not prove the scientific result"
+        )
+        context = self._runner_bundle_context(definitions)
+        return write_run_bundle(
+            destination,
+            definition_doc,
+            manifest_docs,
+            run_payloads,
+            observations,
+            outputs,
+            environment,
+            dataset_fingerprint,
+            hardware,
+            gaps=gaps,
+            attestation=attestation,
+            context=context,
+        )
+
+    def import_run_bundle(self, path: str | Path) -> Any:
+        """Import verified bundle results as IMPORTED, never as local evidence."""
+        from mayaworkbench.experiments.bundle import (
+            import_run_bundle as import_bundle_records,
+        )
+
+        result = import_bundle_records(path, self.store)
+        definitions = {item.id: item for item in result.definitions}
+        for run in result.runs:
+            if run.id not in result.created_run_ids:
+                continue
+            definition = definitions.get(run.experiment_id)
+            if definition is None:
+                continue
+            self._event(
+                EventType.EXPERIMENT_RUN_COMPLETED,
+                definition,
+                entity_type="experiment_run",
+                entity_id=run.id,
+                actor=ActorKind.USER,
+                payload={
+                    "seed": run.seed,
+                    "attempt": run.attempt,
+                    "execution": "IMPORTED",
+                    "attestation": result.attestation,
+                    "observations": run.observation_count,
+                    "bundle_sha256": result.archive_sha256,
+                    "limitation": result.limitation,
+                },
+            )
+        return result
+
+    def _runner_bundle_context(
+        self, definitions: list[ExperimentDefinition]
+    ) -> dict[str, Any]:
+        """Carry immutable project/repository/snapshot metadata for import.
+
+        A portable bundle lands in a home that has none of these rows; without
+        them the strict foreign keys on experiment records reject the import.
+        """
+        projects: dict[str, Any] = {}
+        repositories: dict[str, Any] = {}
+        snapshots: dict[str, Any] = {}
+        for definition in definitions:
+            repository = self.repositories.get(definition.repository_id)
+            snapshot = self.snapshots.get(definition.snapshot_id)
+            if definition.project_id not in projects:
+                slug = "imported-" + "".join(
+                    char for char in definition.project_id.lower() if char.isalnum()
+                )[-20:]
+                projects[definition.project_id] = Project(
+                    id=definition.project_id,
+                    name=repository.name,
+                    slug=slug,
+                    description="Recreated from a portable runner bundle",
+                    # Deterministic: a synthetic project must not make repeated
+                    # exports of the same evidence differ byte-for-byte.
+                    created_at=repository.created_at,
+                    updated_at=repository.created_at,
+                ).model_dump(mode="json")
+            if repository.id not in repositories:
+                repositories[repository.id] = repository.model_dump(mode="json")
+            if snapshot.id not in snapshots:
+                snapshots[snapshot.id] = snapshot.model_dump(mode="json")
+        return {
+            "projects": list(projects.values()),
+            "repositories": list(repositories.values()),
+            "snapshots": list(snapshots.values()),
+        }
 
     def _definition_document(self, definition: ExperimentDefinition) -> dict[str, Any]:
         artifact_id = definition.details.get("protocol_artifact_id")

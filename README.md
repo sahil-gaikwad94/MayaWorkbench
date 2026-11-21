@@ -198,6 +198,17 @@ logs/                    optional structured logs
 | `maya verify checks\|plan` | List built-in checks and inspect/suggest declared checks |
 | `maya verify run\|show\|report` | Run an append-only attempt; inspect or write the report |
 | `maya verify bundle\|check-bundle` | Export and independently re-verify an evidence bundle |
+| `maya verify attest\|check-attestation` | Optionally sign a bundle (HMAC key from `MAYA_SIGNING_KEY`) and verify its signature |
+| `maya workspace create\|list\|show\|attach\|environment\|graph` | Multi-resource engineering workspace with typed attachments and environment specs |
+| `maya runner doctor\|profiles` | Report actual runtime enforcement and execution trust profiles |
+| `maya api serve\|health` | Local loopback JSON control plane with durable event streaming |
+| `maya skill list\|add\|enable\|disable\|promote\|export\|import\|seed\|run` | Versioned, user-governed reusable skills |
+| `maya eval score <bundle...>` | Score verified task completion per supervision hour and cost |
+| `maya env detect\|plan\|doctor` | Detect ecosystems and render argv-only provisioning plans |
+| `maya semantic evaluate <cases.json>` | Measure optional reranker vs lexical baseline |
+| `maya verify proof\|check-proof` | Write/verify `.maya-proof.json` attestation envelopes |
+| `maya memory audit\|retention\|export-bundle\|import-bundle` | Conflict reports, retention, and portable memory bundles |
+| `maya experience record\|suggest` | Record failed attempts and recall confirmed prior attempts as advice |
 | `maya task cleanup\|export` | Remove the worktree or export a run bundle |
 | `maya worker [--once] [--run-id]` | Run the durable task worker process |
 | `maya issues` | Index issues filtered by kind or severity |
@@ -236,14 +247,44 @@ result, and the final status:
 | `MODEL_UNAVAILABLE` | A model was requested but could not be used |
 | `FAILED` | Provider error or schema-invalid output; nothing presented as an answer |
 
+## Execution trust and reported limits
+
+Command execution uses an explicit trust profile. Only `LOCAL_TRUSTED` is
+implemented: it runs project code with the user's OS privileges and is **not a
+sandbox**. `READ_ONLY_ANALYSIS` refuses execution, and the isolated profiles
+(`ROOTLESS_CONTAINER`, `REMOTE_MICROVM`, `GPU_RUNNER`) are **blocked** rather
+than silently downgraded to host privileges. Inspect the host with
+`maya runner doctor` and list profiles with `maya runner profiles` (both support
+`--json`).
+
+Limit enforcement is reported per limit with the mechanism observed at runtime
+(`wall_time`, `cpu`, `memory`, `process_count`, `file_size`, `open_files`). Each
+rlimit is applied inside the child and read back with `getrlimit`; the aggregate
+`limits_enforcement` is derived from those results
+(`all_enforced`/`partially_enforced`/`not_enforced`). `process_count` is
+reported `unsupported`: `RLIMIT_NPROC` is a per-UID ceiling that Linux does not
+enforce for privileged processes and whose headroom calculation can also block
+legitimate child forks. The wall-clock supervisor kills the whole process group,
+but no per-task PID cap is claimed until a verified cgroup/container backend
+exists.
+
+See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the feature→code→test
+truth table and [docs/test-matrix.md](docs/test-matrix.md) for the declared test
+environment and latest full-suite result.
+
 ## Known limitations
 
 These are properties of the current implementation, not TODOs dressed up as
 features:
 
-- **Python-only AST coverage.** Classes, functions, methods, constants,
-  imports, calls, inheritance and decorators are extracted for `.py` files.
-  Other languages are indexed lexically (`LEXICAL_ONLY`) and labelled as such.
+- **Python AST coverage plus heuristic symbols.** Classes, functions, methods,
+  constants, imports, calls, inheritance and decorators are extracted for `.py`
+  files with `FULL` coverage. JavaScript/TypeScript/Go/Rust receive bounded
+  regular-expression declaration/import/call discovery with `PARTIAL` coverage,
+  LOW-confidence symbols and `HEURISTIC` relation provenance; the repository map
+  names these languages separately. All other languages remain lexical-only.
+  Re-indexing an unchanged snapshot reuses content-hash-cached prepared rows;
+  a parser-version or policy change invalidates the affected cache keys.
 - **Static analysis only.** Dynamic dispatch, `getattr`, string-based imports,
   monkeypatching and framework magic are not resolved; such edges are either
   unresolved or `LOW` confidence.
@@ -343,6 +384,9 @@ the previous index intact, invalid citations withhold the answer, and
 - [Evaluation plan](docs/evaluation-plan.md)
 - [CLI and UI flow](docs/ui-flow.md)
 - [Implementation gap analysis](docs/implementation-gap-analysis.md)
+- [Implementation status (truth table)](IMPLEMENTATION_STATUS.md)
+- [Test matrix and release summary](docs/test-matrix.md)
+- [Rigorous end-to-end audit](docs/audit-end-to-end.md)
 - [Phase 1 report](docs/phase-1-report.md)
 - [Phase 2 report](docs/phase-2-report.md)
 - [Phase 3 report](docs/phase-3-report.md)
@@ -355,4 +399,8 @@ the previous index intact, invalid citations withhold the answer, and
 - [Adversarial audit of Phase 6](docs/audit-phase-6.md) — 82 probes, 2 defects found and fixed
 - [ADR 0010 — experiment lab and memory](docs/adr/0010-experiment-lab-and-memory.md)
 - [ADR 0011 — deterministic finish gate and repair](docs/adr/0011-deterministic-finish-gate-and-repair.md)
+- [Local JSON control plane](docs/api-control-plane.md)
 - [Architecture decision records](docs/adr/)
+  - [ADR 0012 — Execution trust and limit evidence](docs/adr/0012-execution-trust-and-limit-evidence.md)
+  - [ADR 0013 — Incremental index cache](docs/adr/0013-incremental-indexing-cache.md)
+  - [ADR 0014 — Multi-language adapters](docs/adr/0014-multi-language-adapters.md)

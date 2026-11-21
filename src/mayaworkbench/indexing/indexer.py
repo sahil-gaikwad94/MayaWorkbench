@@ -39,6 +39,7 @@ from mayaworkbench.domain.enums import (
     IssueKind,
     IssueSeverity,
     ParseCoverage,
+    RelationSource,
     SnapshotStatus,
     SymbolKind,
 )
@@ -55,11 +56,13 @@ from mayaworkbench.errors import ConflictError, IndexingError
 from mayaworkbench.ids import new_ulid, short_hash, stable_edge_id, stable_file_id, stable_symbol_id
 from mayaworkbench.indexing.languages import (
     detect_language,
+    LANGUAGES_WITH_HEURISTIC_SYMBOLS,
     is_config_path,
     is_doc_path,
     is_test_path,
     module_name_for_path,
 )
+from mayaworkbench.indexing.language_adapters import adapter_for_language
 from mayaworkbench.indexing.python_parser import ParsedModule, parse_python
 from mayaworkbench.indexing.resolve import EdgeResolver, clean_target_name
 from mayaworkbench.observability.logging import get_logger
@@ -104,6 +107,7 @@ class IndexReport(BaseModel):
     issues: int
     bytes_indexed: int
     lines_indexed: int
+    files_reused: int = 0
     languages: dict[str, int] = {}
     parse_coverage: dict[str, int] = {}
     duration_ms: int
@@ -124,6 +128,51 @@ class _FileBatch:
     manifest: list[dict] = field(default_factory=list)
     bytes_indexed: int = 0
     lines_indexed: int = 0
+
+    def to_payload(self) -> dict:
+        """Serialisable prepared rows for this file, reusable across runs."""
+        return {
+            "files": [item.model_dump(mode="json") for item in self.files],
+            "symbols": [item.model_dump(mode="json") for item in self.symbols],
+            "edges": [item.model_dump(mode="json") for item in self.edges],
+            "issues": [item.model_dump(mode="json") for item in self.issues],
+            "aliases": [list(item) for item in self.aliases],
+            "lines": {
+                file_id: [[line_no, text] for _fid, line_no, text in rows]
+                for file_id, rows in self.lines.items()
+            },
+            "manifest": list(self.manifest),
+            "bytes_indexed": self.bytes_indexed,
+            "lines_indexed": self.lines_indexed,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "_FileBatch":
+        batch = cls()
+        batch.files = [IndexedFile.model_validate(item) for item in payload["files"]]
+        batch.symbols = [Symbol.model_validate(item) for item in payload["symbols"]]
+        batch.edges = [SymbolEdge.model_validate(item) for item in payload["edges"]]
+        batch.issues = [IndexIssue.model_validate(item) for item in payload["issues"]]
+        batch.aliases = [tuple(item) for item in payload["aliases"]]
+        batch.lines = {
+            file_id: [(file_id, int(line_no), text) for line_no, text in rows]
+            for file_id, rows in payload["lines"].items()
+        }
+        batch.manifest = list(payload.get("manifest", []))
+        batch.bytes_indexed = int(payload.get("bytes_indexed", 0))
+        batch.lines_indexed = int(payload.get("lines_indexed", 0))
+        return batch
+
+    def merge(self, other: "_FileBatch") -> None:
+        self.files.extend(other.files)
+        self.symbols.extend(other.symbols)
+        self.edges.extend(other.edges)
+        self.issues.extend(other.issues)
+        self.aliases.extend(other.aliases)
+        self.lines.update(other.lines)
+        self.manifest.extend(other.manifest)
+        self.bytes_indexed += other.bytes_indexed
+        self.lines_indexed += other.lines_indexed
 
     def reset(self) -> None:
         self.files.clear()
@@ -163,6 +212,7 @@ class Indexer:
         self.repository_service = repository_service
         self.settings = settings
         self.policy: DiscoveryPolicy = DiscoveryPolicy.from_settings(settings.indexing)
+        self._current_snapshot_id: str | None = None
 
     # ------------------------------------------------------------------- entry
     def index(self, snapshot_id: str) -> IndexReport:
@@ -174,6 +224,7 @@ class Indexer:
                 hint="Wait for the current run or remove the stale status after a crash.",
             )
         previous_status = snapshot.status
+        self._current_snapshot_id = snapshot_id
         started = utcnow()
         started_monotonic = time.monotonic()
 
@@ -214,7 +265,24 @@ class Indexer:
                                 )
                             )
                             continue
-                        self._index_file(snapshot, candidate, data, batch, collector)
+                        cache_key = self._file_cache_key(candidate.path, data)
+                        cached_id = self.files.get_index_cache(cache_key)
+                        if cached_id is not None:
+                            reused = _FileBatch.from_payload(
+                                json.loads(self.artifacts.read_text(cached_id))
+                            )
+                            self._apply_cached(reused, candidate.path, collector)
+                            batch.merge(reused)
+                            collector.files_reused += 1
+                            continue
+                        prepared = _FileBatch()
+                        self._index_file(snapshot, candidate, data, prepared, collector)
+                        cache_artifact = self.artifacts.put_text(
+                            json.dumps(prepared.to_payload(), ensure_ascii=False),
+                            kind=ArtifactKind.INDEX_FILE_CACHE,
+                        )
+                        self.files.set_index_cache(cache_key, cache_artifact.id, snapshot_id)
+                        batch.merge(prepared)
                     self._spill_batch(spill, batch, collector)
             prepare_ms = int((time.monotonic() - prepare_started) * 1000)
 
@@ -267,6 +335,39 @@ class Indexer:
         target = self.artifacts.root / "tmp"
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
         return target
+
+    def _file_cache_key(self, path: str, data: bytes) -> str:
+        """A durable key for one file's prepared rows.
+
+        The key includes the parser/indexer version, discovery policy and the
+        content flag, so a parser upgrade or policy change invalidates only the
+        records it actually affects, not the whole repository.
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        material = "|".join(
+            (
+                INDEXER_VERSION,
+                self.repository_service.policy_hash(),
+                self._current_snapshot_id or "",
+                str(bool(self.settings.indexing.store_file_content)),
+                path,
+                digest,
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _apply_cached(
+        self, reused: "_FileBatch", path: str, collector: "_Collector"
+    ) -> None:
+        """Restore collector counters from cached prepared rows."""
+        del path
+        for file in reused.files:
+            collector.languages[file.language] += 1
+            collector.coverage[file.parse_coverage.value] += 1
+            collector.bytes_indexed += file.size_bytes
+            collector.line_count += file.line_count
+        collector.symbols += len(reused.symbols)
+        collector.issues += len(reused.issues)
 
     # --------------------------------------------------------------- lifecycle
     def _begin(self, snapshot: RepositorySnapshot, repository: Repository) -> None:
@@ -451,6 +552,16 @@ class Indexer:
         status = FileStatus.LEXICAL_ONLY
         coverage = ParseCoverage.LEXICAL_ONLY
         parsed: ParsedModule | None = None
+        # None means "keep the Python AST defaults" (HIGH / ast.<edge_type>).
+        symbol_confidence: EdgeConfidence | None = None
+        relation_source: str | None = None
+        if language in LANGUAGES_WITH_HEURISTIC_SYMBOLS:
+            adapter = adapter_for_language(language)
+            if adapter is not None:
+                parsed = adapter.parse(candidate.path, text)
+                coverage = ParseCoverage.PARTIAL
+                symbol_confidence = EdgeConfidence.LOW
+                relation_source = RelationSource.HEURISTIC.value
         if language == "python":
             parsed = parse_python(
                 text, module_name=module_name_for_path(candidate.path), path=candidate.path
@@ -516,7 +627,15 @@ class Indexer:
             collector.main_guard_paths.add(candidate.path)
 
         if parsed is not None:
-            self._add_symbols(snapshot, record, parsed, batch, collector)
+            self._add_symbols(
+                snapshot,
+                record,
+                parsed,
+                batch,
+                collector,
+                confidence=symbol_confidence,
+                provenance=relation_source,
+            )
         if parsed is not None and parsed.truncated:
             batch.issues.append(
                 _issue(
@@ -537,6 +656,9 @@ class Indexer:
         parsed: ParsedModule,
         batch: _FileBatch,
         collector: "_Collector",
+        *,
+        confidence: EdgeConfidence | None = None,
+        provenance: str | None = None,
     ) -> None:
         used_ids: set[str] = set()
         id_by_qualified: dict[str, str] = {}
@@ -569,7 +691,7 @@ class Indexer:
                 end_line=parsed_symbol.end_line,
                 docstring=parsed_symbol.docstring,
                 decorators=list(parsed_symbol.decorators),
-                confidence=EdgeConfidence.HIGH,
+                confidence=confidence or EdgeConfidence.HIGH,
                 parent_symbol_id=parent_id,
             )
             batch.symbols.append(symbol)
@@ -602,6 +724,7 @@ class Indexer:
                     target_name=target_name,
                     line=line,
                     ordinal=ordinal,
+                    provenance=provenance,
                 )
             )
 
@@ -665,6 +788,7 @@ class Indexer:
         target_name: str,
         line: int,
         ordinal: int = 0,
+        provenance: str | None = None,
     ) -> SymbolEdge:
         edge_id = stable_edge_id(
             snapshot_id,
@@ -684,7 +808,7 @@ class Indexer:
             target_name=target_name,
             line=line,
             confidence=EdgeConfidence.LOW,
-            provenance=f"ast.{edge_type.value.lower()}",
+            provenance=provenance or f"ast.{edge_type.value.lower()}",
         )
 
     # --------------------------------------------------------------- resolution
@@ -723,18 +847,7 @@ class Indexer:
         collector.add_manifest(batch.manifest)
         collector.files += len(batch.files)
         collector.issues += len(batch.issues)
-        payload = {
-            "files": [item.model_dump(mode="json") for item in batch.files],
-            "symbols": [item.model_dump(mode="json") for item in batch.symbols],
-            "edges": [item.model_dump(mode="json") for item in batch.edges],
-            "issues": [item.model_dump(mode="json") for item in batch.issues],
-            "aliases": [list(item) for item in batch.aliases],
-            "lines": {
-                file_id: [[line_no, text] for _file_id, line_no, text in rows]
-                for file_id, rows in batch.lines.items()
-            },
-        }
-        spill.write(json.dumps(payload, ensure_ascii=False))
+        spill.write(json.dumps(batch.to_payload(), ensure_ascii=False))
         spill.write("\n")
         batch.reset()
 
@@ -815,6 +928,7 @@ class Indexer:
             repository_id=repository.id,
             status=SnapshotStatus.INDEXED.value,
             files_indexed=collector.files,
+            files_reused=collector.files_reused,
             files_skipped=collector.skipped,
             symbols=collector.symbols,
             edges=collector.edges,
@@ -842,6 +956,7 @@ class _Collector:
         self.snapshot_id = snapshot.id
         self.repository_id = repository.id
         self.files = 0
+        self.files_reused = 0
         self.skipped = 0
         self.symbols = 0
         self.edges = 0
@@ -868,6 +983,7 @@ class _Collector:
             "main_guard_paths": sorted(self.main_guard_paths),
             "files_indexed": report.files_indexed,
             "files_skipped": report.files_skipped,
+            "files_reused": report.files_reused,
             "symbols": report.symbols,
             "edges": report.edges,
             "edges_resolved": report.edges_resolved,

@@ -31,9 +31,14 @@ from mayaworkbench.domain.enums import (
     CheckOutcome,
     ClaimAuthor,
     ClaimConfidence,
+    ClaimExplicitness,
+    ClaimKind,
     ClaimMappingStatus,
     ClaimReviewStatus,
+    ClaimTargetKind,
     ClaimType,
+    KIND_FOR_LEGACY_CLAIM_TYPE,
+    LEGACY_CLAIM_TYPE_FOR_KIND,
     CriterionStatus,
     DocumentMediaKind,
     DocumentOrigin,
@@ -48,6 +53,7 @@ from mayaworkbench.domain.enums import (
     ExperimentRunStatus,
     ExperimentStatus,
     ExperimentVerdict,
+    EvidenceStatus,
     FindingSeverity,
     ExtractionStatus,
     FileStatus,
@@ -65,11 +71,14 @@ from mayaworkbench.domain.enums import (
     PassageKind,
     QaStatus,
     ProtocolComparison,
+    ResourceKind,
     RetentionClass,
     RiskCategory,
     RiskSeverity,
     SnapshotKind,
     TaskDecision,
+    ToolCapability,
+    WorkspaceSessionState,
     TaskType,
     ToolCallStatus,
     VerificationGate,
@@ -82,6 +91,10 @@ from mayaworkbench.domain.enums import (
 )
 
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+
+#: Version of the typed claim graph and the immutable discovery metadata that
+#: grounds it. Recorded on every claim and every saved source-metadata artifact.
+CLAIM_GRAPH_VERSION = "1.0"
 
 
 class Record(BaseModel):
@@ -444,13 +457,35 @@ class SourcePassage(Record):
         return " · ".join(parts)
 
 
-class ResearchClaim(Record):
-    """One claim node in the research DAG (§9.3).
+class ClaimTarget(Record):
+    """A typed resource a claim is about (audit §7.1 ``target_resources``)."""
 
-    Categories are never merged. ``EXPLICIT_SOURCE_CLAIM`` must carry at least
-    one verified source location; inferred and decision claims must carry a
-    derivation note and use ``basis_passage_ids`` instead of quoting the paper as
-    if it stated them.
+    kind: ClaimTargetKind
+    path: str = Field(min_length=1, max_length=1000)
+    symbol: str | None = Field(default=None, max_length=300)
+
+    @field_validator("path")
+    @classmethod
+    def _clean_path(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("target path must not be empty")
+        return cleaned
+
+    @property
+    def label(self) -> str:
+        return f"{self.kind.value}:{self.path}" + (f":{self.symbol}" if self.symbol else "")
+
+
+class ResearchClaim(Record):
+    """One typed node in the versioned research DAG (§9.3, audit §7.1).
+
+    ``kind`` is the typed claim graph axis; ``claim_type`` is retained as the
+    legacy compatibility axis and is always derived consistently from ``kind``
+    (and vice versa). Paper claims carry a verbatim verified quote; inferred
+    claims carry a derivation note and cite basis passages instead. Every node
+    records how explicit it is, what it targets, what validates it, what remains
+    uncertain and whether a code mapping has been checked at all.
     """
 
     id: str
@@ -459,11 +494,18 @@ class ResearchClaim(Record):
     parent_claim_id: str | None = None
     ordinal: int = 0
     claim_type: ClaimType
+    kind: ClaimKind = ClaimKind.PAPER_METHOD
+    graph_version: str = CLAIM_GRAPH_VERSION
     title: str = Field(min_length=1, max_length=300)
     statement: str = Field(min_length=1, max_length=8000)
     implementation_requirement: str = ""
     source_locations: list[SourceLocation] = Field(default_factory=list)
     basis_passage_ids: list[str] = Field(default_factory=list)
+    explicitness: ClaimExplicitness = ClaimExplicitness.EXPLICIT
+    target_resources: list[ClaimTarget] = Field(default_factory=list)
+    validation_ids: list[str] = Field(default_factory=list)
+    uncertainty: list[str] = Field(default_factory=list)
+    mapping_status: ClaimMappingStatus = ClaimMappingStatus.NOT_CHECKED
     expected_code_signals: list[str] = Field(default_factory=list)
     forbidden_code_signals: list[str] = Field(default_factory=list)
     target_paths: list[str] = Field(default_factory=list)
@@ -481,8 +523,77 @@ class ResearchClaim(Record):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_typed_fields(cls, data: Any) -> Any:
+        """Keep ``kind`` and ``claim_type`` consistent for old and new callers.
+
+        A row or caller that supplies only the legacy ``claim_type`` gets the
+        closest typed ``kind``; a caller that supplies only ``kind`` gets the
+        legacy type older validation code expects. Supplying both with
+        contradictory values is an error, never a silent rewrite.
+        """
+        if not isinstance(data, dict):
+            return data
+        raw_kind = data.get("kind")
+        raw_type = data.get("claim_type")
+        kind = ClaimKind(raw_kind) if raw_kind not in (None, "") else None
+        legacy = ClaimType(raw_type) if raw_type not in (None, "") else None
+        if kind is not None and legacy is not None:
+            if LEGACY_CLAIM_TYPE_FOR_KIND[kind] is not legacy:
+                raise ValueError(
+                    f"kind {kind.value} is incompatible with claim_type {legacy.value}"
+                )
+        elif kind is None and legacy is None:
+            # Let normal validation report the missing required claim_type.
+            return data
+        result = dict(data)
+        if kind is None and legacy is not None:
+            kind = KIND_FOR_LEGACY_CLAIM_TYPE[legacy]
+            result["kind"] = kind.value
+        elif legacy is None and kind is not None:
+            result["claim_type"] = LEGACY_CLAIM_TYPE_FOR_KIND[kind].value
+        if data.get("explicitness") in (None, ""):
+            if kind is ClaimKind.INFERRED_REQUIREMENT:
+                explicitness = ClaimExplicitness.INFERRED
+            elif kind in (ClaimKind.PAPER_METHOD, ClaimKind.PAPER_RESULT):
+                explicitness = ClaimExplicitness.EXPLICIT
+            elif data.get("basis_passage_ids") or data.get("derivation_note"):
+                explicitness = ClaimExplicitness.INFERRED
+            else:
+                explicitness = ClaimExplicitness.EXPLICIT
+            result["explicitness"] = explicitness.value
+        return result
+
     def is_reviewed(self) -> bool:
         return self.review_status != ClaimReviewStatus.NEEDS_REVIEW
+
+
+class SourceMetadata(Record):
+    """Immutable, content-addressed provenance for a discovered source.
+
+    The record is a small index over an artifact holding the exact provider
+    payload. There is deliberately no update path: retrieval time, URL/DOI,
+    paper version and content hash describe what was actually observed.
+    """
+
+    id: str
+    project_id: str
+    document_key: str
+    provider: str = Field(min_length=1, max_length=80)
+    external_id: str = Field(min_length=1, max_length=500)
+    title: str = ""
+    authors: list[str] = Field(default_factory=list)
+    doi: str | None = None
+    url: str | None = None
+    published: str | None = None
+    paper_version: str | None = None
+    retrieval_url: str | None = None
+    metadata_sha256: str = Field(min_length=64, max_length=64)
+    retrieved_at: datetime = Field(default_factory=utcnow)
+    artifact_id: str = Field(min_length=1)
+    protocol_version: str = CLAIM_GRAPH_VERSION
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ClaimDependency(Record):
@@ -642,6 +753,10 @@ class TaskScope(Record):
     excluded_paths: list[str] = Field(default_factory=list)
     base_commit_sha: str = Field(min_length=40, max_length=40, pattern=r"^[0-9a-f]{40}$")
     include_working_tree_patch: bool = False
+    #: Durable Engineering Workspace scope. When set, ``resource_ids`` must be
+    #: attachments of that workspace, so a task cannot silently reach a raw path.
+    workspace_id: str | None = None
+    resource_ids: list[str] = Field(default_factory=list)
 
     @field_validator("allowed_paths", "excluded_paths")
     @classmethod
@@ -758,10 +873,25 @@ class TaskConstraints(Record):
     max_tool_calls: int = Field(default=120, ge=1, le=1000)
     max_output_bytes: int = Field(default=200_000, ge=1024, le=10_000_000)
     max_processes: int = Field(default=128, ge=8, le=4096)
+    #: Closed allowlist of tool capabilities. Empty means a legacy contract
+    #: where the existing approval/path/command policy remains authoritative.
+    capabilities: list[str] = Field(default_factory=list)
+    #: Execution boundary requested for this task. Isolated profiles block
+    #: until a verified runtime backend is available.
+    execution_trust: str = "LOCAL_TRUSTED"
     allow_file_deletion: bool = False
     # An unknown model price is not zero. Set this only when the user accepts
     # spend that the contract cannot bound.
     allow_unknown_cost: bool = False
+
+    @field_validator("capabilities")
+    @classmethod
+    def _validate_capabilities(cls, value: list[str]) -> list[str]:
+        allowed = {item.value for item in ToolCapability}
+        invalid = sorted(set(value) - allowed)
+        if invalid:
+            raise ValueError(f"unknown tool capabilities: {', '.join(invalid)}")
+        return list(dict.fromkeys(value))
 
 
 class ResearchContextRef(Record):
@@ -1510,6 +1640,73 @@ class ProjectMemory(Record):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class Workspace(Record):
+    """Durable multi-resource scope (WP4). Distinct from a task-owned worktree."""
+
+    id: str
+    project_id: str
+    slug: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,62}$")
+    title: str = Field(default="", max_length=200)
+    description: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+    created_by: str = "USER"
+
+
+class ResourceAttachment(Record):
+    """A typed link from a Workspace to a repository, dataset, service, etc."""
+
+    id: str
+    workspace_id: str
+    kind: ResourceKind
+    name: str = Field(min_length=1, max_length=200)
+    ref: str = Field(min_length=1, max_length=1000)
+    revision: str | None = None
+    hash_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    details: dict[str, Any] = Field(default_factory=dict)
+    attached_at: datetime = Field(default_factory=utcnow)
+
+
+class EnvironmentSpec(Record):
+    """Declarative toolchain/lockfile description attached to a workspace."""
+
+    id: str
+    workspace_id: str
+    name: str = Field(min_length=1, max_length=120)
+    ecosystem: str = Field(min_length=1, max_length=60)
+    descriptor_path: str | None = None
+    lockfile_path: str | None = None
+    runtime: str = "LOCAL_TRUSTED"
+    toolchain: dict[str, Any] = Field(default_factory=dict)
+    hash_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class WorkspaceSession(Record):
+    """Client-side record of a long-running process in a workspace."""
+
+    id: str
+    workspace_id: str
+    runtime_id: str | None = None
+    command: list[str] = Field(default_factory=list)
+    state: WorkspaceSessionState = WorkspaceSessionState.OPEN
+    last_seq: int = Field(default=0, ge=0)
+    started_at: datetime = Field(default_factory=utcnow)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceItem(Record):
+    """A verifiable statement linked to a workspace resource and artifact."""
+
+    id: str
+    workspace_id: str
+    resource_id: str | None = None
+    claim: str = Field(min_length=1, max_length=4000)
+    artifact_id: str | None = None
+    hash_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: EvidenceStatus = EvidenceStatus.UNVERIFIED
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class WorkerJob(Record):
     """Durable queue entry for the separate local worker process."""
 
@@ -1545,7 +1742,10 @@ __all__ = [
     "SourceLocation",
     "ResearchDocument",
     "SourcePassage",
+    "ClaimTarget",
     "ResearchClaim",
+    "SourceMetadata",
+    "CLAIM_GRAPH_VERSION",
     "ClaimDependency",
     "ResearchExtraction",
     "ClaimRevision",
@@ -1568,6 +1768,11 @@ __all__ = [
     "ReviewFinding",
     "TaskReview",
     "WorkerJob",
+    "Workspace",
+    "ResourceAttachment",
+    "EnvironmentSpec",
+    "WorkspaceSession",
+    "EvidenceItem",
     "InvariantSpec",
     "CheckSpec",
     "VerificationRun",

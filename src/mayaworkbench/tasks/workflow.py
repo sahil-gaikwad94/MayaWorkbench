@@ -28,13 +28,32 @@ ALLOWED_TRANSITIONS: dict[WorkflowState, frozenset[WorkflowState]] = {
     ),
     WorkflowState.PLANNING: frozenset(
         {
+            WorkflowState.AWAITING_PLAN_REVIEW,
             WorkflowState.AWAITING_APPROVAL,
             WorkflowState.FAILED,
             WorkflowState.BLOCKED,
             WorkflowState.CANCELLED,
         }
     ),
+    WorkflowState.AWAITING_PLAN_REVIEW: frozenset(
+        {
+            WorkflowState.AWAITING_APPROVAL,
+            WorkflowState.PLANNING,
+            WorkflowState.FAILED,
+            WorkflowState.BLOCKED,
+            WorkflowState.CANCELLED,
+        }
+    ),
     WorkflowState.AWAITING_APPROVAL: frozenset(
+        {
+            WorkflowState.ENVIRONMENT_PROVISIONING,
+            WorkflowState.IMPLEMENTING,
+            WorkflowState.BLOCKED,
+            WorkflowState.FAILED,
+            WorkflowState.CANCELLED,
+        }
+    ),
+    WorkflowState.ENVIRONMENT_PROVISIONING: frozenset(
         {
             WorkflowState.IMPLEMENTING,
             WorkflowState.BLOCKED,
@@ -44,6 +63,17 @@ ALLOWED_TRANSITIONS: dict[WorkflowState, frozenset[WorkflowState]] = {
     ),
     WorkflowState.IMPLEMENTING: frozenset(
         {
+            WorkflowState.REPAIRING,
+            WorkflowState.REVIEWING,
+            WorkflowState.PAUSED,
+            WorkflowState.BLOCKED,
+            WorkflowState.FAILED,
+            WorkflowState.CANCELLED,
+        }
+    ),
+    WorkflowState.REPAIRING: frozenset(
+        {
+            WorkflowState.IMPLEMENTING,
             WorkflowState.REVIEWING,
             WorkflowState.PAUSED,
             WorkflowState.BLOCKED,
@@ -60,6 +90,26 @@ ALLOWED_TRANSITIONS: dict[WorkflowState, frozenset[WorkflowState]] = {
         }
     ),
     WorkflowState.REVIEWING: frozenset(
+        {
+            WorkflowState.EVIDENCE_BUILDING,
+            WorkflowState.COMPLETED,
+            WorkflowState.COMPLETED_WITH_LIMITATIONS,
+            WorkflowState.NEEDS_HUMAN_DECISION,
+            WorkflowState.FAILED,
+            WorkflowState.CANCELLED,
+        }
+    ),
+    WorkflowState.EVIDENCE_BUILDING: frozenset(
+        {
+            WorkflowState.PUBLISHING_DRAFT,
+            WorkflowState.COMPLETED,
+            WorkflowState.COMPLETED_WITH_LIMITATIONS,
+            WorkflowState.NEEDS_HUMAN_DECISION,
+            WorkflowState.FAILED,
+            WorkflowState.CANCELLED,
+        }
+    ),
+    WorkflowState.PUBLISHING_DRAFT: frozenset(
         {
             WorkflowState.COMPLETED,
             WorkflowState.COMPLETED_WITH_LIMITATIONS,

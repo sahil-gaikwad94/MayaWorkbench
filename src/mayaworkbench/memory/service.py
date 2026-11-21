@@ -198,6 +198,27 @@ class MemoryService:
     def get(self, memory_id: str) -> ProjectMemory:
         return self.store.get(memory_id)
 
+    # ------------------------------------------------------------ experience
+    def record_attempt(self, **kwargs: Any) -> ProjectMemory:
+        """Record a failed approach as a scoped negative result (WP2-01)."""
+        from mayaworkbench.memory.experience import record_attempt
+
+        return record_attempt(self, **kwargs)
+
+    def suggest_prior_attempts(
+        self, *, project_id: str, goal: str, failure_signature: str = "", limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Suggest prior attempts by similarity; suggestions never prohibit work."""
+        from mayaworkbench.memory.experience import suggest_prior_attempts
+
+        return suggest_prior_attempts(
+            self,
+            project_id=project_id,
+            goal=goal,
+            failure_signature=failure_signature,
+            limit=limit,
+        )
+
     # ---------------------------------------------------------------- changes
     def confirm(self, memory_id: str, *, note: str = "") -> ProjectMemory:
         memory = self.store.get(memory_id)

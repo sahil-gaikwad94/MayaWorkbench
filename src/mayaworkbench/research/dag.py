@@ -21,6 +21,7 @@ from __future__ import annotations
 import heapq
 from collections import defaultdict
 
+from mayaworkbench.domain.enums import ClaimKind
 from mayaworkbench.domain.models import ClaimDependency, ResearchClaim
 from mayaworkbench.research.models import ClaimDagValidation, DagIssue
 from mayaworkbench.version import RESEARCH_PROTOCOL_VERSION
@@ -149,6 +150,7 @@ def validate_claim_dag(
         document_id=document_id,
         claim_count=len(by_id),
         edge_count=len(clean_edges),
+        claim_kind_counts=_kind_counts(by_id),
         issues=issues,
         cycles=cycles,
         topological_order=order,
@@ -157,6 +159,13 @@ def validate_claim_dag(
         roots=roots,
         leaves=leaves,
     )
+
+
+def _kind_counts(by_id: dict[str, ResearchClaim]) -> dict[str, int]:
+    counts = {kind.value: 0 for kind in ClaimKind}
+    for claim in by_id.values():
+        counts[claim.kind.value] = counts.get(claim.kind.value, 0) + 1
+    return counts
 
 
 def _parent_issues(by_id: dict[str, ResearchClaim]) -> list[DagIssue]:

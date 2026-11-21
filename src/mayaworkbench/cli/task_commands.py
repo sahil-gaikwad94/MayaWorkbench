@@ -12,7 +12,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mayaworkbench.domain.enums import ApprovalAction, TaskType, WorkflowState
+from mayaworkbench.domain.enums import (
+    ApprovalAction,
+    ExecutionTrust,
+    TaskType,
+    ToolCapability,
+    WorkflowState,
+)
 from mayaworkbench.errors import UsageError
 
 
@@ -26,6 +32,13 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     task = sub.add_parser("task", help="Create, approve and run controlled engineering tasks")
     task_sub = task.add_subparsers(dest="task_command", metavar="<action>")
 
+    reliability = task_sub.add_parser("reliability", help="Show tool-call reliability for a run")
+    reliability.add_argument("run_id")
+    reliability.set_defaults(func=cmd_task_reliability)
+    explain = task_sub.add_parser("explain-params", help="Show model/routing parameters for a run")
+    explain.add_argument("run_id")
+    explain.set_defaults(func=cmd_task_explain_params)
+
     create = task_sub.add_parser("create", help="Create a task and its immutable contract")
     create.add_argument("--project")
     create.add_argument("--repo")
@@ -35,6 +48,8 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     create.add_argument("--task-type", choices=[item.value for item in TaskType], default="ENGINEERING_CHANGE")
     create.add_argument("--allow-path", action="append", required=True, help="Repository-relative writable path")
     create.add_argument("--exclude-path", action="append", default=[])
+    create.add_argument("--workspace", help="Engineering Workspace id")
+    create.add_argument("--resource", action="append", default=[], help="Attached resource id (repeatable)")
     create.add_argument("--acceptance", action="append", default=[])
     create.add_argument("--unknown", action="append", default=[])
     create.add_argument("--max-steps", type=int, default=30)
@@ -48,6 +63,19 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
         choices=["DENY_BY_DEFAULT", "ALLOW_WITH_APPROVAL"],
         default="DENY_BY_DEFAULT",
         help="Command network policy; DENY_BY_DEFAULT refuses execution without isolation",
+    )
+    create.add_argument(
+        "--capability",
+        action="append",
+        choices=[item.value for item in ToolCapability],
+        default=[],
+        help="Grant one tool capability (repeatable); a non-empty list is a closed allowlist",
+    )
+    create.add_argument(
+        "--trust",
+        choices=[item.value for item in ExecutionTrust],
+        default=ExecutionTrust.LOCAL_TRUSTED.value,
+        help="Execution trust profile (isolated profiles are blocked until available)",
     )
     create.add_argument("--allow-delete", action="store_true", help="Permit file deletion")
     create.add_argument(
@@ -109,6 +137,22 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     start.add_argument("--approval-ttl", type=int, default=24 * 3600)
     start.set_defaults(func=cmd_task_start)
 
+    plan = task_sub.add_parser(
+        "plan", help="Show the implementation plan or the typed role DAG (JSON)"
+    )
+    plan.add_argument("identifier", help="Task id or run id")
+    plan.add_argument(
+        "--roles",
+        action="store_true",
+        help="Emit the deterministic typed role DAG instead of the implementation plan",
+    )
+    plan.set_defaults(func=cmd_task_plan)
+
+    roles = task_sub.add_parser(
+        "roles", help="List the fixed roles and their default authority"
+    )
+    roles.set_defaults(func=cmd_task_roles)
+
     approve = task_sub.add_parser("approve", help="Grant one pending approval")
     approve.add_argument("approval_id")
     approve.add_argument("--reason", default=None)
@@ -127,6 +171,11 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     run.add_argument("task_id")
     run.add_argument("--detach", action="store_true", help="Do not wait for the worker")
     run.add_argument("--timeout", type=int, default=None)
+    run.add_argument(
+        "--roles",
+        action="store_true",
+        help="Use the single deterministic role orchestrator instead of the legacy single-role loop",
+    )
     run.set_defaults(func=cmd_task_run)
 
     status = task_sub.add_parser("status", help="Show a run, its approvals, diff and review")
@@ -194,6 +243,53 @@ def _resolve_run(svc, identifier: str):  # type: ignore[no-untyped-def]
     return run
 
 
+def cmd_task_reliability(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    run = svc.runs.get(args.run_id)
+    from mayaworkbench.tasks.llm_capabilities import tool_reliability
+
+    scores = tool_reliability(run.details)
+    payload = {
+        "run_id": run.id,
+        "tools": {name: item.__dict__ for name, item in scores.items()},
+    }
+    if console.json_mode:
+        console.json(payload)
+    else:
+        console.table(
+            ["tool", "success", "failure", "blocked", "score"],
+            [
+                (name, item.success, item.failure, item.blocked, item.score)
+                for name, item in scores.items()
+            ],
+        )
+    return 0
+
+
+def cmd_task_explain_params(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    run = svc.runs.get(args.run_id)
+    details = run.details or {}
+    from mayaworkbench.tasks.llm_capabilities import route_task
+
+    route = route_task(
+        details.get("task_type", "ENGINEERING_CHANGE"),
+        uncertainty=float(details.get("uncertainty", 0.0) or 0.0),
+        context_tokens=int(details.get("context_tokens", 0) or 0),
+        data_policy=svc.settings.data_policy.value if hasattr(svc.settings.data_policy, "value") else str(svc.settings.data_policy),
+    )
+    payload = {
+        "run_id": run.id,
+        "route": route.__dict__,
+        "model_params": details.get("model_params", {}),
+        "parse_errors": details.get("agent_parse_errors", []),
+    }
+    console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _task_type(value: str) -> TaskType:
     return TaskType(value)
 
@@ -216,6 +312,8 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         "max_runtime_seconds": args.runtime,
         "max_output_bytes": args.max_output,
         "network_access": args.network,
+        "capabilities": list(args.capability or []),
+        "execution_trust": args.trust,
         "allow_file_deletion": bool(args.allow_delete),
         "allow_unknown_cost": bool(args.allow_unknown_cost),
     }
@@ -259,6 +357,8 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         snapshot_id=snapshot.id,
         allowed_paths=args.allow_path,
         excluded_paths=args.exclude_path,
+        workspace_id=args.workspace,
+        resource_ids=list(args.resource or []),
         acceptance_criteria=args.acceptance or None,
         constraints=constraints,
         unknowns=args.unknown or None,
@@ -400,6 +500,80 @@ def cmd_task_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_task_plan(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    if args.roles:
+        from mayaworkbench.tasks.orientation import build_orientation
+        from mayaworkbench.tasks.roles import build_role_plan
+
+        if args.identifier.startswith("run_"):
+            run = svc.runs.get(args.identifier)
+            task = svc.tasks.get(run.task_id)
+            contract = svc.contracts.get(run.contract_id)
+        else:
+            task = svc.tasks.get(args.identifier)
+            contract = svc.contracts.latest(task.id)
+        orientation: dict[str, Any] | None = None
+        try:
+            orientation = build_orientation(
+                retrieval=svc.retrieval,
+                files=svc.files,
+                symbols=svc.symbols,
+                issues=svc.issues,
+                snapshot_id=contract.snapshot_id,
+                goal=task.goal,
+                allowed_paths=contract.scope.allowed_paths,
+                excluded_paths=contract.scope.excluded_paths,
+            )
+        except Exception:  # noqa: BLE001 - orientation is an aid, never a gate
+            orientation = None
+        role_plan = build_role_plan(task, contract, orientation)
+        console.json({"role_plan": role_plan.to_json()})
+        return 0
+
+    run = _resolve_run(svc, args.identifier)
+    plan = (
+        svc.plans.get(run.plan_id)
+        if run.plan_id
+        else svc.plans.latest_for_run(run.id)
+    )
+    console.json({"plan": plan.model_dump(mode="json") if plan else None})
+    return 0
+
+
+def cmd_task_roles(args: argparse.Namespace) -> int:
+    console = args.console
+    from mayaworkbench.tasks.roles import (
+        ROLE_AUTHORITY,
+        ROLE_MODEL_LABEL,
+        ROLE_OUTPUT,
+        AgentRole,
+    )
+
+    rows = [
+        {
+            "role": role.value,
+            "output_artifact": ROLE_OUTPUT[role],
+            "authority": ROLE_AUTHORITY[role],
+            "model_label": ROLE_MODEL_LABEL[role],
+        }
+        for role in AgentRole
+    ]
+    console.json(
+        {
+            "roles": rows,
+            "orchestrator": "one deterministic orchestrator",
+            "swarm": False,
+            "note": (
+                "Authority is descriptive. Grants come from the immutable contract "
+                "and consumed approvals; only the backend changes workflow state."
+            ),
+        }
+    )
+    return 0
+
+
 def cmd_task_approve(args: argparse.Namespace) -> int:
     console = args.console
     svc = _services(args)
@@ -446,6 +620,11 @@ def cmd_task_approvals(args: argparse.Namespace) -> int:
 def cmd_task_run(args: argparse.Namespace) -> int:
     console = args.console
     svc = _services(args)
+    if getattr(args, "roles", False):
+        from mayaworkbench.tasks.orchestrator import set_role_plan_enabled
+
+        run = _resolve_run(svc, args.task_id)
+        set_role_plan_enabled(svc.runs, run.id, enabled=True)
     result = svc.task_service.run_task(
         args.task_id, detached=args.detach, timeout_seconds=args.timeout
     )

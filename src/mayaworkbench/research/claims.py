@@ -32,8 +32,12 @@ from mayaworkbench.domain.enums import (
     ArtifactKind,
     ClaimAuthor,
     ClaimConfidence,
+    ClaimExplicitness,
+    ClaimKind,
     ClaimReviewStatus,
     ClaimType,
+    KIND_FOR_LEGACY_CLAIM_TYPE,
+    LEGACY_CLAIM_TYPE_FOR_KIND,
     EventType,
     PassageKind,
     RiskCategory,
@@ -43,6 +47,7 @@ from mayaworkbench.domain.models import (
     ClaimDependency,
     ClaimRevision,
     ClaimRiskFactor,
+    ClaimTarget,
     Project,
     ResearchClaim,
     ResearchDocument,
@@ -918,7 +923,12 @@ class ClaimService:
         self,
         project_id: str,
         *,
-        claim_type: ClaimType,
+        claim_type: ClaimType | None = None,
+        kind: ClaimKind | None = None,
+        explicitness: ClaimExplicitness | None = None,
+        target_resources: list[ClaimTarget | dict[str, Any]] | None = None,
+        validation_ids: list[str] | None = None,
+        uncertainty: list[str] | None = None,
         title: str,
         statement: str,
         implementation_requirement: str = "",
@@ -940,6 +950,20 @@ class ClaimService:
         accept: bool = False,
         actor: str = "local-user",
     ) -> ResearchClaim:
+        if claim_type is None and kind is None:
+            raise UsageError(
+                "Provide --kind or --claim-type",
+                hint="Typed kinds: " + ", ".join(item.value for item in ClaimKind),
+            )
+        if claim_type is not None and kind is not None:
+            if LEGACY_CLAIM_TYPE_FOR_KIND[kind] is not claim_type:
+                raise UsageError(
+                    f"kind {kind.value} is incompatible with claim_type {claim_type.value}"
+                )
+        elif claim_type is None and kind is not None:
+            claim_type = LEGACY_CLAIM_TYPE_FOR_KIND[kind]
+        elif kind is None and claim_type is not None:
+            kind = KIND_FOR_LEGACY_CLAIM_TYPE[claim_type]
         project = self.projects.get(project_id)
         document = self.documents.get(document_id) if document_id else None
         if document is not None and document.project_id != project.id:
@@ -978,6 +1002,14 @@ class ClaimService:
         parent = self._check_parent(project_id, parent_claim_id, document_id)
         dependency_ids = self._check_dependencies(project_id, depends_on or [], claim_id=None)
 
+        targets: list[ClaimTarget] = []
+        seen_targets: set[str] = set()
+        for raw in target_resources or []:
+            target = ClaimTarget.model_validate(raw)
+            if target.label not in seen_targets:
+                seen_targets.add(target.label)
+                targets.append(target)
+
         claim = ResearchClaim(
             id="clm_" + new_ulid(),
             project_id=project.id,
@@ -987,11 +1019,16 @@ class ClaimService:
                 project_id=project.id, document_id=document.id if document else None
             ),
             claim_type=claim_type,
+            kind=kind,
+            explicitness=explicitness,
             title=title.strip()[:300],
             statement=normalize_quote(statement)[:8000],
             implementation_requirement=normalize_quote(implementation_requirement)[:4000],
             source_locations=source_locations,
             basis_passage_ids=sorted(set(basis)),
+            target_resources=targets,
+            validation_ids=_normalise_lines(validation_ids or []),
+            uncertainty=_normalise_lines(uncertainty or []),
             expected_code_signals=_normalise_signals(expected_code_signals or [], warnings),
             forbidden_code_signals=_normalise_signals(forbidden_code_signals or [], warnings),
             target_paths=_normalise_lines(target_paths or []),
@@ -1033,6 +1070,9 @@ class ClaimService:
                     actor_name=actor,
                     payload={
                         "claim_type": claim.claim_type.value,
+                        "kind": claim.kind.value,
+                        "explicitness": claim.explicitness.value,
+                        "graph_version": claim.graph_version,
                         "title": claim.title,
                         "document_id": claim.document_id,
                         "review_status": claim.review_status.value,
@@ -1283,6 +1323,30 @@ class ClaimService:
                 raise UsageError(
                     f"{claim.claim_type.value} needs a derivation note"
                 )
+        if claim.kind in (ClaimKind.PAPER_METHOD, ClaimKind.PAPER_RESULT):
+            if not claim.source_locations:
+                raise UsageError(
+                    f"{claim.kind.value} must carry at least one verified source quote",
+                    hint="Cite --document/--passage/--quote, or use INFERRED_REQUIREMENT.",
+                )
+            if claim.explicitness is not ClaimExplicitness.EXPLICIT:
+                raise UsageError(
+                    f"{claim.kind.value} states what the paper says and must be EXPLICIT"
+                )
+        if claim.kind is ClaimKind.INFERRED_REQUIREMENT:
+            if claim.explicitness is not ClaimExplicitness.INFERRED:
+                raise UsageError(
+                    "INFERRED_REQUIREMENT must be labelled --explicitness INFERRED"
+                )
+            if not claim.derivation_note.strip():
+                raise UsageError("INFERRED_REQUIREMENT needs a derivation note")
+        if claim.kind is ClaimKind.VALIDATION_CLAIM and not (
+            claim.validation_ids or claim.validation_methods
+        ):
+            raise UsageError(
+                "VALIDATION_CLAIM needs --validation-id or --validation-method",
+                hint="Record what the test or experiment is intended to establish.",
+            )
         _guard_signal_overlap(claim)
 
 

@@ -157,6 +157,12 @@ INVARIANT_NAMES: tuple[str, ...] = (
     "deterministic_eval",
     "parameter_update",
     "dtype_device_consistency",
+    "softmax_row_sum",
+    "causal_future_independence",
+    "permutation_equivariance",
+    "finite_difference_gradient",
+    "normalization_moments",
+    "conservation_of_sum",
 )
 
 INVARIANT_DESCRIPTIONS: dict[str, str] = {
@@ -168,6 +174,9 @@ INVARIANT_DESCRIPTIONS: dict[str, str] = {
     "deterministic_eval": "In eval mode, two identical forward passes must be numerically equal.",
     "parameter_update": "One optimisation step must change at least one parameter and keep parameters finite.",
     "dtype_device_consistency": "The output dtype and device must match the input.",
+    **__import__(
+        "mayaworkbench.verification.math_invariants", fromlist=["METHOD_DESCRIPTIONS"]
+    ).METHOD_DESCRIPTIONS,
 }
 
 _PRELUDE = r'''
@@ -455,6 +464,14 @@ _TEMPLATE_BUILDERS: dict[str, Callable[[InvariantSpec], str]] = {
     "deterministic_eval": _deterministic_eval,
     "parameter_update": _parameter_update,
     "dtype_device_consistency": _dtype_device_consistency,
+    **{
+        name: __import__(
+            "mayaworkbench.verification.math_invariants", fromlist=["builder_for"]
+        ).builder_for(name)
+        for name in __import__(
+            "mayaworkbench.verification.math_invariants", fromlist=["METHOD_INVARIANTS"]
+        ).METHOD_INVARIANTS
+    },
 }
 
 

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MayaWorkbench — control plane</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0f1115;--fg:#e8e9ed;--muted:#9aa0aa;--accent:#5cc8ff;--card:#191c22;--border:#2b303a}
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:16px 24px;border-bottom:1px solid var(--border)}h1{margin:0;font-size:18px}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;padding:20px;max-width:1400px;margin:auto}
+section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;min-height:120px}
+h2{font-size:14px;margin:0 0 10px;color:var(--accent)}pre{margin:0;white-space:pre-wrap;word-break:break-word;color:var(--muted);font-size:12px;max-height:320px;overflow:auto}
+button{background:var(--accent);color:#00121c;border:0;border-radius:4px;padding:6px 12px;cursor:pointer;font-weight:600}
+input{background:#0c0e12;color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px;width:70%}
+.row{display:flex;gap:8px;margin-bottom:8px}.muted{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<header><h1>MayaWorkbench — local control plane</h1><div class="muted">Evidence-first engineering workspace · loopback only · no auth in this local alpha</div></header>
+<main>
+<section><h2>Health</h2><pre id="health">loading…</pre></section>
+<section><h2>Projects / workspaces</h2><button onclick="refresh()">Refresh</button><pre id="projects"></pre></section>
+<section><h2>Tasks</h2><div class="row"><input id="taskId" placeholder="task id"><button onclick="loadTask()">Load</button></div><pre id="task"></pre></section>
+<section><h2>Approvals</h2><pre id="approvals">Select a task to inspect its approvals.</pre></section>
+<section><h2>Live events (durable cursor)</h2><div class="row"><input id="after" value="0" placeholder="after seq"><button onclick="connect()">Connect</button></div><pre id="events"></pre></section>
+<section><h2>Diff / evidence</h2><div class="row"><input id="runId" placeholder="run id"><button onclick="loadEvidence()">Load</button></div><pre id="evidence"></pre></section>
+</main>
+<script>
+const get=async p=>(await fetch(p)).json();
+async function refresh(){try{const h=await get('/health');document.getElementById('health').textContent=JSON.stringify(h,null,2);const p=await get('/projects');document.getElementById('projects').textContent=JSON.stringify(p,null,2);}catch(e){document.getElementById('health').textContent='error: '+e}}
+async function loadTask(){const id=document.getElementById('taskId').value.trim();if(!id)return;try{const t=await get('/tasks/'+encodeURIComponent(id));document.getElementById('task').textContent=JSON.stringify(t,null,2);}catch(e){document.getElementById('task').textContent='error: '+e}}
+async function loadEvidence(){const id=document.getElementById('runId').value.trim();if(!id)return;try{const r=await get('/verification/'+encodeURIComponent(id)+'/report');document.getElementById('evidence').textContent=JSON.stringify(r,null,2);}catch(e){document.getElementById('evidence').textContent='error: '+e}}
+let source=null;
+function connect(){if(source)source.close();const after=document.getElementById('after').value||'0';const out=document.getElementById('events');out.textContent='streaming from seq '+after+'\n';source=new EventSource('/events/stream?after='+encodeURIComponent(after));source.onmessage=e=>{out.textContent+=e.data+'\n';out.scrollTop=out.scrollHeight;const d=JSON.parse(e.data);if(d.seq)document.getElementById('after').value=d.seq;};source.onerror=()=>{out.textContent+='\n[stream ended; reconnect with fresh cursor]\n';source.close();};}
+refresh();
+</script>
+</body>
+</html>

@@ -8,6 +8,8 @@ the repository moves. The CLI never silently confirms anything.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 from mayaworkbench.domain.enums import MemoryAuthor, MemoryKind, MemoryStatus
 from mayaworkbench.domain.models import MemorySource
@@ -104,6 +106,79 @@ def register_memory_commands(sub: argparse._SubParsersAction) -> None:  # type: 
     export.add_argument("directory")
     export.add_argument("--project")
     export.set_defaults(func=cmd_memory_export)
+
+    audit = memory_sub.add_parser("audit", help="Report conflicting confirmed memories")
+    audit.add_argument("--project")
+    audit.set_defaults(func=cmd_memory_audit)
+    retention = memory_sub.add_parser("retention", help="Retract memories past their window")
+    retention.add_argument("--project")
+    retention.add_argument("--max-age-days", type=int, default=365)
+    retention.set_defaults(func=cmd_memory_retention)
+    bundle_export = memory_sub.add_parser("export-bundle", help="Export memories as JSON")
+    bundle_export.add_argument("--project")
+    bundle_export.add_argument("path")
+    bundle_export.set_defaults(func=cmd_memory_export_bundle)
+    bundle_import = memory_sub.add_parser("import-bundle", help="Import memories as unconfirmed")
+    bundle_import.add_argument("--project")
+    bundle_import.add_argument("path")
+    bundle_import.add_argument("--allow-conflicts", action="store_true")
+    bundle_import.set_defaults(func=cmd_memory_import_bundle)
+
+
+def cmd_memory_audit(args: argparse.Namespace) -> int:
+    from mayaworkbench.memory.advanced import find_conflicts
+
+    console = args.console
+    project = _services(args).resolve_project(args.project)
+    conflicts = find_conflicts(_services(args).memory_service, project.id)
+    payload = {"conflicts": conflicts}
+    console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_memory_retention(args: argparse.Namespace) -> int:
+    from mayaworkbench.memory.advanced import apply_retention
+
+    console = args.console
+    project = _services(args).resolve_project(args.project)
+    result = apply_retention(
+        _services(args).memory_service, project.id, max_age_days=args.max_age_days
+    )
+    payload = {"retracted": result}
+    console.json(payload) if console.json_mode else console.print(
+        f"Retracted {len(result)} memory item(s)"
+    )
+    return 0
+
+
+def cmd_memory_export_bundle(args: argparse.Namespace) -> int:
+    from mayaworkbench.memory.advanced import export_bundle
+
+    console = args.console
+    project = _services(args).resolve_project(args.project)
+    payload = export_bundle(_services(args).memory_service, project.id)
+    Path(args.path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    if not console.json_mode:
+        console.print(f"Exported {len(payload['memories'])} memory item(s) to {args.path}")
+    return 0
+
+
+def cmd_memory_import_bundle(args: argparse.Namespace) -> int:
+    from mayaworkbench.memory.advanced import import_bundle
+
+    console = args.console
+    project = _services(args).resolve_project(args.project)
+    payload = import_bundle(
+        _services(args).memory_service,
+        project.id,
+        json.loads(Path(args.path).read_text(encoding="utf-8")),
+        allow_conflicts=bool(args.allow_conflicts),
+    )
+    console.json(payload) if console.json_mode else console.print(
+        f"Imported {len(payload['created'])}, skipped {len(payload['skipped'])}, "
+        f"conflicts {len(payload['conflicts'])}"
+    )
+    return 0
 
 
 def cmd_memory_add(args: argparse.Namespace) -> int:

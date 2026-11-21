@@ -43,7 +43,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-mayaworkbench = ["py.typed"]
+mayaworkbench = ["py.typed", "api/ui/index.html"]
 "mayaworkbench.storage.migrations" = ["*.sql"]
 
 [tool.pytest.ini_options]

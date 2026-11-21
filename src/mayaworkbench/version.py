@@ -10,7 +10,7 @@ from __future__ import annotations
 MAYA_VERSION = "0.5.0"
 
 #: Bump whenever index output changes in a way that invalidates prior indexes.
-INDEXER_VERSION = "1.0.0"
+INDEXER_VERSION = "1.1.0"
 
 #: Version of the persisted domain/contract schemas (Task Contract, Claim, ...).
 CONTRACT_VERSION = "1.0"

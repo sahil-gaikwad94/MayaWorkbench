@@ -26,6 +26,7 @@ from mayaworkbench.errors import MayaError  # noqa: E402
 from mayaworkbench.experiments import stats  # noqa: E402
 from tests.conftest import git, write  # noqa: E402
 from tests.test_tool_gateway_runner import build_gateway  # noqa: E402
+from artifacts.adversarial._cli import maya_argv, maya_shell_command  # noqa: E402
 
 RESULTS: list[dict] = []
 
@@ -478,7 +479,7 @@ def main() -> int:
     # ------------------------------------------------------------- G. CLI
     def cli(*args, timeout=60):
         return subprocess.run(
-            [str(ROOT / ".venv" / "bin" / "maya"), "--home", str(home), *args],
+            maya_argv("--home", str(home), *args),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -512,7 +513,7 @@ def main() -> int:
 
     def g3():
         proc = subprocess.run(
-            f"{ROOT}/.venv/bin/maya --home {home} search --snapshot {snapshot.id} count_tokens | head -1",
+            f"{maya_shell_command(['--home', str(home), 'search', '--snapshot', snapshot.id, 'count_tokens'])} | head -1",
             shell=True,
             executable="/bin/bash",
             capture_output=True,

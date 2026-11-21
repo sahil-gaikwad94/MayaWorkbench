@@ -101,6 +101,26 @@ def command_ok():
     }
 
 
+def test_workflow_has_eighteen_backend_owned_states_and_valid_transitions(services, indexed, task_model):
+    from mayaworkbench.domain.enums import WorkflowState
+    from mayaworkbench.tasks.workflow import ALLOWED_TRANSITIONS
+
+    assert len(WorkflowState) == 18
+    for state, targets in ALLOWED_TRANSITIONS.items():
+        assert state not in targets or not state.is_terminal
+        for target in targets:
+            assert target in WorkflowState
+    assert WorkflowState.AWAITING_PLAN_REVIEW in ALLOWED_TRANSITIONS[WorkflowState.PLANNING]
+    assert WorkflowState.REPAIRING in ALLOWED_TRANSITIONS[WorkflowState.IMPLEMENTING]
+    assert WorkflowState.EVIDENCE_BUILDING in ALLOWED_TRANSITIONS[WorkflowState.REVIEWING]
+
+    task, contract = make_task(services, indexed)
+    task_model.actions = [finish_action()]
+    run = services.task_service.start_task(task.id).run
+    with pytest.raises(TaskError, match="Invalid workflow transition"):
+        services.workflow.transition(run.id, WorkflowState.COMPLETED)
+
+
 def test_approvals_are_required_scoped_single_use_and_expire(services, indexed, task_model):
     task, contract = make_task(services, indexed)
     task_model.actions = [finish_action()]

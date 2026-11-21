@@ -21,6 +21,7 @@ from mayaworkbench.models.gateway import ModelGateway  # noqa: E402
 from mayaworkbench.verification.registry import command_check  # noqa: E402
 from mayaworkbench.worker import Worker  # noqa: E402
 from tests.conftest import ScriptedTaskProvider, enable_virtual_model, git, write  # noqa: E402
+from artifacts.adversarial._cli import maya_argv  # noqa: E402
 
 RESULTS: list[dict] = []
 REMOTE_TOKEN = "ghp_AUDIT0123456789abcdefghijklmnopqrst"

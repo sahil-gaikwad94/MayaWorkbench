@@ -8,9 +8,17 @@ services.
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import Any
 
-from mayaworkbench.domain.enums import ClaimConfidence
+from mayaworkbench.domain.enums import (
+    ClaimConfidence,
+    ClaimExplicitness,
+    ClaimKind,
+    ClaimTargetKind,
+    ClaimType,
+)
 from mayaworkbench.errors import UsageError
 from mayaworkbench.research.ingestion import MetadataOverrides
 
@@ -67,8 +75,47 @@ def register_research_commands(sub: argparse._SubParsersAction) -> None:  # type
     claims = research_sub.add_parser("claims", help="List extracted claims")
     claims.add_argument("--project")
     claims.add_argument("--document")
+    claims.add_argument("--kind", choices=[item.value for item in ClaimKind])
     claims.add_argument("--limit", type=int, default=100)
     claims.set_defaults(func=cmd_research_claims)
+
+    claim = research_sub.add_parser("claim", help="Author a typed claim")
+    claim_sub = claim.add_subparsers(dest="claim_command", metavar="<action>")
+    claim_add = claim_sub.add_parser("add", help="Add a typed claim node")
+    claim_add.add_argument("--project")
+    claim_add.add_argument("--kind", choices=[item.value for item in ClaimKind], required=True)
+    claim_add.add_argument(
+        "--explicitness",
+        choices=[item.value for item in ClaimExplicitness],
+        default=ClaimExplicitness.EXPLICIT.value,
+    )
+    claim_add.add_argument("--title", required=True)
+    claim_add.add_argument("--statement", required=True)
+    claim_add.add_argument("--document")
+    claim_add.add_argument("--quote", default="")
+    claim_add.add_argument("--validation-id", action="append", default=[])
+    claim_add.add_argument("--uncertainty", action="append", default=[])
+    claim_add.add_argument("--target-resource", action="append", default=[])
+    claim_add.add_argument("--parent")
+    claim_add.set_defaults(func=cmd_research_claim_add)
+
+    search = research_sub.add_parser("search", help="Search literature metadata")
+    search.add_argument("--project")
+    search.add_argument("query")
+    search.add_argument("--provider", default="memory")
+    search.add_argument("--limit", type=int, default=5)
+    search.add_argument("--save", action="store_true")
+    search.add_argument("--document-key")
+    search.set_defaults(func=cmd_research_search)
+
+    ocr = research_sub.add_parser("ocr", help="Run explicit OCR into a separate artifact")
+    ocr.add_argument("document_id")
+    ocr.set_defaults(func=cmd_research_ocr)
+
+    versions = research_sub.add_parser("versions", help="List immutable source versions")
+    versions.add_argument("--project")
+    versions.add_argument("key")
+    versions.set_defaults(func=cmd_research_versions)
 
     memo = research_sub.add_parser("memo", help="Build a source-linked research memo")
     memo.add_argument("--project")
@@ -312,7 +359,10 @@ def cmd_research_claims(args: argparse.Namespace) -> int:
     svc = _services(args)
     project = svc.resolve_project(args.project)
     claims = svc.claim_service.list_claims(
-        project_id=project.id, document_id=args.document, limit=args.limit
+        project_id=project.id,
+        document_id=args.document,
+        kind=ClaimKind(args.kind) if getattr(args, "kind", None) else None,
+        limit=args.limit,
     )
     payload = {"claims": [claim.model_dump(mode="json") for claim in claims]}
     if console.json_mode:
@@ -334,6 +384,113 @@ def cmd_research_claims(args: argparse.Namespace) -> int:
         ],
         max_column=55,
     )
+    return 0
+
+
+def cmd_research_claim_add(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    project = svc.resolve_project(args.project)
+    targets: list[dict[str, Any]] = []
+    for raw in args.target_resource:
+        parts = raw.split(":", 2)
+        if len(parts) < 2:
+            raise UsageError(
+                f"--target-resource expects KIND:path[:symbol], got {raw!r}"
+            )
+        item: dict[str, Any] = {"kind": parts[0].upper(), "path": parts[1]}
+        if len(parts) == 3:
+            item["symbol"] = parts[2]
+        targets.append(item)
+    claim = svc.claim_service.add_claim(
+        project.id,
+        kind=ClaimKind(args.kind),
+        explicitness=ClaimExplicitness(args.explicitness),
+        title=args.title,
+        statement=args.statement,
+        document_id=args.document,
+        quote=args.quote,
+        validation_ids=args.validation_id,
+        uncertainty=args.uncertainty,
+        target_resources=targets,
+        parent_claim_id=args.parent,
+    )
+    if console.json_mode:
+        console.json({"claim": claim.model_dump(mode="json")})
+    else:
+        console.print(f"Created {claim.kind.value} claim {claim.id}")
+    return 0
+
+
+def cmd_research_search(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    project = svc.resolve_project(args.project)
+    result = svc.discovery_service.search(
+        project,
+        args.query,
+        provider=args.provider,
+        limit=args.limit,
+        save=bool(args.save),
+        document_key=args.document_key,
+    )
+    payload = {
+        "provider": result.provider,
+        "query": result.query,
+        "hits": [hit.model_dump(mode="json") for hit in result.hits],
+        "saved": [item.model_dump(mode="json") for item in result.saved],
+    }
+    if console.json_mode:
+        console.json(payload)
+    else:
+        console.table(
+            ["title", "doi", "published"],
+            [(hit.title, hit.doi or "", hit.published or "") for hit in result.hits],
+        )
+    return 0
+
+
+def cmd_research_ocr(args: argparse.Namespace) -> int:
+    from mayaworkbench.domain.enums import ArtifactKind
+    from mayaworkbench.research.ocr import UnavailableOcrAdapter
+
+    console = args.console
+    svc = _services(args)
+    document = svc.documents.get(args.document_id)
+    adapter = UnavailableOcrAdapter()
+    if not adapter.available():
+        console.error(
+            "No OCR engine is configured; OCR is an explicit opt-in capability",
+            code="RUNTIME_UNAVAILABLE",
+            hint="Install pdftoppm and tesseract, then use the injected adapter in code.",
+        )
+        return 1
+    source = Path(svc.artifacts.resolve_path(document.document_artifact_id))
+    result = adapter.extract(source)
+    artifact = svc.artifacts.put_text(
+        json.dumps(result.as_dict(), ensure_ascii=False, indent=2),
+        kind=ArtifactKind.SOURCE_OCR,
+    )
+    payload = {"artifact_id": artifact.id, **result.as_dict()}
+    console.json(payload) if console.json_mode else console.print(
+        f"OCR artifact {artifact.id} with {len(result.pages)} page(s), "
+        "never merged into exact quotes"
+    )
+    return 0
+
+
+def cmd_research_versions(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    project = svc.resolve_project(args.project)
+    payload = svc.discovery_service.versions(project, args.key)
+    if console.json_mode:
+        console.json(payload)
+    else:
+        console.print(
+            f"Source key {args.key}: {len(payload.get('documents', []))} document "
+            f"version(s), {len(payload.get('source_metadata', []))} metadata record(s)"
+        )
     return 0
 
 

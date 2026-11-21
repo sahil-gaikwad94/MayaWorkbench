@@ -369,6 +369,28 @@ def register_experiment_commands(sub: argparse._SubParsersAction) -> None:  # ty
     verify.add_argument("directory")
     verify.set_defaults(func=cmd_experiment_verify_bundle)
 
+    adapter = experiment_sub.add_parser(
+        "export-adapter", help="Export a comparison to MLflow or TensorBoard format"
+    )
+    adapter.add_argument("comparison_id")
+    adapter.add_argument("--format", choices=["mlflow", "tensorboard"], required=True)
+    adapter.add_argument("--out", required=True)
+    adapter.set_defaults(func=cmd_experiment_export_adapter)
+
+
+def cmd_experiment_export_adapter(args: argparse.Namespace) -> int:
+    from mayaworkbench.experiments.adapters import export_adapter
+
+    console = args.console
+    svc = _services(args)
+    comparison = svc.experiment_store.get_comparison(args.comparison_id).model_dump(mode="json")
+    files = export_adapter(comparison, format=args.format, directory=args.out)
+    payload = {"format": args.format, "files": files, "attestation": "UNATTESTED"}
+    console.json(payload) if console.json_mode else console.print(
+        f"Exported {args.format} adapter to {args.out}"
+    )
+    return 0
+
 
 # ------------------------------------------------------------------ create
 def cmd_experiment_create(args: argparse.Namespace) -> int:

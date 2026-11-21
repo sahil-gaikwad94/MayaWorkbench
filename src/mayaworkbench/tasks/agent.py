@@ -171,6 +171,7 @@ class ControlledAgent:
         self.orientation = orientation
         self.events = events
         self._invalid_actions = 0
+        self._last_parse_errors: list[str] = []
         self._recent_failures: list[str] = []
         self._consecutive_failures = 0
         self._check_rounds = 0
@@ -882,17 +883,23 @@ class ControlledAgent:
         }
 
     def _parse_action(self, structured: dict[str, Any] | None, text: str) -> AgentAction:
-        payload = structured
-        if payload is None:
-            payload = _extract_json(text)
-        if not isinstance(payload, dict):
-            raise ValueError("model response was not a JSON object")
-        return AgentAction.model_validate(payload)
+        from mayaworkbench.tasks.llm_capabilities import repair_structured_output
+        from mayaworkbench.tasks.agent_models import AgentAction
+
+        if structured is not None:
+            return AgentAction.model_validate(structured)
+        action, errors = repair_structured_output(text, AgentAction, retry=None)
+        self._last_parse_errors = errors
+        if action is None:
+            raise ValueError("; ".join(errors) or "invalid model output")
+        return action
 
     def _details(self, run: WorkflowRun | None = None) -> dict[str, Any]:
         current = run or self.runs.get(self.run.id)
         details = dict(current.details)
         details.pop("agent_last_error", None)
+        if self._last_parse_errors:
+            details["agent_parse_errors"] = list(self._last_parse_errors[-5:])
         return details
 
     def _event(self, event_type: EventType, *, payload: dict[str, Any]) -> None:
