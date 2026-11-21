@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, TypeVar
 
 from mayaworkbench.clock import to_iso, utcnow
@@ -48,6 +48,13 @@ from mayaworkbench.domain.models import (
     ApprovalRequest,
     ExecutionWorkspace,
     EvidenceLink,
+    ExperimentComparison,
+    ExperimentDefinition,
+    ExperimentManifest,
+    ExperimentRun,
+    MemorySource,
+    MetricObservation,
+    ProjectMemory,
     Task,
     TaskContract,
     TaskDiff,
@@ -1644,6 +1651,7 @@ class ContractStore:
         "verification_checks": ("verification_checks_json", []),
         "required_approvals": ("required_approvals_json", []),
     }
+    BOOL = ("require_experiment",)
 
     def __init__(self, db: Database):
         self.db = db
@@ -1652,7 +1660,7 @@ class ContractStore:
         _insert(
             self.db,
             "task_contracts",
-            _model_to_row(contract, json_fields=self.JSON),
+            _model_to_row(contract, json_fields=self.JSON, bool_fields=self.BOOL),
         )
         return contract
 
@@ -1660,7 +1668,9 @@ class ContractStore:
         row = self.db.fetchone("SELECT * FROM task_contracts WHERE id = ?", (contract_id,))
         if row is None:
             raise NotFoundError(f"Task contract not found: {contract_id}")
-        return _row_to_model(TaskContract, row, json_fields=self.JSON)
+        return _row_to_model(
+            TaskContract, row, json_fields=self.JSON, bool_fields=self.BOOL
+        )
 
     def latest(self, task_id: str) -> TaskContract:
         row = self.db.fetchone(
@@ -1669,14 +1679,19 @@ class ContractStore:
         )
         if row is None:
             raise NotFoundError(f"Task has no contract: {task_id}")
-        return _row_to_model(TaskContract, row, json_fields=self.JSON)
+        return _row_to_model(
+            TaskContract, row, json_fields=self.JSON, bool_fields=self.BOOL
+        )
 
     def list_by_task(self, task_id: str) -> list[TaskContract]:
         rows = self.db.fetchall(
             "SELECT * FROM task_contracts WHERE task_id = ? ORDER BY version",
             (task_id,),
         )
-        return [_row_to_model(TaskContract, row, json_fields=self.JSON) for row in rows]
+        return [
+            _row_to_model(TaskContract, row, json_fields=self.JSON, bool_fields=self.BOOL)
+            for row in rows
+        ]
 
     def next_version(self, task_id: str) -> int:
         row = self.db.fetchone(
@@ -1687,6 +1702,507 @@ class ContractStore:
 
     def count(self) -> int:
         return int(self.db.fetchone("SELECT COUNT(*) FROM task_contracts")[0])
+
+
+class ExperimentStore:
+    """Experiment definitions, pre-run manifests, runs, observations, comparisons.
+
+    Definitions and manifests are immutable content records. Approval state on a
+    definition is the only mutable field, and it is versioned by the definition's
+    own content hash: approving a different hash is a different decision.
+    """
+
+    DEFINITION_JSON = {
+        "command": ("command_json", []),
+        "seeds": ("seeds_json", []),
+        "metrics": ("metrics_json", []),
+        "metrics_source": ("metrics_source_json", {}),
+        "protocol": ("protocol_json", {}),
+        "treatment_dimensions": ("treatment_json", []),
+        "allowed_variation": ("variation_json", []),
+        "budget": ("budget_json", {}),
+        "details": ("details_json", {}),
+    }
+    MANIFEST_JSON = {
+        "command": ("command_json", []),
+        "limits": ("limits_json", {}),
+        "environment": ("environment_json", {}),
+        "verified_inputs": ("verified_inputs_json", {}),
+        "protocol": ("protocol_json", {}),
+        "details": ("details_json", {}),
+    }
+    MANIFEST_BOOL = ("includes_worktree_patch",)
+    RUN_JSON = {
+        "command": ("command_json", []),
+        "details": ("details_json", {}),
+    }
+    RUN_BOOL = ("timed_out", "blocked", "cancelled", "metrics_ingested", "workspace_kept")
+    COMPARISON_JSON = {
+        "findings": ("findings_json", []),
+        "metrics": ("metrics_json", []),
+        "baseline_run_ids": ("baseline_run_ids_json", []),
+        "candidate_run_ids": ("candidate_run_ids_json", []),
+        "limitations": ("limitations_json", []),
+        "details": ("details_json", {}),
+    }
+    COMPARISON_BOOL = ("comparable",)
+    OBSERVATION_JSON = {"details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    # ---------------------------------------------------------- definitions
+    def create_definition(self, definition: ExperimentDefinition) -> ExperimentDefinition:
+        _insert(
+            self.db,
+            "experiment_definitions",
+            _model_to_row(definition, json_fields=self.DEFINITION_JSON),
+        )
+        return definition
+
+    def get_definition(self, experiment_id: str) -> ExperimentDefinition:
+        row = self.db.fetchone(
+            "SELECT * FROM experiment_definitions WHERE id = ?", (experiment_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Experiment {experiment_id!r} does not exist")
+        return _row_to_model(
+            ExperimentDefinition, row, json_fields=self.DEFINITION_JSON
+        )
+
+    def list_definitions(
+        self,
+        *,
+        project_id: str | None = None,
+        task_id: str | None = None,
+        role: str | None = None,
+        limit: int = 50,
+    ) -> list[ExperimentDefinition]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if role:
+            clauses.append("role = ?")
+            params.append(role)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.db.fetchall(
+            f"SELECT * FROM experiment_definitions {where} "
+            "ORDER BY created_at DESC LIMIT ?",
+            params,
+        )
+        return [
+            _row_to_model(ExperimentDefinition, row, json_fields=self.DEFINITION_JSON)
+            for row in rows
+        ]
+
+    def update_definition_approval(
+        self,
+        experiment_id: str,
+        *,
+        status: str,
+        approved_by: str | None,
+        approved_at: Any,
+        approval_sha256: str | None,
+        revoked_reason: str | None = None,
+    ) -> None:
+        self.db.execute(
+            "UPDATE experiment_definitions SET status = ?, approved_by = ?, approved_at = ?, "
+            "approval_sha256 = ?, revoked_reason = ? WHERE id = ?",
+            (
+                status,
+                approved_by,
+                to_iso(approved_at) if approved_at is not None else None,
+                approval_sha256,
+                revoked_reason,
+                experiment_id,
+            ),
+        )
+
+    # ------------------------------------------------------------ manifests
+    def create_manifest(self, manifest: ExperimentManifest) -> ExperimentManifest:
+        _insert(
+            self.db,
+            "experiment_manifests",
+            _model_to_row(
+                manifest,
+                json_fields=self.MANIFEST_JSON,
+                bool_fields=self.MANIFEST_BOOL,
+            ),
+        )
+        return manifest
+
+    def get_manifest(self, manifest_id: str) -> ExperimentManifest:
+        row = self.db.fetchone(
+            "SELECT * FROM experiment_manifests WHERE id = ?", (manifest_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Experiment manifest {manifest_id} does not exist")
+        return _row_to_model(
+            ExperimentManifest,
+            row,
+            json_fields=self.MANIFEST_JSON,
+            bool_fields=self.MANIFEST_BOOL,
+        )
+
+    def manifest_for(self, experiment_id: str, seed: int, attempt: int) -> ExperimentManifest:
+        row = self.db.fetchone(
+            "SELECT * FROM experiment_manifests WHERE experiment_id = ? AND seed = ? "
+            "AND attempt = ?",
+            (experiment_id, seed, attempt),
+        )
+        if row is None:
+            raise NotFoundError(
+                f"No manifest for experiment {experiment_id} seed {seed} attempt {attempt}"
+            )
+        return _row_to_model(
+            ExperimentManifest,
+            row,
+            json_fields=self.MANIFEST_JSON,
+            bool_fields=self.MANIFEST_BOOL,
+        )
+
+    # ----------------------------------------------------------------- runs
+    def next_attempt(self, experiment_id: str, seed: int) -> int:
+        row = self.db.fetchone(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM experiment_runs "
+            "WHERE experiment_id = ? AND seed = ?",
+            (experiment_id, seed),
+        )
+        return int(row[0]) if row else 1
+
+    def create_run(self, run: ExperimentRun) -> ExperimentRun:
+        _insert(
+            self.db,
+            "experiment_runs",
+            _model_to_row(run, json_fields=self.RUN_JSON, bool_fields=self.RUN_BOOL),
+        )
+        return run
+
+    def update_run(self, run_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        data: dict[str, Any] = {}
+        for field, value in fields.items():
+            column = self.RUN_JSON.get(field, (field, None))[0]
+            if field in self.RUN_JSON:
+                data[column] = _dump_json(value)
+            elif field in self.RUN_BOOL:
+                data[field] = 1 if value else 0
+            elif isinstance(value, datetime):
+                data[field] = to_iso(value)
+            else:
+                data[field] = value
+        assignments = ", ".join(f"{column} = :{column}" for column in data)
+        data["run_id"] = run_id
+        self.db.execute(
+            f"UPDATE experiment_runs SET {assignments} WHERE id = :run_id", data
+        )
+
+    def get_run(self, run_id: str) -> ExperimentRun:
+        row = self.db.fetchone("SELECT * FROM experiment_runs WHERE id = ?", (run_id,))
+        if row is None:
+            raise NotFoundError(f"Experiment run {run_id} does not exist")
+        return _row_to_model(
+            ExperimentRun, row, json_fields=self.RUN_JSON, bool_fields=self.RUN_BOOL
+        )
+
+    def list_runs(self, experiment_id: str) -> list[ExperimentRun]:
+        rows = self.db.fetchall(
+            "SELECT * FROM experiment_runs WHERE experiment_id = ? "
+            "ORDER BY seed, attempt",
+            (experiment_id,),
+        )
+        return [
+            _row_to_model(
+                ExperimentRun, row, json_fields=self.RUN_JSON, bool_fields=self.RUN_BOOL
+            )
+            for row in rows
+        ]
+
+    def latest_runs_by_seed(self, experiment_id: str) -> dict[int, ExperimentRun]:
+        """Latest attempt for every seed. Earlier attempts remain inspectable."""
+        rows = self.db.fetchall(
+            "SELECT * FROM experiment_runs WHERE experiment_id = ? "
+            "ORDER BY seed, attempt DESC",
+            (experiment_id,),
+        )
+        out: dict[int, ExperimentRun] = {}
+        for row in rows:
+            run = _row_to_model(
+                ExperimentRun, row, json_fields=self.RUN_JSON, bool_fields=self.RUN_BOOL
+            )
+            out.setdefault(run.seed, run)
+        return out
+
+    def list_runs_for_task(self, task_id: str) -> list[ExperimentRun]:
+        rows = self.db.fetchall(
+            "SELECT * FROM experiment_runs WHERE task_id = ? ORDER BY started_at",
+            (task_id,),
+        )
+        return [
+            _row_to_model(
+                ExperimentRun, row, json_fields=self.RUN_JSON, bool_fields=self.RUN_BOOL
+            )
+            for row in rows
+        ]
+
+    # ----------------------------------------------------------- observations
+    def add_observations(
+        self, run: ExperimentRun, observations: list[MetricObservation]
+    ) -> None:
+        """Insert observations and mark the run ingested atomically.
+
+        Deterministic observation ids make a second ingestion of the same run a
+        conflict instead of duplicating evidence.
+        """
+        rows = [
+            _model_to_row(item, json_fields=self.OBSERVATION_JSON)
+            for item in observations
+        ]
+        with self.db.transaction():
+            _insert_many(self.db, "metric_observations", rows)
+            self.db.execute(
+                "UPDATE experiment_runs SET metrics_ingested = 1, observation_count = ? "
+                "WHERE id = ?",
+                (len(observations), run.id),
+            )
+
+    def observations_for_run(self, run_id: str) -> list[MetricObservation]:
+        rows = self.db.fetchall(
+            "SELECT * FROM metric_observations WHERE run_id = ? "
+            "ORDER BY metric_key, sample_index",
+            (run_id,),
+        )
+        return [
+            _row_to_model(MetricObservation, row, json_fields=self.OBSERVATION_JSON)
+            for row in rows
+        ]
+
+    def observations_for_experiment(
+        self, experiment_id: str, *, metric_key: str | None = None
+    ) -> list[MetricObservation]:
+        if metric_key:
+            rows = self.db.fetchall(
+                "SELECT * FROM metric_observations WHERE experiment_id = ? "
+                "AND metric_key = ? ORDER BY run_id, sample_index",
+                (experiment_id, metric_key),
+            )
+        else:
+            rows = self.db.fetchall(
+                "SELECT * FROM metric_observations WHERE experiment_id = ? "
+                "ORDER BY run_id, metric_key, sample_index",
+                (experiment_id,),
+            )
+        return [
+            _row_to_model(MetricObservation, row, json_fields=self.OBSERVATION_JSON)
+            for row in rows
+        ]
+
+    def observation_count(self, experiment_id: str) -> int:
+        return int(
+            self.db.fetchone(
+                "SELECT COUNT(*) FROM metric_observations WHERE experiment_id = ?",
+                (experiment_id,),
+            )[0]
+        )
+
+    # ---------------------------------------------------------- comparisons
+    def create_comparison(self, comparison: ExperimentComparison) -> ExperimentComparison:
+        _insert(
+            self.db,
+            "experiment_comparisons",
+            _model_to_row(
+                comparison,
+                json_fields=self.COMPARISON_JSON,
+                bool_fields=self.COMPARISON_BOOL,
+            ),
+        )
+        return comparison
+
+    def get_comparison(self, comparison_id: str) -> ExperimentComparison:
+        row = self.db.fetchone(
+            "SELECT * FROM experiment_comparisons WHERE id = ?", (comparison_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Experiment comparison {comparison_id} does not exist")
+        return _row_to_model(
+            ExperimentComparison,
+            row,
+            json_fields=self.COMPARISON_JSON,
+            bool_fields=self.COMPARISON_BOOL,
+        )
+
+    def list_comparisons(
+        self,
+        *,
+        project_id: str | None = None,
+        candidate_experiment_id: str | None = None,
+        task_id: str | None = None,
+        limit: int = 50,
+    ) -> list[ExperimentComparison]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if candidate_experiment_id:
+            clauses.append("candidate_experiment_id = ?")
+            params.append(candidate_experiment_id)
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.db.fetchall(
+            f"SELECT * FROM experiment_comparisons {where} "
+            "ORDER BY created_at DESC LIMIT ?",
+            params,
+        )
+        return [
+            _row_to_model(
+                ExperimentComparison,
+                row,
+                json_fields=self.COMPARISON_JSON,
+                bool_fields=self.COMPARISON_BOOL,
+            )
+            for row in rows
+        ]
+
+    def latest_comparison_for_task(self, task_id: str) -> ExperimentComparison | None:
+        rows = self.list_comparisons(task_id=task_id, limit=1)
+        return rows[0] if rows else None
+
+    def count_definitions(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM experiment_definitions")[0])
+
+    def count_runs(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM experiment_runs")[0])
+
+
+class MemoryStore:
+    """Durable project knowledge with relational provenance links."""
+
+    JSON = {"details": ("details_json", {})}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, memory: ProjectMemory) -> ProjectMemory:
+        row = _model_to_row(memory, json_fields=self.JSON)
+        # Sources are their own table; they are not a column on the record.
+        row.pop("sources", None)
+        with self.db.transaction():
+            _insert(self.db, "project_memories", row)
+            self._insert_sources(memory)
+        return memory
+
+    def _insert_sources(self, memory: ProjectMemory) -> None:
+        rows = []
+        for source in memory.sources:
+            rows.append(
+                {
+                    "id": "msrc_"
+                    + short_hash(
+                        f"{memory.id}:{source.kind}:{source.ref}:{source.sha256}", 32
+                    ),
+                    "memory_id": memory.id,
+                    "kind": source.kind,
+                    "ref": source.ref,
+                    "sha256": source.sha256,
+                    "note": source.note,
+                    "created_at": to_iso(utcnow()),
+                }
+            )
+        _insert_many(self.db, "memory_sources", rows)
+
+    def get(self, memory_id: str) -> ProjectMemory:
+        row = self.db.fetchone(
+            "SELECT * FROM project_memories WHERE id = ?", (memory_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Memory {memory_id!r} does not exist")
+        memory = _row_to_model(ProjectMemory, row, json_fields=self.JSON)
+        memory.sources = self.sources_for(memory.id)
+        return memory
+
+    def sources_for(self, memory_id: str) -> list[MemorySource]:
+        rows = self.db.fetchall(
+            "SELECT kind, ref, sha256, note FROM memory_sources WHERE memory_id = ? "
+            "ORDER BY created_at, id",
+            (memory_id,),
+        )
+        return [MemorySource.model_validate(dict(row)) for row in rows]
+
+    def list(
+        self,
+        *,
+        project_id: str,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[ProjectMemory]:
+        clauses = ["project_id = ?"]
+        params: list[Any] = [project_id]
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        params.append(limit)
+        rows = self.db.fetchall(
+            f"SELECT * FROM project_memories WHERE {' AND '.join(clauses)} "
+            "ORDER BY created_at DESC LIMIT ?",
+            params,
+        )
+        memories = [_row_to_model(ProjectMemory, row, json_fields=self.JSON) for row in rows]
+        for memory in memories:
+            memory.sources = self.sources_for(memory.id)
+        return memories
+
+    def set_status(self, memory_id: str, status: str, *, note: str = "") -> None:
+        details = self.get(memory_id).details
+        if note:
+            details = {**details, "status_note": note[:2000]}
+        self.db.execute(
+            "UPDATE project_memories SET status = ?, updated_at = ?, last_validated_at = ?, "
+            "details_json = ? WHERE id = ?",
+            (
+                status,
+                to_iso(utcnow()),
+                to_iso(utcnow()),
+                _dump_json(details),
+                memory_id,
+            ),
+        )
+
+    def delete(self, memory_id: str) -> None:
+        self.db.execute("DELETE FROM project_memories WHERE id = ?", (memory_id,))
+
+    def mark_stale_by_commit(self, *, repository_id: str, current_commit: str) -> list[str]:
+        """Mark confirmed commit-scoped memories whose revision is no longer current.
+
+        Only ``CONFIRMED`` items are touched: an unconfirmed hypothesis does not
+        become stale by being unconfirmed, and a retracted item stays retracted.
+        """
+        rows = self.db.fetchall(
+            "SELECT id FROM project_memories WHERE repository_id = ? AND commit_sha IS NOT NULL "
+            "AND commit_sha <> ? AND status = 'CONFIRMED'",
+            (repository_id, current_commit),
+        )
+        ids = [str(row["id"]) for row in rows]
+        for memory_id in ids:
+            self.set_status(memory_id, "STALE", note=f"repository is now at {current_commit}")
+        return ids
+
+    def count(self) -> int:
+        return int(self.db.fetchone("SELECT COUNT(*) FROM project_memories")[0])
 
 
 class PlanStore:
@@ -2512,7 +3028,13 @@ class VerificationStore:
         grouped: dict[str, list[VerificationFinding]] = {}
         for row in finding_rows:
             data = dict(row)
-            for extra in ("verification_id", "check_id", "run_id", "created_at"):
+            for extra in (
+                "id",
+                "verification_id",
+                "check_id",
+                "run_id",
+                "created_at",
+            ):
                 data.pop(extra, None)
             for field, (column, default) in self.FINDING_JSON.items():
                 data[field] = _load_json(data.pop(column, None), default)
@@ -2554,7 +3076,13 @@ class VerificationStore:
         findings: list[VerificationFinding] = []
         for row in rows:
             data = dict(row)
-            for extra in ("verification_id", "check_id", "run_id", "created_at"):
+            for extra in (
+                "id",
+                "verification_id",
+                "check_id",
+                "run_id",
+                "created_at",
+            ):
                 data.pop(extra, None)
             for field, (column, default) in self.FINDING_JSON.items():
                 data[field] = _load_json(data.pop(column, None), default)
@@ -2661,5 +3189,7 @@ __all__ = [
     "ReviewStore",
     "WorkerJobStore",
     "VerificationStore",
+    "ExperimentStore",
+    "MemoryStore",
     "like_pattern",
 ]

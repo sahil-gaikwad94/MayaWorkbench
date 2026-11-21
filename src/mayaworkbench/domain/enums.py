@@ -130,6 +130,14 @@ class ArtifactKind(StrEnum):
     TEST_INTEGRITY_REPORT = "TEST_INTEGRITY_REPORT"
     MODEL_REVIEW = "MODEL_REVIEW"
     EVIDENCE_BUNDLE = "EVIDENCE_BUNDLE"
+    # Phase 5 — Experiment Lab and durable memory
+    EXPERIMENT_PROTOCOL = "EXPERIMENT_PROTOCOL"
+    EXPERIMENT_MANIFEST = "EXPERIMENT_MANIFEST"
+    EXPERIMENT_OUTPUT = "EXPERIMENT_OUTPUT"
+    EXPERIMENT_METRICS = "EXPERIMENT_METRICS"
+    EXPERIMENT_REPORT = "EXPERIMENT_REPORT"
+    EXPERIMENT_BUNDLE = "EXPERIMENT_BUNDLE"
+    PROJECT_MEMORY = "PROJECT_MEMORY"
     OTHER = "OTHER"
 
 
@@ -217,6 +225,9 @@ class EventType(StrEnum):
     WORKER_LEASE_ACQUIRED = "WORKER_LEASE_ACQUIRED"
     WORKER_LEASE_LOST = "WORKER_LEASE_LOST"
     WORKER_FINISHED = "WORKER_FINISHED"
+    # Phase 6 — deterministic feedback inside the agent loop
+    AGENT_CHECK_COMPLETED = "AGENT_CHECK_COMPLETED"
+    AGENT_REPAIR_REQUESTED = "AGENT_REPAIR_REQUESTED"
     # Phase 4 — verification and evidence
     VERIFICATION_STARTED = "VERIFICATION_STARTED"
     VERIFICATION_CHECK_COMPLETED = "VERIFICATION_CHECK_COMPLETED"
@@ -225,6 +236,21 @@ class EventType(StrEnum):
     VERIFICATION_OVERRIDDEN = "VERIFICATION_OVERRIDDEN"
     MODEL_REVIEW_COMPLETED = "MODEL_REVIEW_COMPLETED"
     EVIDENCE_BUNDLE_EXPORTED = "EVIDENCE_BUNDLE_EXPORTED"
+    # Phase 5 — Experiment Lab and durable memory
+    EXPERIMENT_CREATED = "EXPERIMENT_CREATED"
+    EXPERIMENT_APPROVED = "EXPERIMENT_APPROVED"
+    EXPERIMENT_REVOKED = "EXPERIMENT_REVOKED"
+    EXPERIMENT_RUN_STARTED = "EXPERIMENT_RUN_STARTED"
+    EXPERIMENT_RUN_COMPLETED = "EXPERIMENT_RUN_COMPLETED"
+    EXPERIMENT_RUN_FAILED = "EXPERIMENT_RUN_FAILED"
+    EXPERIMENT_RUN_BLOCKED = "EXPERIMENT_RUN_BLOCKED"
+    EXPERIMENT_METRICS_INGESTED = "EXPERIMENT_METRICS_INGESTED"
+    EXPERIMENT_COMPARED = "EXPERIMENT_COMPARED"
+    EXPERIMENT_BUNDLE_EXPORTED = "EXPERIMENT_BUNDLE_EXPORTED"
+    MEMORY_CREATED = "MEMORY_CREATED"
+    MEMORY_UPDATED = "MEMORY_UPDATED"
+    MEMORY_DELETED = "MEMORY_DELETED"
+    MEMORY_STALE = "MEMORY_STALE"
 
 
 # ------------------------------------------------------------ task workflow
@@ -582,6 +608,144 @@ class FindingSeverity(StrEnum):
     BLOCKER = "BLOCKER"
 
 
+# -------------------------------------------------- experiments (Phase 5)
+class ExperimentRole(StrEnum):
+    """Which arm of a comparison an experiment belongs to (§14.2)."""
+
+    BASELINE = "BASELINE"
+    CANDIDATE = "CANDIDATE"
+    ABLATION = "ABLATION"
+
+
+class ExperimentProfile(StrEnum):
+    """Compute profiles from §14.5.
+
+    Phase 5 executes ``CPU_SMOKE`` and ``SMALL_VALIDATION`` locally. ``STATIC``
+    means "provenance only, metrics supplied externally" (a user-owned GPU run);
+    ``FULL_EXPERIMENT`` and ``LARGE_TRAINING`` are declared but refused locally
+    rather than silently treated as a small run.
+    """
+
+    STATIC = "STATIC"
+    CPU_SMOKE = "CPU_SMOKE"
+    SMALL_VALIDATION = "SMALL_VALIDATION"
+    FULL_EXPERIMENT = "FULL_EXPERIMENT"
+    LARGE_TRAINING = "LARGE_TRAINING"
+
+
+class ExperimentStatus(StrEnum):
+    """Approval state of an experiment definition."""
+
+    DRAFT = "DRAFT"
+    APPROVED = "APPROVED"
+    REVOKED = "REVOKED"
+
+
+class ExperimentRunStatus(StrEnum):
+    """Lifecycle of one execution attempt of one seed."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    TIMED_OUT = "TIMED_OUT"
+    CANCELLED = "CANCELLED"
+
+
+class MetricDirection(StrEnum):
+    """Which direction is better. This is a declared property, never inferred."""
+
+    HIGHER_IS_BETTER = "HIGHER_IS_BETTER"
+    LOWER_IS_BETTER = "LOWER_IS_BETTER"
+    NEUTRAL = "NEUTRAL"
+
+
+class MetricAggregation(StrEnum):
+    """How multiple raw observations inside one run become one replicate value."""
+
+    LAST = "LAST"
+    MEAN = "MEAN"
+    MEDIAN = "MEDIAN"
+    MAX = "MAX"
+    MIN = "MIN"
+    SUM = "SUM"
+
+
+class MetricsSourceKind(StrEnum):
+    """How a run's metrics are obtained.
+
+    ``IMPORTED`` means the metrics were produced outside this workbench (for
+    example a user-owned GPU run) and ingested with their provenance; it is
+    never presented as a locally executed measurement.
+    """
+
+    JSON_FILE = "JSON_FILE"
+    STDOUT_JSON = "STDOUT_JSON"
+    STDOUT_JSONL = "STDOUT_JSONL"
+    IMPORTED = "IMPORTED"
+
+
+class ExperimentDesign(StrEnum):
+    """Statistical design chosen from the observed pairing structure."""
+
+    PAIRED = "PAIRED"
+    UNPAIRED = "UNPAIRED"
+
+
+class ExperimentVerdict(StrEnum):
+    """Outcome of a fair comparison. Never a claim of scientific truth."""
+
+    INCONCLUSIVE = "INCONCLUSIVE"
+    NOT_COMPARABLE = "NOT_COMPARABLE"
+    NO_DETECTABLE_DIFFERENCE = "NO_DETECTABLE_DIFFERENCE"
+    CANDIDATE_ADVANTAGE = "CANDIDATE_ADVANTAGE"
+    BASELINE_ADVANTAGE = "BASELINE_ADVANTAGE"
+    CANDIDATE_NON_INFERIOR = "CANDIDATE_NON_INFERIOR"
+
+
+class ProtocolComparison(StrEnum):
+    """Classification of one protocol field difference (§14.3)."""
+
+    MATCH = "MATCH"
+    EXPECTED_TREATMENT = "EXPECTED_TREATMENT"
+    ACCEPTABLE_VARIATION = "ACCEPTABLE_VARIATION"
+    FAIRNESS_VIOLATION = "FAIRNESS_VIOLATION"
+
+
+class MemoryKind(StrEnum):
+    """Durable project knowledge categories (§15.1)."""
+
+    FACT = "FACT"
+    DECISION = "DECISION"
+    CONVENTION = "CONVENTION"
+    NEGATIVE_RESULT = "NEGATIVE_RESULT"
+    EXPERIMENT_RESULT = "EXPERIMENT_RESULT"
+    LIMITATION = "LIMITATION"
+
+
+class MemoryStatus(StrEnum):
+    """Epistemic status of a memory record.
+
+    ``UNCONFIRMED`` is where model-authored or inferred items start; repetition
+    never promotes one to ``CONFIRMED``. ``STALE`` means the pinned revision it
+    described is no longer the current one.
+    """
+
+    UNCONFIRMED = "UNCONFIRMED"
+    CONFIRMED = "CONFIRMED"
+    STALE = "STALE"
+    RETRACTED = "RETRACTED"
+
+
+class MemoryAuthor(StrEnum):
+    """Who asserted a memory item."""
+
+    USER = "USER"
+    MODEL = "MODEL"
+    SYSTEM = "SYSTEM"
+
+
 class RetentionClass(StrEnum):
     """How long an artifact should live.
 
@@ -644,4 +808,17 @@ __all__ = [
     "CriterionStatus",
     "TaskDecision",
     "FindingSeverity",
+    "ExperimentRole",
+    "ExperimentProfile",
+    "ExperimentStatus",
+    "ExperimentRunStatus",
+    "MetricDirection",
+    "MetricAggregation",
+    "MetricsSourceKind",
+    "ExperimentDesign",
+    "ExperimentVerdict",
+    "ProtocolComparison",
+    "MemoryKind",
+    "MemoryStatus",
+    "MemoryAuthor",
 ]

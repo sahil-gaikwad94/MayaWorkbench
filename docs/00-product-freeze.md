@@ -1,6 +1,6 @@
 # Product freeze (Phase 0)
 
-Status: frozen for Phase 0/1/2. Changes require a documented decision record in
+Status: frozen for Phase 0–5. Changes require a documented decision record in
 [docs/adr/](adr/) and an update to the affected contract schemas.
 
 ## 1. Who this is for
@@ -29,8 +29,11 @@ dashboards, or automated merge bots.
 | J6 | "What does this paper require, and how much of it does the code actually implement?" | Summaries that merge the paper, guesses and code into one confident story |
 
 J7–J9 (task contracts, isolated worktrees, verified patches) are implemented in
-Phases 3–4. Labelled corpora and evaluation scoring are specified but not
-implemented; the evidence records needed to score runs now exist.
+Phases 3–4. Phase 5 adds the follow-on job "is the candidate actually better,
+and can I reproduce that claim?" through pre-registered experiments and
+reproduction bundles, plus scoped memory for decisions and negative results.
+Labelled corpora and evaluation scoring are specified but not implemented; the
+evidence records needed to score runs now exist.
 
 ## 3. Product principles (non-negotiable)
 
@@ -138,6 +141,25 @@ contract schemas, evaluation plan, CLI/UI flow, gap analysis, ADRs.
 - Fixed decision rules, per-criterion evidence assessment, an evidence graph,
   hashed JSON/Markdown reports and a self-verifying export bundle.
 
+### Phase 5 — Experiment Lab and memory (implemented)
+
+- Immutable, content-hashed experiment definitions approved before execution;
+  any change creates a new definition.
+- One replicate per run, with a manifest hashed before the command starts and
+  observed input hashes recorded.
+- Fairness classification of the protocol surface; undeclared drift yields
+  `NOT_COMPARABLE`, unknown fields become limitations.
+- Fixed statistics: paired t when seeds match, Welch otherwise, Holm for
+  secondaries, Hedges' g, constant-difference handling.
+- Conservative verdicts (`INCONCLUSIVE`, `NO_DETECTABLE_DIFFERENCE`,
+  `CANDIDATE_ADVANTAGE`, `BASELINE_ADVANTAGE`, `CANDIDATE_NON_INFERIOR`).
+- Reproduction bundles with per-arm commits, file hashes and verification.
+- Verification Gate F (`task_contracts.require_experiment`,
+  `experiment.evidence`) makes an approved comparison mandatory evidence.
+- Scoped project memory (`FACT`, `DECISION`, `NEGATIVE_RESULT`) where only the
+  user confirms, provenance is validated, secrets are refused and commit-scoped
+  memories become `STALE`.
+
 ### Explicitly out of scope
 
 Multi-repository reasoning, embeddings/vector search, hosted service,
@@ -180,6 +202,18 @@ measured numbers on the fixture repository rather than extrapolating.
 | Test weakening is visible | detectable patterns produce warnings with path/line | `test_verification_evidence.py` |
 | Reports are reproducible | append-only attempts; bundle hashes verify | bundle tamper tests |
 | No silent acceptance | missing/blocked checks yield `INCONCLUSIVE`/`BLOCKED` | decision matrix tests |
+
+### Phase 5 success criteria
+
+| Criterion | Target | Verified by |
+| --- | --- | --- |
+| No post-hoc protocol | definition hash covers protocol, metrics, seeds and command; edits create a new definition | definition immutability tests |
+| Honest comparison | undeclared protocol drift yields `NOT_COMPARABLE`; unknowns are limitations | comparison tests, real-repo bundle |
+| No fabricated significance | constant differences have no p-value; underpowered samples are `INCONCLUSIVE` | stats/comparison tests |
+| Reproducible claim | bundle hashes verify and records both arm commits | cross-commit bundle test |
+| Correctness not traded for speed | a declared secondary can contradict the primary without upgrading it | comparison tests |
+| No self-confirmed memory | model/system memories stay `UNCONFIRMED` until the user confirms | `test_memory.py` |
+| Gate F cannot be bypassed | missing/inconclusive experiment evidence blocks or limits acceptance | verification Gate F tests |
 
 ## 6. Constraints and decisions already made
 

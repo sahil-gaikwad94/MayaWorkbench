@@ -118,6 +118,20 @@ BUILTIN_CHECKS: tuple[BuiltinCheck, ...] = (
         ),
     ),
     BuiltinCheck(
+        key="experiment.evidence",
+        gate=VerificationGate.EXPERIMENT,
+        title="A fair experiment supports the claimed metric effect",
+        method=VerificationMethod.EXPERIMENT,
+        required=False,
+        description=(
+            "Finds the latest fair comparison attached to the task, reports its "
+            "verdict and primary-metric interval, and treats it as required "
+            "evidence only when the contract sets require_experiment. A fair "
+            "comparison that favours the baseline is a failure only then; "
+            "otherwise it is a warning that downgrades the decision."
+        ),
+    ),
+    BuiltinCheck(
         key="report.integrity",
         gate=VerificationGate.REPORT,
         title="Every reported success links to recorded evidence",

@@ -127,6 +127,7 @@ class VerificationService:
         invocations: InvocationStore,
         store: VerificationStore,
         gateway: ModelGateway,
+        experiments: Any = None,
     ):
         self.home = Path(home)
         self.db = db
@@ -148,6 +149,9 @@ class VerificationService:
         self.invocations = invocations
         self.store = store
         self.gateway = gateway
+        # Phase 5 Gate F. Optional so the verification engine still works in a
+        # deployment without the Experiment Lab enabled.
+        self.experiments = experiments
 
     # ------------------------------------------------------------------ public
     def latest_report(self, run_id: str) -> VerificationReport | None:
@@ -278,6 +282,10 @@ class VerificationService:
                 )
             )
             checks.append(self._test_integrity(run, diff, workspace, attempt))
+            experiment_check, experiment_summary = self._experiment_evidence(
+                run, contract, attempt
+            )
+            checks.append(experiment_check)
             review_result = self._review(
                 run=run,
                 task=task,
@@ -331,6 +339,7 @@ class VerificationService:
                 limitations=limitations,
                 reviewer=reviewer_details,
                 declared_specs=declared,
+                experiment=experiment_summary,
             )
             report_json = json.dumps(
                 payload, indent=2, sort_keys=True, ensure_ascii=False
@@ -1425,6 +1434,236 @@ class VerificationService:
         )
 
     # ---------------------------------------------------------- report integrity
+    def _experiment_evidence(
+        self,
+        run: WorkflowRun,
+        contract: TaskContract,
+        attempt: VerificationRun,
+    ) -> tuple[VerificationCheck, dict[str, Any] | None]:
+        """Gate F: is there a fair experiment supporting a metric claim?
+
+        The check never interprets the metric beyond its declared direction and
+        primary status. A fair experiment that favours the baseline is recorded
+        as a failure only when the contract explicitly requires one; otherwise
+        it is a warning that downgrades the decision.
+        """
+        from mayaworkbench.domain.enums import ExperimentVerdict
+
+        task = self.tasks.get(run.task_id)
+        required = bool(contract.require_experiment)
+        base = dict(
+            run=run,
+            task=task,
+            attempt=attempt,
+            key="experiment.evidence",
+            gate=VerificationGate.EXPERIMENT,
+            kind=CheckKind.DETERMINISTIC,
+            title="A fair experiment supports the claimed metric effect",
+            method=VerificationMethod.EXPERIMENT,
+            required=required,
+        )
+        comparison = None
+        if self.experiments is not None:
+            comparison = self.experiments.latest_comparison_for_task(run.task_id)
+        if comparison is None:
+            findings = []
+            if required:
+                findings.append(
+                    VerificationFinding(
+                        severity=FindingSeverity.ERROR,
+                        code="EXPERIMENT_REQUIRED_MISSING",
+                        message=(
+                            "The contract requires a comparable experiment, but no "
+                            "comparison is attached to this task."
+                        ),
+                    )
+                )
+            return (
+                self._record(
+                    **base,
+                    outcome=CheckOutcome.INCONCLUSIVE
+                    if required
+                    else CheckOutcome.NOT_APPLICABLE,
+                    summary=(
+                        "no experiment comparison is attached to this task"
+                        + ("; the contract requires one" if required else "")
+                    ),
+                    findings=findings,
+                    details={
+                        "mandatory": required,
+                        "comparison_id": None,
+                        "requirement": "contract.require_experiment",
+                    },
+                ),
+                None,
+            )
+
+        primary = next(
+            (item for item in comparison.metrics if item.primary),
+            comparison.metrics[0] if comparison.metrics else None,
+        )
+        observations = (
+            len(primary.baseline_values) + len(primary.candidate_values)
+            if primary
+            else 0
+        )
+        findings: list[VerificationFinding] = []
+        verdict = comparison.verdict
+        candidate_definition = None
+        if self.experiments is not None:
+            try:
+                candidate_definition = self.experiments.resolve(
+                    comparison.candidate_experiment_id
+                )
+            except Exception:  # noqa: BLE001 - the comparison is still inspectable
+                candidate_definition = None
+        commit_mismatch = bool(
+            candidate_definition is not None
+            and run.base_commit_sha
+            and candidate_definition.base_commit_sha != run.base_commit_sha
+        )
+        if commit_mismatch:
+            outcome = CheckOutcome.INCONCLUSIVE
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.ERROR
+                    if required
+                    else FindingSeverity.WARNING,
+                    code="EXPERIMENT_COMMIT_MISMATCH",
+                    message=(
+                        "The experiment was evaluated at "
+                        f"{candidate_definition.base_commit_sha[:12]}, but this run "
+                        f"started from {run.base_commit_sha[:12]}; it does not "
+                        "measure the verified revision."
+                    ),
+                )
+            )
+        elif not comparison.comparable:
+            outcome = CheckOutcome.INCONCLUSIVE
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.ERROR
+                    if required
+                    else FindingSeverity.WARNING,
+                    code="EXPERIMENT_NOT_COMPARABLE",
+                    message=(
+                        "The attached experiment has undeclared protocol differences, "
+                        "so its numbers are not a fair comparison."
+                    ),
+                )
+            )
+        elif verdict == ExperimentVerdict.INCONCLUSIVE:
+            outcome = CheckOutcome.INCONCLUSIVE
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.ERROR
+                    if required
+                    else FindingSeverity.WARNING,
+                    code="EXPERIMENT_INCONCLUSIVE",
+                    message="The attached comparison produced no usable verdict.",
+                )
+            )
+        elif verdict == ExperimentVerdict.BASELINE_ADVANTAGE:
+            outcome = CheckOutcome.FAILED if required else CheckOutcome.PARTIAL
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.ERROR
+                    if required
+                    else FindingSeverity.WARNING,
+                    code="EXPERIMENT_FAVORS_BASELINE",
+                    message=(
+                        "The declared primary metric favours the baseline arm on a "
+                        "fair comparison."
+                    ),
+                )
+            )
+        else:
+            outcome = CheckOutcome.PASSED
+            if verdict == ExperimentVerdict.NO_DETECTABLE_DIFFERENCE:
+                findings.append(
+                    VerificationFinding(
+                        severity=FindingSeverity.WARNING,
+                        code="EXPERIMENT_NO_DETECTABLE_DIFFERENCE",
+                        message=(
+                            "The comparison found no detectable difference; this is not "
+                            "evidence that the arms are equivalent."
+                        ),
+                    )
+                )
+            elif verdict == ExperimentVerdict.CANDIDATE_NON_INFERIOR:
+                findings.append(
+                    VerificationFinding(
+                        severity=FindingSeverity.WARNING,
+                        code="EXPERIMENT_NON_INFERIOR_ONLY",
+                        message=(
+                            "Non-inferiority was assessed only on the declared primary "
+                            "metric and margin."
+                        ),
+                    )
+                )
+        imported = bool(
+            any(
+                "outside this workbench" in item
+                for item in comparison.limitations
+            )
+        )
+        if imported:
+            findings.append(
+                VerificationFinding(
+                    severity=FindingSeverity.WARNING,
+                    code="EXPERIMENT_IMPORTED_RUNS",
+                    message=(
+                        "At least one experiment run was produced outside this "
+                        "workbench; its environment was not verified here."
+                    ),
+                )
+            )
+        primary_summary = "not reported"
+        if primary is not None:
+            primary_summary = (
+                f"{primary.key}: baseline {primary.baseline_mean} -> candidate "
+                f"{primary.candidate_mean} (diff {primary.difference}, 95% CI "
+                f"{primary.ci_low} to {primary.ci_high}, n="
+                f"{len(primary.candidate_values)}/{len(primary.baseline_values)})"
+            )
+        summary = f"{verdict.value}: {primary_summary}"
+        details = {
+            "mandatory": required,
+            "comparison_id": comparison.id,
+            "verdict": verdict.value,
+            "comparable": comparison.comparable,
+            "design": comparison.design.value,
+            "observations": observations,
+            "commit_mismatch": commit_mismatch,
+            "experiment_commit_sha": candidate_definition.base_commit_sha
+            if candidate_definition
+            else None,
+            "run_base_commit_sha": run.base_commit_sha,
+            "json_sha256": comparison.json_sha256,
+            "primary_metric": primary.model_dump(mode="json") if primary else None,
+            "limitations": comparison.limitations[:20],
+        }
+        check = self._record(
+            **base,
+            outcome=outcome,
+            summary=summary,
+            artifact_id=comparison.report_artifact_id,
+            findings=findings,
+            details=details,
+        )
+        experiment_summary = {
+            "comparison_id": comparison.id,
+            "verdict": verdict.value,
+            "comparable": comparison.comparable,
+            "design": comparison.design.value,
+            "observations": observations,
+            "primary_summary": primary_summary,
+            "limitations": comparison.limitations[:20],
+            "json_sha256": comparison.json_sha256,
+            "bundle_files": [],
+        }
+        return check, experiment_summary
+
     def _report_integrity(
         self,
         run: WorkflowRun,
@@ -1897,6 +2136,11 @@ class VerificationService:
             indent=2,
             sort_keys=True,
         ).encode()
+        if self.experiments is not None:
+            experiment_documents, _summary = self.experiments.collect_for_verification(
+                run.task_id
+            )
+            payloads.update(experiment_documents)
         plan_artifact_id = attempt.details.get("plan_artifact_id")
         if plan_artifact_id:
             payloads["verification-plan.json"] = self.artifacts.read_bytes(plan_artifact_id)

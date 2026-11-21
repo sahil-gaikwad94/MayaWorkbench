@@ -63,7 +63,12 @@ from mayaworkbench.indexing.languages import (
 from mayaworkbench.indexing.python_parser import ParsedModule, parse_python
 from mayaworkbench.indexing.resolve import EdgeResolver, clean_target_name
 from mayaworkbench.observability.logging import get_logger
-from mayaworkbench.repositories.discovery import Candidate, DiscoveryPolicy, inspect_content
+from mayaworkbench.repositories.discovery import (
+    Candidate,
+    DiscoveryPolicy,
+    decode_indexable_text,
+    inspect_content,
+)
 from mayaworkbench.repositories.snapshots import RepositoryService
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.db import Database
@@ -386,13 +391,15 @@ class Indexer:
             collector.skipped += 1
             return
         try:
-            text = data.decode("utf-8")
+            # Honours a UTF-8 or UTF-16 byte-order mark; without this a UTF-8 BOM
+            # reaches ast.parse as U+FEFF and turns a valid file into PARSE_ERROR.
+            text = decode_indexable_text(data)
         except UnicodeDecodeError:  # pragma: no cover - inspect_content already filtered
             batch.issues.append(
                 _issue(
                     snapshot.id,
                     IssueKind.ENCODING_ERROR,
-                    "content is not valid UTF-8",
+                    "content is not decodable text",
                     path=candidate.path,
                 )
             )

@@ -13,6 +13,8 @@ CLI (argparse, rendering)
         ├── qa/            prompts, citation validation, answer pipeline
         ├── research/      documents, passages, claims, DAG, readiness, memos
         ├── mapping/       claim signals, evidence discovery, rule pack
+        ├── experiments/   protocols, runner, statistics, comparison, bundles
+        ├── memory/        scoped statements, confirmation, staleness
         ├── models/        provider gateway and adapters
         └── storage/       SQLite, stores, artifact store
               └── domain/  enums and persisted models (no I/O)
@@ -58,6 +60,15 @@ together, which is what makes the providers replaceable in tests.
 | `mapping/signals.py` | Whole-token behavioural signals | Prose never counts as code evidence |
 | `mapping/rules.py` | Deterministic mapping rule pack | `PRESENT` needs definition-level code evidence |
 | `mapping/service.py` | Mapping persistence, evidence, adjudication | Evidence is re-verified against the snapshot |
+| `experiments/protocol.py` | Comparable protocol surface and fairness classification | An undeclared difference is `NOT_COMPARABLE` |
+| `experiments/runner.py` | Manifest-hashed execution in a fresh worktree | Inputs verified before the command starts |
+| `experiments/metrics.py` | Metric extraction from stdout/JSON/CSV | A missing declared metric makes the run unusable |
+| `experiments/stats.py` | t distribution, t-tests, Hedges' g, Holm | No p-value is fabricated for zero variance |
+| `experiments/comparison.py` | Verdicts, paired/Welch design, effect sizes | The primary metric alone drives the verdict |
+| `experiments/report.py` | Markdown/JSON experiment report | Every claim is tied to declared metrics and runs |
+| `experiments/bundle.py` | Reproduction export and verification | Both arm commits and every file hash are checked |
+| `experiments/service.py` | Definition, run, compare, memory orchestration | Definitions are immutable and approval is explicit |
+| `memory/service.py` | Scoped project statements and provenance | Only the user confirms; commit-scoped memory goes `STALE` |
 
 ## 3. Lifecycles
 
@@ -271,7 +282,70 @@ the only writer of run state; `task finish` refuses to accept a run without a
 report and gates on the fixed decision rules (with an explicit, recorded
 `--override`).
 
-## 10. Deliberate non-architecture
+## 10. Experiments and memory (Phase 5)
+
+```text
+ExperimentService
+  |-- definition ---> content hash, DRAFT -> APPROVED (user) -> REVOKED
+  |-- plan ----------> blockers, unknown protocol fields
+  |-- run -----------> manifest (hashed before execution)
+  |                    -> fresh worktree at the pinned snapshot
+  |                    -> input hash verification (script, declared files)
+  |                    -> CommandRunner (offline, rlimits, timeout)
+  |                    -> metrics extracted; observations appended
+  |-- compare -------> protocol classification
+  |                    -> paired t (same seeds) or Welch
+  |                    -> Holm for secondaries; Hedges' g
+  |                    -> verdict + limitations
+  |-- bundle --------> definitions, comparison, manifests, observations,
+  |                    outputs, report; per-arm commits; root hash
+  v
+experiment_definitions / manifests / runs / metric_observations / comparisons
+  |
+  v
+verification Gate F (`experiment.evidence`) and project_memories
+```
+
+A definition is a pre-registration: it is content-addressed, approved by the
+user, and never edited. Each run executes one seed in a fresh worktree and
+records its own manifest; the manifest is hashed before the command starts, so
+a run cannot rewrite its provenance after seeing a result. The comparison
+classifies every protocol field (`MATCH`, `EXPECTED_TREATMENT`,
+`UNEXPECTED_TREATMENT`, `MISSING`, `UNKNOWN`) and only uses the difference
+statistics fixed by the definition. Verification Gate F consumes a comparison as
+mandatory evidence when the task contract asks for one.
+
+Memory is a separate, deliberately narrow store: `FACT`, `DECISION` and
+`NEGATIVE_RESULT` statements with provenance. Model-authored and
+comparison-derived entries are `UNCONFIRMED`; only the user confirms them. A
+memory pinned to a commit becomes `STALE` when the project moves on, and secrets
+are refused before storage.
+
+## 11. Inside the agent loop (Phase 6)
+
+`ControlledAgent` remains one role, one action, one step. Phase 6 adds four
+things around that loop:
+
+- `tasks/orientation.py` builds a bounded `repository_orientation` payload from
+the pinned index for the first steps: retrieval spans for the goal, top-level
+symbols in the allowed paths, relevant test files and index issues that make a
+file unreliable evidence. It is an aid, never a gate, and it says it describes
+the base revision.
+- `tasks/inloop.py` owns `DeclaredCheckRunner`. When a `finish` action arrives it
+runs the contract's checks through the same `CommandRunner` as verification,
+classifies each result as a code failure or an infrastructure failure, and
+either returns typed repair feedback (bounded rounds) or records the limitation.
+It never writes `verification_checks` rows.
+- the loop derives `workspace_ledger` from the audited `ToolCall` rows instead of
+storing it, so pause/resume and prompt truncation cannot lose what the run
+already did;
+- repeated read-only actions are refused before they consume a tool call and the
+run blocks after four identical attempts.
+
+The model-facing authority is unchanged: the gateway validates every argument,
+approvals are consumed records, and the path policy resolves every path.
+
+## 12. Deliberate non-architecture
 
 - No plugin loading from repositories (would execute untrusted code).
 - No daemon, no background indexing, no file watcher (Phase 1 is explicit

@@ -1,8 +1,9 @@
 # Threat model
 
-Phase 1 runs locally, on one machine, over repositories the user chose to
-attach. This model covers that surface. Multi-user, hosted and agent-execution
-threats are listed as out of scope with the Phase 3/4 controls they will need.
+MayaWorkbench runs locally, on one machine, over repositories the user chose to
+attach. This model covers that surface through Phase 5 (agent execution,
+verification and experiments). Multi-user and hosted threats are listed as out
+of scope with the controls they will need.
 
 ## 1. Assets
 
@@ -14,6 +15,8 @@ threats are listed as out of scope with the Phase 3/4 controls they will need.
 | Artifact store | Contains file content, patches, prompts' context, answer records |
 | Snapshot integrity | Every answer's truth depends on it |
 | Model budget | Remote calls cost money and can leak context |
+| Experiment definitions and results | A benchmark claim can be gamed by changing the metric or protocol after seeing numbers |
+| Project memory | Poisoned or over-confident statements could steer later work |
 
 ## 2. Trust boundaries
 
@@ -216,6 +219,26 @@ Implemented controls:
   string interpolation, and run under the same policy.
 - The reviewer is read-only, receives a bounded diff, and cannot execute tools or
   change deterministic results. Ungrounded model findings are rejected.
+- Phase 6 in-loop checks are contract data, not model output. `run_check` accepts
+  only declared keys and still requires the consumed `COMMAND_EXECUTION`
+  approval, so the agent gains a way to observe a verdict, not a way to choose
+  what runs.
+- Repair feedback is redacted with the same signature set as tool output and
+  bounded to an excerpt; the full round payload is a local artifact. The model
+  cannot mark a check as passed, and an infrastructure failure is attributed to
+  the checker rather than used as an invitation to edit code.
+- `find_symbol` filters excluded and credential-shaped paths before returning
+  anything, so index metadata cannot reveal what the other tools hide.
+- A Git remote URL that embeds credentials (the CI/credential-helper pattern
+  `https://x-access-token:…@host/org/repo.git`) is redacted before storage. The
+  repository keeps its host and path, attach warns that something was removed,
+  and neither the database nor the `REPOSITORY_ATTACHED` event contains the
+  token. Regression test: `tests/test_audit_findings.py`.
+- The gateway decodes UTF-8/UTF-16 BOM text, refuses UTF-32 and binary content,
+  labels lossy decodes, and refuses to patch a non-UTF-8 file, so an unusual
+  encoding cannot be used to smuggle content past the secret scan.
+- Paths containing C0/C1 controls, bidi overrides or line separators are refused
+  before resolution, which closes a display-spoofing route in diffs and logs.
 
 Residual risks:
 
@@ -224,6 +247,13 @@ Residual risks:
   Rlimits and path validation reduce accidents, not a determined escape.
 - **Approval scope is a hash of the command/plan, not a syscall sandbox.** An
   approved interpreter can still do whatever that program does.
+- **A remote token used with an older build is still in that database.**
+  Redaction applies at attach time; existing rows and backups are not rewritten,
+  so a previously stored token must be rotated rather than assumed gone.
+- **A repair loop runs declared checks earlier and more often.** Each command is
+  still approval-scoped, allowlisted, rlimited and time-bounded, and rounds are
+  capped, but a check that mutates external state would now do so during the run
+  as well as during verification. Checks should be read-only by contract.
 - **A malicious repository can attack the parser, Git, or an approved test run.**
   Only read-only Git commands are used and helpers are disabled, but Git and the
   Python interpreter are trusted.
@@ -235,7 +265,60 @@ Residual risks:
   whose manifest was rewritten by an attacker is not signed and cannot be
   distinguished from a fresh export.
 
-## 5. Out of scope (future phases)
+## 5. Experiment and memory boundaries (Phase 5)
+
+Experiment commands are arbitrary local programs. They run through the same
+`CommandRunner` as task checks: argv only, allowlisted executables, a fresh
+worktree, timeouts, process-group cleanup, output caps, rlimits and no network
+unless a network namespace can be created and verified. The manifest is hashed
+before execution and records the definition hash and the observed inputs, so a
+run cannot retroactively redefine what it measured.
+
+Implemented controls:
+
+- Definitions are immutable and content-addressed; only the user can approve
+  them, and any change requires a new definition.
+- The primary metric, direction, seed set and treatment dimensions are fixed
+  before execution. A protocol difference outside the declared treatment makes
+  the comparison `NOT_COMPARABLE`; a field unknown on both arms is recorded as
+  a limitation, never as a match.
+- Runs are one seed each. Metrics missing from the declared contract make the
+  run unusable rather than defaulting to zero; undeclared metrics are excluded
+  from the comparison with a warning.
+- Reproduction bundles hash every file and record the commit and patch per arm;
+  verification checks commands, seeds and commits agree. A single top-level
+  commit is only accepted when all arms used it.
+- Imported runs are explicitly `IMPORTED` and carry a limitation that their
+  environment was not verified here. They are evidence of what a user supplied,
+  not of a local execution.
+- Model-authored and comparison-derived memory is `UNCONFIRMED`; only the user
+  can confirm it. Provenance references are validated, secret-looking statements
+  are refused, and commit-scoped memory goes `STALE` rather than being reused
+  silently.
+
+Residual risks:
+
+- **A benchmark measures what it measures.** The lab prevents post-hoc metric
+  changes and undeclared protocol drift; it cannot tell whether the workload is
+  representative, whether the effect matters, or whether the command is honest
+  about the work it performs.
+- **Wall-clock results depend on the host.** The bundle records Python version,
+  CPU count and environment gaps, but a reproducer on another machine may get
+  different numbers. Unknown environment fields are limitations, not proof of
+  equivalence.
+- **Network isolation is a user namespace, not a kernel sandbox.** It removes
+  routes for the child; a local kernel or privileged escape is out of scope, as
+  in Phase 3/4.
+- **Imported results can be fabricated.** The limitation is explicit, but the
+  workbench has no way to authenticate an externally produced metrics document.
+- **A bundle is not signed.** `verify-bundle` recomputes hashes and rejects
+  modified or extra files; an attacker who rewrites the manifest along with the
+  files cannot be detected without an external trust anchor.
+- **Memory is not an authorization source.** Gate F and verification ignore
+  `UNCONFIRMED` memory; a user who confirms a false statement has authorized it
+  as context, not as evidence.
+
+## 6. Out of scope (future phases)
 
 - **Multi-user access control**: needs authentication, per-user scoping of rows
   and artifacts, and audit of shared resources.
@@ -244,7 +327,7 @@ Residual risks:
 - **Container/VM sandbox for approved commands**: the current boundary is the
   OS user plus rlimits, not an isolated kernel.
 
-## 6. Reporting
+## 7. Reporting
 
 This is a local developer tool with no security programme. If you find a
 weakness in the controls above, document the reproduction and treat the

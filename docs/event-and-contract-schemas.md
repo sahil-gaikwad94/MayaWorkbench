@@ -257,11 +257,32 @@ Every task event carries the project id and, where relevant, `task_id` and
 `COMMAND_BLOCKED`, `DIFF_CAPTURED`, `DIFF_REVIEWED`, `WORKER_STARTED`,
 `WORKER_LEASE_ACQUIRED`, `WORKER_LEASE_LOST` and `WORKER_FINISHED`.
 
-Exported JSON Schemas (bundle `1.2`) cover `Task`, `TaskContract`, `TaskPlan`,
+Exported JSON Schemas (bundle `1.4`) cover `Task`, `TaskContract`, `TaskPlan`,
 `WorkflowRun`, `ApprovalRequest`, `ExecutionWorkspace`, `ToolCall`, `TaskDiff`,
 `TaskReview` and `WorkerJob`. `AgentAction` and `PlanPayload` are the structured
 model contracts used by the worker; they are internal but versioned with
 `TASK_PROTOCOL_VERSION`.
+
+### Phase 6 additions to the agent protocol
+
+`AgentAction.tool` gains `run_check` (arguments `{key}`) and `find_symbol`
+(arguments `{query, limit}`). Neither adds authority: `run_check` resolves the
+key against the contract's declared checks and still requires the consumed
+`COMMAND_EXECUTION` approval, and `find_symbol` is read-only against the pinned
+index with excluded paths filtered out.
+
+Two event types extend the append-only log; the envelope is unchanged:
+
+- `AGENT_CHECK_COMPLETED` — `{round, verdict, duration_ms, checks:[{key,outcome}], artifact_id}`
+  for one advisory in-loop check round. The artifact is the full feedback
+  payload (`VERIFICATION_CHECK`, `in_loop: true`).
+- `AGENT_REPAIR_REQUESTED` — `{round, max_rounds, failed_checks, infrastructure_checks}`.
+
+In-loop results never create `verification_checks` rows and never change a
+`VerificationReport` decision. `WorkflowRun.details` carries
+`in_loop_check_rounds` (last five summaries), `in_loop_verdict`
+(`PASSED`/`FAILED`/`NO_VERDICT`/`NOT_AUTHORIZED`/`NOT_RUN`) and `in_loop_rounds`
+(the total executed).
 
 Safety-relevant payload rules:
 

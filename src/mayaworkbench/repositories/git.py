@@ -17,6 +17,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from mayaworkbench.errors import GitError
 from mayaworkbench.observability.logging import get_logger
@@ -24,6 +25,30 @@ from mayaworkbench.observability.logging import get_logger
 log = get_logger("repositories.git")
 
 DEFAULT_TIMEOUT = 120
+
+
+def redact_remote_url(url: str | None) -> tuple[str | None, bool]:
+    """Remove credentials embedded in a remote URL.
+
+    A checkout created by CI or a credential helper often has a token in the
+    remote (``https://x-access-token:ghp_...@host/org/repo.git``). Storing it
+    would copy a live credential into the workbench database, the event log and
+    any evidence bundle that quotes the repository. The redacted URL keeps the
+    host and path so the remote remains identifiable; the caller is told that
+    something was removed so it can warn the user.
+    """
+    if not url:
+        return url, False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url, False
+    if parts.username is None and parts.password is None:
+        return url, False
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment)), True
 
 
 @dataclass(frozen=True)

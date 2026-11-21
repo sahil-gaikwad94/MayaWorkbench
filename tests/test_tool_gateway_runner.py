@@ -28,6 +28,8 @@ def build_gateway(
     *,
     allow_delete=False,
     network_policy="ALLOW_WITH_APPROVAL",
+    excluded_paths=(),
+    symbol_lookup=None,
 ):
     task, contract = services.task_service.create_task(
         project_id=indexed.project.id,
@@ -72,6 +74,7 @@ def build_gateway(
     policy = PathPolicy(
         workspace,
         allowed_paths=["utils.py", "src", "tests"],
+        excluded_paths=excluded_paths,
         allow_file_deletion=allow_delete,
     )
     runner = CommandRunner(
@@ -99,6 +102,7 @@ def build_gateway(
         expected_write_spec=spec,
         command_approval=approvals[ApprovalAction.COMMAND_EXECUTION],
         expected_command_spec=spec,
+        symbol_lookup=symbol_lookup,
     )
     return gateway, workspace, run, contract, task
 

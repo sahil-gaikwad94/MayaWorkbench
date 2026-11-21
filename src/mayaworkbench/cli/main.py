@@ -257,6 +257,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Phase 2/3 command areas are registered by their own modules so a missing
     # area is caught by a parser test rather than by a user (MWB-001).
+    from mayaworkbench.cli.experiment_commands import register_experiment_commands
+    from mayaworkbench.cli.memory_commands import register_memory_commands
     from mayaworkbench.cli.research_commands import register_research_commands
     from mayaworkbench.cli.task_commands import register_task_commands
     from mayaworkbench.cli.verification_commands import register_verification_commands
@@ -264,6 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
     register_research_commands(sub)
     register_task_commands(sub)
     register_verification_commands(sub)
+    register_experiment_commands(sub)
+    register_memory_commands(sub)
 
     worker = sub.add_parser("worker", help="Run the durable task worker process")
     worker.add_argument("--once", action="store_true", help="Process one job and exit")
@@ -1456,6 +1460,16 @@ def cmd_schemas_export(args: argparse.Namespace) -> int:
         "ContextPack": ContextPack,
         "QaAnswerPayload": QaAnswerPayload,
         "ModelCitation": ModelCitation,
+        "TaskContract": domain_models.TaskContract,
+        "VerificationReport": domain_models.VerificationReport,
+        "VerificationCheck": domain_models.VerificationCheck,
+        "ExperimentDefinition": domain_models.ExperimentDefinition,
+        "ExperimentManifest": domain_models.ExperimentManifest,
+        "ExperimentRun": domain_models.ExperimentRun,
+        "MetricObservation": domain_models.MetricObservation,
+        "ExperimentComparison": domain_models.ExperimentComparison,
+        "ProjectMemory": domain_models.ProjectMemory,
+        "MemorySource": domain_models.MemorySource,
     }
     import hashlib
 
@@ -1538,6 +1552,18 @@ def cmd_db_info(args: argparse.Namespace) -> int:
         "workflow_events",
         "model_invocations",
         "qa_records",
+        "tasks",
+        "task_contracts",
+        "workflow_runs",
+        "verification_reports",
+        "verification_checks",
+        "experiment_definitions",
+        "experiment_manifests",
+        "experiment_runs",
+        "metric_observations",
+        "experiment_comparisons",
+        "project_memories",
+        "memory_sources",
     ):
         counts[table] = int(svc.db.fetchone(f"SELECT COUNT(*) FROM {table}")[0])
     size_bytes = svc.paths.db_path.stat().st_size if svc.paths.db_path.exists() else 0
@@ -1593,6 +1619,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 2
 
+    # A repository may contain paths or commit messages that are not valid in
+    # the terminal's encoding. Replacing the undecodable bytes keeps the command
+    # useful instead of aborting halfway through a table.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):  # pragma: no cover - exotic stream
+                pass
+
     from mayaworkbench.cli.output import Console
 
     args.console = Console(
@@ -1604,6 +1641,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return int(args.func(args) or 0)
+    except BrokenPipeError:
+        # `maya search ... | head` is normal shell usage, not a failure. Point the
+        # remaining writes at devnull so interpreter shutdown does not complain.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:  # pragma: no cover - defensive
+            pass
+        return 0
     except MayaError as exc:
         args.console.error(str(exc), hint=exc.hint, code=exc.code)
         if args.verbose and exc.detail:

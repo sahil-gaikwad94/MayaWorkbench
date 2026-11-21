@@ -44,7 +44,7 @@ from mayaworkbench.repositories.discovery import (
     discover_tree,
     discover_worktree,
 )
-from mayaworkbench.repositories.git import GitClient
+from mayaworkbench.repositories.git import GitClient, redact_remote_url
 from mayaworkbench.repositories.source import GitTreeSource, SnapshotSource, WorktreeSource
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.db import Database
@@ -121,6 +121,12 @@ class RepositoryService:
             return AttachResult(existing, created=False, warnings=warnings)
 
         head = git.head_commit()
+        remote_url, remote_had_credentials = redact_remote_url(git.remote_url())
+        if remote_had_credentials:
+            warnings.append(
+                "The configured remote URL embedded credentials; they were removed "
+                "before the URL was stored. Rotate the token if this workbench is shared."
+            )
         if head is None:
             warnings.append(
                 "The repository has no commits yet. Create a commit before pinning snapshots."
@@ -132,7 +138,7 @@ class RepositoryService:
             name=name or root.name or "repository",
             root_path=str(root),
             vcs="git",
-            remote_url=git.remote_url(),
+            remote_url=remote_url,
             default_branch=git.default_branch(),
             created_at=utcnow(),
             updated_at=utcnow(),
@@ -140,6 +146,7 @@ class RepositoryService:
                 "attached_path": str(requested.resolve()),
                 "git_version": git.version(),
                 "head_at_attach": head,
+                "remote_url_credentials_removed": remote_had_credentials,
             },
         )
         with self.db.transaction():

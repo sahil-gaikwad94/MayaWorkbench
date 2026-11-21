@@ -18,12 +18,14 @@ AgentTool = Literal[
     "read_file",
     "list_files",
     "search_text",
+    "find_symbol",
     "apply_patch",
     "write_file",
     "delete_file",
     "git_status",
     "git_diff",
     "run_command",
+    "run_check",
     "finish",
 ]
 

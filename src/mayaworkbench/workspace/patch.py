@@ -219,7 +219,45 @@ def _decode(data: bytes, path: str) -> str:
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise PatchError(f"file is not valid UTF-8: {path}") from exc
+        raise PatchError(
+            f"file is not valid UTF-8 and cannot be patched losslessly: {path}"
+        ) from exc
+
+
+def _first_mismatch(
+    actual: tuple[str, ...], expected: tuple[str, ...]
+) -> tuple[int, str, str]:
+    for position in range(max(len(actual), len(expected))):
+        left = actual[position] if position < len(actual) else "<end of file>"
+        right = expected[position] if position < len(expected) else "<absent>"
+        if left != right:
+            return position, left, right
+    return 0, "", ""
+
+
+def _mismatch_message(
+    path: str, index: int, actual: tuple[str, ...], expected: tuple[str, ...]
+) -> str:
+    """Explain *where* and *how* a hunk differs, not just that it failed.
+
+    A stale patch and a line-ending mismatch produce the same boolean result but
+    need different repairs. The diagnostic names the first differing line and
+    flags whitespace/CRLF-only differences so the model can re-read the right
+    range instead of blindly retrying the same patch.
+    """
+    position, left, right = _first_mismatch(actual, expected)
+    line_no = index + position + 1
+    detail = (
+        f"hunk does not match {path} at line {line_no}: "
+        f"expected {right!r}, found {left!r}"
+    )
+    if left.replace("\r\n", "\n").rstrip() == right.replace("\r\n", "\n").rstrip() and left != right:
+        detail += " (whitespace or line-ending difference)"
+    elif left.strip() == right.strip() and left != right:
+        detail += " (leading/trailing whitespace difference)"
+    if "\r\n" in "".join(actual) and "\r\n" not in "".join(expected):
+        detail += " (the file uses CRLF line endings; the patch does not)"
+    return detail + "; re-read the current file and regenerate the patch"
 
 
 def apply_file_patch(target: bytes, file_patch: FilePatch) -> bytes:
@@ -249,8 +287,7 @@ def apply_file_patch(target: bytes, file_patch: FilePatch) -> bytes:
         actual = tuple(original[index : index + hunk.old_len])
         if actual != hunk.old_lines:
             raise PatchError(
-                f"hunk does not match {file_patch.path} at line {index + 1}: "
-                "the patch is stale or has been modified"
+                _mismatch_message(file_patch.path, index, actual, hunk.old_lines)
             )
         output.extend(original[position:index])
         output.extend(hunk.new_lines)
@@ -263,6 +300,9 @@ def apply_file_patch(target: bytes, file_patch: FilePatch) -> bytes:
             raise PatchError(f"deletion patch adds content in {file_patch.path}")
         return b""
     result = "".join(output)
+    if "\x00" in result:
+        # A text patch must not smuggle binary content into a repository file.
+        raise PatchError(f"patched content for {file_patch.path} contains a null byte")
     if len(result.encode("utf-8")) > 5_000_000:
         raise PatchError(f"patched file exceeds 5 MB: {file_patch.path}")
     return result.encode("utf-8")
@@ -301,6 +341,7 @@ def apply_patch(
 
 __all__ = [
     "PatchError",
+    "_mismatch_message",
     "Hunk",
     "FilePatch",
     "AppliedFile",

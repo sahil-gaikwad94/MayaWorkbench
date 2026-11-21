@@ -26,7 +26,7 @@ import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from pydantic import Field, field_validator
 
@@ -62,16 +62,21 @@ from mayaworkbench.workspace.policy import (
 )
 from mayaworkbench.workspace.runner import CommandPolicy, CommandResult, CommandRunner
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mayaworkbench.tasks.inloop import DeclaredCheckRunner
+
 ToolName = Literal[
     "read_file",
     "list_files",
     "search_text",
+    "find_symbol",
     "apply_patch",
     "write_file",
     "delete_file",
     "git_status",
     "git_diff",
     "run_command",
+    "run_check",
 ]
 
 MAX_READ_BYTES = 300_000
@@ -90,6 +95,23 @@ _SECRET_PATTERNS = (
 
 class ToolBlocked(PolicyError):
     """A tool is unavailable under the task's authorization or scope."""
+
+
+def _dominant_eol(data: bytes) -> str:
+    """Return the line ending a file actually uses.
+
+    A file with both conventions falls back to LF: mixed endings are already
+    ambiguous, and silently converting half of them would be worse than leaving
+    the content as given.
+    """
+    crlf = data.count(b"\r\n")
+    bare_lf = data.count(b"\n") - crlf
+    bare_cr = data.count(b"\r") - crlf
+    if crlf and not bare_lf and not bare_cr:
+        return "\r\n"
+    if bare_cr and not crlf and not bare_lf:
+        return "\r"
+    return "\n"
 
 
 def redact(text: str) -> str:
@@ -154,6 +176,19 @@ class GitArgs(Record):
     pass
 
 
+class FindSymbolArgs(Record):
+    """Search the pinned snapshot's symbol index (read-only orientation)."""
+
+    query: str = Field(min_length=1, max_length=200)
+    limit: int = Field(default=10, ge=1, le=30)
+
+
+class RunCheckArgs(Record):
+    """Run one check that the immutable task contract already declares."""
+
+    key: str = Field(min_length=1, max_length=90)
+
+
 class RunCommandArgs(Record):
     argv: list[str] = Field(min_length=1, max_length=64)
     timeout_seconds: int = Field(default=120, ge=1, le=86_400)
@@ -202,6 +237,8 @@ class ToolGateway:
         command_approval: ApprovalRequest | None,
         expected_command_spec: str,
         cancel_requested: Any | None = None,
+        check_runner: "DeclaredCheckRunner | None" = None,
+        symbol_lookup: Callable[[str, int], list[dict[str, Any]]] | None = None,
     ):
         self.run = run
         self.task = task
@@ -217,6 +254,8 @@ class ToolGateway:
         self.command_approval = command_approval
         self.expected_command_spec = expected_command_spec
         self.cancel_requested = cancel_requested
+        self.check_runner = check_runner
+        self.symbol_lookup = symbol_lookup
         self._cancelled = False
 
     # ------------------------------------------------------------------ public
@@ -231,6 +270,8 @@ class ToolGateway:
             "git_status",
             "git_diff",
             "run_command",
+            "run_check",
+            "find_symbol",
         }:
             raise ToolError(f"unknown tool: {tool}")
         parsed = self._parse(tool, arguments)
@@ -320,6 +361,8 @@ class ToolGateway:
             "git_status": GitArgs,
             "git_diff": GitArgs,
             "run_command": RunCommandArgs,
+            "run_check": RunCheckArgs,
+            "find_symbol": FindSymbolArgs,
         }
         try:
             return models[tool].model_validate(arguments).model_dump(mode="json")
@@ -349,7 +392,7 @@ class ToolGateway:
         if tool == "run_command":
             argv = [redact(str(item)) for item in args.get("argv", [])]
             return {"argv": argv, "timeout_seconds": args.get("timeout_seconds")}
-        if tool == "search_text":
+        if tool in {"search_text", "find_symbol"}:
             return {**args, "query": redact(str(args.get("query", "")))}
         return dict(args)
 
@@ -398,8 +441,12 @@ class ToolGateway:
             return self._git_status()
         if tool == "git_diff":
             return self._git_diff()
+        if tool == "find_symbol":
+            return self._find_symbol(args)
         if tool == "run_command":
             return self._run_command(args, call)
+        if tool == "run_check":
+            return self._run_check(args)
         self._require_write()
         if tool == "apply_patch":
             return self._apply_patch(args)
@@ -417,12 +464,35 @@ class ToolGateway:
                 f"file is too large to read through the gateway ({len(data)} bytes); "
                 "use search_text or a line range on a smaller file"
             )
-        if b"\x00" in data[:8192]:
-            raise ToolError(f"refusing to read binary file: {args['path']}")
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ToolError(f"file is not valid UTF-8: {args['path']}") from exc
+        encoding = "utf-8"
+        replaced = 0
+        if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+            # UTF-32 also starts with the UTF-16 LE BOM; decoding it as UTF-16
+            # would return silent garbage instead of an honest refusal.
+            raise ToolError(
+                f"UTF-32 files are not supported by the gateway: {args['path']}"
+            )
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            # UTF-16 text is legible to a model and contains NUL bytes by
+            # construction, so the BOM is checked before the binary heuristic.
+            try:
+                text = data.decode("utf-16")
+                encoding = "utf-16"
+            except UnicodeDecodeError as exc:
+                raise ToolError(f"file has a UTF-16 byte-order mark but does not decode: {args['path']}") from exc
+        else:
+            if b"\x00" in data[:8192]:
+                raise ToolError(f"refusing to read binary file: {args['path']}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                # A latin-1 log or a stray byte should not make a whole file
+                # invisible. The lossy decode is labelled so the model never
+                # trusts the non-ASCII characters or edits through apply_patch
+                # (which refuses non-UTF-8 files).
+                text = data.decode("utf-8", errors="replace")
+                encoding = "utf-8-replaced"
+                replaced = text.count("\ufffd")
         lines = text.splitlines(keepends=True)
         start = args.get("start_line") or 1
         end = args.get("end_line") or len(lines)
@@ -430,20 +500,29 @@ class ToolGateway:
             raise ToolError("end_line must be >= start_line")
         if start > len(lines) and lines:
             raise ToolError(f"start_line {start} is past end of file ({len(lines)} lines)")
-        end = min(end, len(lines))
+        end = min(end, len(lines)) if lines else 0
         selected = "".join(lines[start - 1 : end])
         if len(selected.encode("utf-8")) > MAX_READ_BYTES:
             raise ToolError("requested line range exceeds the read size limit")
+        summary = f"Read {args['path']} lines {start}-{end} of {len(lines)}"
+        if encoding == "utf-16":
+            summary += " (UTF-16)"
+        elif encoding == "utf-8-replaced":
+            summary += (
+                f" (NOT valid UTF-8: {replaced} character(s) replaced; non-ASCII text is lossy)"
+            )
         return ToolResult(
             tool="read_file",
             status=ToolCallStatus.SUCCEEDED,
-            summary=f"Read {args['path']} lines {start}-{end} of {len(lines)}",
+            summary=summary,
             output=selected,
             data={
                 "path": args["path"],
                 "start_line": start,
                 "end_line": end,
                 "total_lines": len(lines),
+                "encoding": encoding,
+                "replacement_characters": replaced,
             },
         )
 
@@ -542,22 +621,48 @@ class ToolGateway:
         rel = args["path"]
         target = self.policy.writable_file(rel)
         content = args["content"]
-        data = content.encode("utf-8")
-        if len(data) > MAX_WRITE_BYTES:
-            raise ToolError(f"content exceeds {MAX_WRITE_BYTES} bytes")
-        if b"\x00" in data[:8192]:
-            raise ToolError("write_file only accepts UTF-8 text")
         if contains_secret_material(content):
             raise PolicyViolation(f"credential-shaped content is not writable: {rel}", path=rel)
         existed = target.exists()
         if existed and not args.get("overwrite"):
             raise ToolError(f"file exists; pass overwrite=true to replace it: {rel}")
+        notes: list[str] = []
+        eol = "lf"
+        bom_preserved = False
+        if existed:
+            existing = target.read_bytes()
+            existing_eol = _dominant_eol(existing)
+            if existing_eol != "\n" and "\n" in content and "\r" not in content:
+                # Rewriting a CRLF file with LF content produces a whole-file
+                # diff and can change behaviour in tools that read raw bytes.
+                # Preserve the file's own convention instead of guessing.
+                content = content.replace("\n", existing_eol)
+                notes.append("preserved " + ("CRLF" if existing_eol == "\r\n" else "CR") + " line endings")
+            if existing.startswith(b"\xef\xbb\xbf") and not content.startswith("\ufeff"):
+                content = "\ufeff" + content
+                bom_preserved = True
+                notes.append("preserved the UTF-8 byte-order mark")
+            eol = {"\r\n": "crlf", "\r": "cr"}.get(existing_eol, "lf")
+        data = content.encode("utf-8")
+        if len(data) > MAX_WRITE_BYTES:
+            raise ToolError(f"content exceeds {MAX_WRITE_BYTES} bytes")
+        if b"\x00" in data[:8192]:
+            raise ToolError("write_file only accepts UTF-8 text")
         self._atomic_write([(target, data, target.stat().st_mode if existed else None)])
+        summary = f"Wrote {len(data)} bytes to {rel}" + (" (overwrote)" if existed else "")
+        if notes:
+            summary += "; " + "; ".join(notes)
         return ToolResult(
             tool="write_file",
             status=ToolCallStatus.SUCCEEDED,
-            summary=f"Wrote {len(data)} bytes to {rel}" + (" (overwrote)" if existed else ""),
-            data={"path": rel, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()},
+            summary=summary,
+            data={
+                "path": rel,
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "eol": eol,
+                "bom_preserved": bom_preserved,
+            },
         )
 
     def _delete_file(self, args: dict[str, Any]) -> ToolResult:
@@ -689,6 +794,89 @@ class ToolGateway:
                 shutil.rmtree(directory, ignore_errors=True)
             raise
 
+    # ----------------------------------------------------------- orientation
+    def _find_symbol(self, args: dict[str, Any]) -> ToolResult:
+        """Search the pinned index. The workspace may be ahead of the index."""
+        if self.symbol_lookup is None:
+            raise ToolBlocked(
+                "the symbol index is not available for this run; use search_text instead"
+            )
+        try:
+            hits = self.symbol_lookup(args["query"], args["limit"])
+        except Exception as exc:  # noqa: BLE001 - index failures are tool failures
+            raise ToolError(f"symbol search failed: {type(exc).__name__}: {exc}") from exc
+        # Excluded paths are invisible to every other tool, so a symbol result
+        # must not leak their names either.
+        hits = [
+            hit
+            for hit in hits
+            if not self.policy.is_excluded(str(hit.get("path") or ""))
+            and not is_secret_path(str(hit.get("path") or ""))
+        ]
+        lines = []
+        for hit in hits:
+            lines.append(
+                f"{hit.get('qualified_name')} ({hit.get('kind')}) "
+                f"{hit.get('path')}:{hit.get('start_line')}-{hit.get('end_line')} "
+                f"[{hit.get('match_reason', '')}] {hit.get('signature', '')}".strip()
+            )
+        return ToolResult(
+            tool="find_symbol",
+            status=ToolCallStatus.SUCCEEDED,
+            summary=(
+                f"Found {len(hits)} symbol(s) for {args['query']!r} in the pinned index "
+                "(the worktree may be newer)"
+            ),
+            output="\n".join(lines),
+            data={
+                "query": args["query"],
+                "count": len(hits),
+                "source": "pinned_index",
+                "results": hits,
+            },
+        )
+
+    # ------------------------------------------------------------------- checks
+    def _run_check(self, args: dict[str, Any]) -> ToolResult:
+        if self.check_runner is None:
+            raise ToolBlocked("this task contract declares no runnable checks")
+        self._require_command()
+        spec = self.check_runner.spec_for(args["key"])
+        if spec is None:
+            declared = ", ".join(item.key for item in self.check_runner.specs) or "none"
+            raise ToolError(
+                f"no declared check has key {args['key']!r}; declared checks: {declared}"
+            )
+        feedback = self.check_runner.run([spec.key])
+        if not feedback.results:
+            raise ToolError(f"check {spec.key!r} produced no result")
+        item = feedback.results[0]
+        from mayaworkbench.domain.enums import CheckOutcome
+
+        if item.outcome == CheckOutcome.PASSED.value:
+            status = ToolCallStatus.SUCCEEDED
+        elif item.outcome == CheckOutcome.SKIPPED.value:
+            status = ToolCallStatus.SUCCEEDED
+        elif item.outcome == CheckOutcome.FAILED.value:
+            status = ToolCallStatus.FAILED
+        else:
+            status = ToolCallStatus.BLOCKED
+        output = json.dumps(item.to_payload(), ensure_ascii=False, indent=2, sort_keys=True)
+        return ToolResult(
+            tool="run_check",
+            status=status,
+            summary=f"Check {spec.key}: {item.outcome} ({item.reason})",
+            output=output,
+            exit_code=item.exit_code,
+            duration_ms=item.duration_ms,
+            data={
+                "key": spec.key,
+                "outcome": item.outcome,
+                "infrastructure_failure": item.infrastructure,
+                "in_loop": True,
+            },
+        )
+
     # ----------------------------------------------------------------- command
     def _run_command(self, args: dict[str, Any], call: ToolCall) -> ToolResult:
         self._require_command()
@@ -818,6 +1006,8 @@ __all__ = [
     "ReadFileArgs",
     "ListFilesArgs",
     "SearchTextArgs",
+    "FindSymbolArgs",
+    "RunCheckArgs",
     "ApplyPatchArgs",
     "WriteFileArgs",
     "DeleteFileArgs",

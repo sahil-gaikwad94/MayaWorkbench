@@ -78,6 +78,14 @@ def register_task_commands(sub: argparse._SubParsersAction) -> None:  # type: ig
     )
     create.add_argument("--check-timeout", type=int, default=300)
     create.add_argument(
+        "--require-experiment",
+        action="store_true",
+        help=(
+            "Gate acceptance on a fair, comparable experiment attached to the task "
+            "(Gate F). The comparison must exist before verification runs."
+        ),
+    )
+    create.add_argument(
         "--invariant",
         dest="invariants",
         action="append",
@@ -258,6 +266,7 @@ def cmd_task_create(args: argparse.Namespace) -> int:
         claim_ids=list(args.claim),
         mapping_artifact_id=args.mapping_artifact,
         verification_checks=checks,
+        require_experiment=args.require_experiment,
     )
     payload = {"task": task.model_dump(mode="json"), "contract": contract.model_dump(mode="json")}
     if console.json_mode:
@@ -275,6 +284,10 @@ def cmd_task_create(args: argparse.Namespace) -> int:
             ("network", contract.constraints.network_access),
             ("approvals", ", ".join(item.value for item in contract.required_approvals)),
             ("verification checks", len(contract.verification_checks) or "none declared"),
+            (
+                "experiment required",
+                "yes (Gate F)" if contract.require_experiment else "no",
+            ),
         ]
     )
     if not contract.verification_checks:
@@ -482,6 +495,28 @@ def cmd_task_status(args: argparse.Namespace) -> int:
     )
     for approval in payload["approvals"]:
         console.bullet(f"{approval['action']}: {approval['status']} ({approval['id']})")
+    rounds = (run.details or {}).get("in_loop_check_rounds") or []
+    if rounds:
+        console.section("In-loop declared checks (advisory)")
+        console.table(
+            ["round", "verdict", "duration_ms", "checks"],
+            [
+                [
+                    item.get("round"),
+                    item.get("verdict"),
+                    item.get("duration_ms"),
+                    ", ".join(
+                        f"{check.get('key')}={check.get('outcome')}"
+                        for check in item.get("checks", [])
+                    ),
+                ]
+                for item in rounds
+            ],
+            max_column=60,
+        )
+        console.note(
+            "In-loop checks guide repair. `maya verify run` re-executes them and is the evidence."
+        )
     if payload["diff"]:
         console.section("Candidate patch")
         console.kv(

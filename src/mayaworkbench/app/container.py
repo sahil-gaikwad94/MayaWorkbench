@@ -16,8 +16,10 @@ from mayaworkbench.domain.enums import ActorKind, EventType
 from mayaworkbench.domain.models import Project, WorkflowEvent
 from mayaworkbench.errors import ConflictError, UsageError
 from mayaworkbench.ids import new_ulid
+from mayaworkbench.experiments.service import ExperimentService
 from mayaworkbench.indexing.indexer import Indexer
 from mayaworkbench.indexing.map import RepositoryMapService
+from mayaworkbench.memory.service import MemoryService
 from mayaworkbench.mapping.service import ClaimMappingService
 from mayaworkbench.tasks.approvals import ApprovalService
 from mayaworkbench.tasks.plans import PlanService
@@ -51,6 +53,8 @@ from mayaworkbench.storage.stores import (
     VerificationStore,
     WorkerJobStore,
     WorkspaceStore,
+    ExperimentStore,
+    MemoryStore,
     FileStore,
     InvocationStore,
     IssueStore,
@@ -123,6 +127,10 @@ class Services:
     worktrees: WorktreeManager
     verification_store: VerificationStore
     verification_service: VerificationService
+    experiment_store: ExperimentStore
+    experiment_service: ExperimentService
+    memory_store: MemoryStore
+    memory_service: MemoryService
     task_service: TaskService
 
     @classmethod
@@ -263,6 +271,34 @@ class Services:
         task_reviews = ReviewStore(db)
         jobs = WorkerJobStore(db)
         verification_store = VerificationStore(db)
+        experiment_store = ExperimentStore(db)
+        memory_store = MemoryStore(db)
+        memory_service = MemoryService(
+            store=memory_store,
+            events=events,
+            projects=projects,
+            tasks=task_store,
+            runs=workflow_runs,
+            experiments=experiment_store,
+            artifacts=artifacts,
+            documents=documents,
+            claims=claims,
+            snapshots=snapshots,
+            repositories=repositories,
+        )
+        experiment_service = ExperimentService(
+            home=paths.home,
+            settings=settings,
+            artifacts=artifacts,
+            events=events,
+            store=experiment_store,
+            repositories=repositories,
+            snapshots=snapshots,
+            files=files,
+            tasks=task_store,
+            contracts=contracts,
+            memory=memory_service,
+        )
         plan_service = PlanService(
             settings=settings,
             gateway=gateway,
@@ -311,6 +347,7 @@ class Services:
             invocations=invocations,
             store=verification_store,
             gateway=gateway,
+            experiments=experiment_service,
         )
         task_service = TaskService(
             paths=paths,
@@ -391,6 +428,10 @@ class Services:
             worktrees=worktrees,
             verification_store=verification_store,
             verification_service=verification_service,
+            experiment_store=experiment_store,
+            experiment_service=experiment_service,
+            memory_store=memory_store,
+            memory_service=memory_service,
             task_service=task_service,
         )
 
@@ -431,6 +472,14 @@ class Services:
     @property
     def verification(self) -> VerificationService:
         return self.verification_service
+
+    @property
+    def experiments(self) -> ExperimentService:
+        return self.experiment_service
+
+    @property
+    def memory(self) -> MemoryService:
+        return self.memory_service
 
     def close(self) -> None:
         self.db.close()

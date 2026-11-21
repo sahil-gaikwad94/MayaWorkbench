@@ -168,6 +168,18 @@ class VerificationError(MayaError):
     code = "VERIFICATION_ERROR"
 
 
+class ExperimentError(MayaError):
+    """An experiment definition, run, manifest or comparison was refused."""
+
+    code = "EXPERIMENT_ERROR"
+
+
+class ProjectMemoryError(MayaError):
+    """Durable project memory could not be recorded or changed."""
+
+    code = "MEMORY_ERROR"
+
+
 class BudgetError(MayaError):
     """A task budget (time, tokens, cost, steps or output) was exhausted."""
 
@@ -195,5 +207,7 @@ __all__ = [
     "ApprovalError",
     "WorkspaceError",
     "ToolError",
+    "ExperimentError",
+    "ProjectMemoryError",
     "BudgetError",
 ]

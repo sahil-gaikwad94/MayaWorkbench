@@ -187,6 +187,29 @@ class ResearchSettings(BaseModel):
     allow_private_network_fetch: bool = False
 
 
+class ExperimentSettings(BaseModel):
+    """Hard local ceilings for the Experiment Lab.
+
+    A definition declares its own budgets, but it cannot exceed these: the
+    settings are the outer bound the local machine owner controls. A profile
+    that needs more (a full training run) is refused locally instead of being
+    silently executed as a smaller run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_runtime_seconds: int = Field(default=1800, ge=1, le=86_400)
+    max_total_runtime_seconds: int = Field(default=7200, ge=1, le=7 * 86_400)
+    max_runs: int = Field(default=20, ge=1, le=100)
+    max_artifact_bytes: int = Field(default=20_000_000, ge=1024)
+    max_output_bytes: int = Field(default=1_000_000, ge=1024)
+    max_metric_observations: int = Field(default=100_000, ge=1)
+    max_metric_file_bytes: int = Field(default=10_000_000, ge=1024)
+    max_dataset_fingerprint_bytes: int = Field(default=268_435_456, ge=0)
+    default_min_seeds: int = Field(default=2, ge=1, le=100)
+    keep_workspaces: bool = False
+
+
 class Settings(BaseModel):
     """Root settings document persisted at ``$MAYA_HOME/config.json``."""
 
@@ -198,6 +221,7 @@ class Settings(BaseModel):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     indexing: IndexingSettings = Field(default_factory=IndexingSettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
+    experiments: ExperimentSettings = Field(default_factory=ExperimentSettings)
 
     def allows_remote_model(self) -> bool:
         return self.data_policy == "BYOK_REMOTE_MODEL"
@@ -387,6 +411,7 @@ def redacted_settings_view(paths: AppPaths, settings: Settings) -> dict:
         "retrieval": settings.retrieval.model_dump(),
         "indexing": settings.indexing.model_dump(),
         "research": settings.research.model_dump(),
+        "experiments": settings.experiments.model_dump(),
     }
 
 
@@ -397,6 +422,7 @@ __all__ = [
     "RetrievalSettings",
     "IndexingSettings",
     "ResearchSettings",
+    "ExperimentSettings",
     "DataPolicy",
     "SETTINGS_SCHEMA_VERSION",
     "load_settings",

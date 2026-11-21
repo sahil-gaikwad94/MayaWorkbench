@@ -141,6 +141,19 @@ def decide(
         if check.outcome
         in {CheckOutcome.INCONCLUSIVE, CheckOutcome.UNVERIFIED, CheckOutcome.SKIPPED}
     ]
+    # Evidence the contract explicitly requires (for example Gate F: a
+    # comparable experiment) cannot be traded for a passing functional check.
+    # If it is missing, the honest decision is INCONCLUSIVE.
+    mandatory_missing = [
+        check for check in no_evidence if check.details.get("mandatory")
+    ]
+    if mandatory_missing:
+        blocking.extend(
+            f"{check.key} is required evidence but produced no usable result: "
+            f"{check.summary or check.outcome.value}"
+            for check in mandatory_missing
+        )
+        return TaskDecision.INCONCLUSIVE, blocking, limitations
     if no_evidence:
         for check in no_evidence:
             limitations.append(
@@ -366,6 +379,7 @@ def build_report_payload(
     limitations: list[str],
     reviewer: dict[str, Any] | None,
     declared_specs: list[CheckSpec],
+    experiment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "1.0",
@@ -386,7 +400,10 @@ def build_report_payload(
         "checks": [item.model_dump(mode="json") for item in checks],
         "declared_checks": [item.model_dump(mode="json") for item in declared_specs],
         "reviewer": reviewer,
-        "evidence_classification": evidence_classification(checks, reviewer, diff),
+        "experiment": experiment,
+        "evidence_classification": evidence_classification(
+            checks, reviewer, diff, experiment
+        ),
         "generated_at": _now_iso(),
     }
 
@@ -395,9 +412,16 @@ def evidence_classification(
     checks: list[VerificationCheck],
     reviewer: dict[str, Any] | None,
     diff: TaskDiff,
+    experiment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Separate implemented, checked, model-assessed and unverified claims."""
     functional = [check for check in checks if check.kind in FUNCTIONAL_KINDS]
+    observed = bool(
+        experiment
+        and experiment.get("comparable")
+        and experiment.get("verdict") not in {"NOT_COMPARABLE", "INCONCLUSIVE"}
+        and experiment.get("observations", 0) > 0
+    )
     return {
         "implemented": {
             "value": bool(diff.files),
@@ -413,8 +437,17 @@ def evidence_classification(
             "basis": [check.key for check in functional if check.outcome == CheckOutcome.PASSED],
         },
         "experimentally_observed": {
-            "value": False,
-            "basis": "experiments are Phase 5; no metric observation exists",
+            "value": observed,
+            "basis": (
+                f"{experiment.get('comparison_id')} — {experiment.get('verdict')} "
+                f"({experiment.get('primary_summary', 'no primary metric')})"
+                if observed and experiment
+                else (
+                    "a comparison exists but produced no comparable observation"
+                    if experiment
+                    else "no experiment is attached to this task"
+                )
+            ),
         },
         "model_assessed": {
             "value": bool(reviewer and not reviewer.get("skipped_reason")),
@@ -531,10 +564,18 @@ def render_markdown(
         f"- **Deterministically checked:** {checked.get('value')} "
         f"({', '.join(checked.get('basis', [])) or 'no passing functional check'})."
     )
-    lines.append(
-        "- **Experimentally observed:** false — no experiment was run for this task; "
-        "a passing check is not an experiment result."
-    )
+    experiment = payload.get("experiment")
+    if experiment:
+        lines.append(
+            "- **Experimentally observed:** "
+            f"{classification.get('experimentally_observed', {}).get('value')} — "
+            f"{classification.get('experimentally_observed', {}).get('basis')}."
+        )
+    else:
+        lines.append(
+            "- **Experimentally observed:** false — no experiment is attached to this "
+            "task; a passing check is not an experiment result."
+        )
     model_assessed = classification.get("model_assessed", {})
     lines.append(
         f"- **Model-assessed:** {model_assessed.get('value')} "
@@ -545,6 +586,37 @@ def render_markdown(
     lines.append(
         "- **Unverified:** " + (", ".join(unverified) if unverified else "no check was left unverified")
     )
+
+    if experiment:
+        lines.extend(
+            [
+                "",
+                "## Experiment evidence",
+                "",
+                f"- Comparison: `{experiment.get('comparison_id')}`",
+                f"- Verdict: **{experiment.get('verdict')}**"
+                f" ({'comparable' if experiment.get('comparable') else 'not comparable'})",
+                f"- Design: `{experiment.get('design', 'unknown')}`",
+                f"- Primary metric: {experiment.get('primary_summary', 'not reported')}",
+                f"- Observations: {experiment.get('observations', 0)}",
+                "",
+                "The experiment verdict is evidence under the recorded protocol. It is "
+                "not a proof of scientific truth, and it does not change any deterministic "
+                "check above.",
+            ]
+        )
+        experiment_limitations = experiment.get("limitations") or []
+        if experiment_limitations:
+            lines.extend(["", "Experiment limitations:", ""])
+            lines.extend(f"- {item}" for item in experiment_limitations)
+        if experiment.get("bundle_files"):
+            lines.extend(
+                [
+                    "",
+                    "The verification bundle embeds the comparison report and every run "
+                    "manifest under `experiments/`.",
+                ]
+            )
 
     lines.extend(["", "## Limitations and assumptions", ""])
     if payload["limitations"]:

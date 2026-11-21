@@ -193,6 +193,7 @@ class TaskService:
         claim_ids: list[str] | None = None,
         mapping_artifact_id: str | None = None,
         verification_checks: list[CheckSpec] | None = None,
+        require_experiment: bool = False,
         created_by: str = "local-user",
     ) -> tuple[Task, TaskContract]:
         project = self.projects.get(project_id)
@@ -310,6 +311,7 @@ class TaskService:
             ),
             "required_approvals": [action.value for action in approvals],
             "verification_checks": [spec.model_dump(mode="json") for spec in checks],
+            "require_experiment": require_experiment,
             "contract_version": "1.0",
         }
         contract = TaskContract(
@@ -327,6 +329,7 @@ class TaskService:
             unknowns=unknowns or [],
             research_context=research_context,
             verification_checks=checks,
+            require_experiment=require_experiment,
             required_approvals=approvals,
             content_sha256=canonical_sha256(payload),
             created_by=created_by,

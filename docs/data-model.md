@@ -176,6 +176,13 @@ via a temp file + atomic rename, deduplicated by `(sha256, kind)`.
 | `CLAIM_SET` | Validated claims (plus dependencies and risks) from one extraction run |
 | `CLAIM_MATRIX` | Claim-to-code matrix for one snapshot, including verified evidence |
 | `RESEARCH_MEMO` | Rendered memo body (source interpretation + appended deviations) |
+| `EXPERIMENT_PROTOCOL` | Full definition payload covered by its content hash |
+| `EXPERIMENT_MANIFEST` | Pre-execution manifest, including the definition hash |
+| `EXPERIMENT_OUTPUT` | Bounded stdout/stderr from one experiment run |
+| `EXPERIMENT_METRICS` | Parsed metrics document when it was read from a file |
+| `EXPERIMENT_REPORT` | Markdown comparison report covered by `json_sha256` |
+| `EXPERIMENT_BUNDLE` | Exported reproduction bundle manifest |
+| `PROJECT_MEMORY` | Serialised memory source/provenance snapshot |
 
 Every read re-hashes the bytes and raises `ConflictError` on mismatch; a missing
 blob raises `NotFoundError`. Writes are fsync'd before the row is committed, so
@@ -204,7 +211,7 @@ On startup:
 3. refuse to run on mismatch (`DatabaseError`);
 4. apply pending migrations inside one transaction per file.
 
-`schema_version` (currently `2`) is stored in `PRAGMA user_version` and exposed
+`schema_version` (currently `6`) is stored in `PRAGMA user_version` and exposed
 by `maya db info` / `maya doctor`. Editing a released migration is not allowed;
 behaviour changes require a new file. `0002_research_and_claims.sql` is
 purely additive: it creates the research tables and leaves Phase 1 rows
@@ -344,6 +351,14 @@ events keep their entity ids and remain readable. Task/contract/plan/workspace
 tables use foreign keys with restrictive deletes where the evidence must not be
 silently orphaned, and cascade only from project/task ownership.
 
+Phase 6 added no tables and no columns. In-loop check rounds live in
+`workflow_runs.details_json` as `in_loop_check_rounds` (the last five summaries:
+round, verdict, duration, per-check outcomes and artifact id) plus
+`in_loop_verdict` and the round count; the full feedback for each round is a
+`VERIFICATION_CHECK` artifact. This keeps the advisory loop record next to the
+run without giving it the authority of a `verification_checks` row, which only
+`maya verify run` writes.
+
 The candidate patch, tool outputs, diff review and exported bundle are
 content-addressed artifacts (`TASK_PATCH`, `TOOL_OUTPUT`, `COMMAND_OUTPUT`,
 `DIFF_REVIEW`, `TASK_CONTRACT`, `IMPLEMENTATION_PLAN`). The database stores
@@ -370,3 +385,32 @@ are never updated; a new attempt writes new rows. `verification_checks` has a
 unique `(verification_id, check_key)` constraint; findings cascade from their
 check. Command output (stdout/stderr) lives in `COMMAND_OUTPUT` artifacts, and
 evidence bundles copy the artifacts they cite.
+
+## 9. Experiments and memory (schema 6)
+
+Migration `0006_experiments_and_memory.sql` adds pre-registered experiments,
+append-only run evidence and scoped project memory.
+
+| Table | Purpose | Key columns |
+| --- | --- | --- |
+| `experiment_definitions` | Immutable pre-registration | `snapshot_id`, `base_commit_sha`, `role`, `command_json`, `seeds_json`, `metrics_json`, `protocol_json`, `treatment_json`, `status`, `content_sha256`, `approved_by` |
+| `experiment_manifests` | Hashed before execution | `experiment_id`, `seed`, `attempt`, `definition_sha256`, `commit_sha`, `snapshot_kind`, `protocol_json`, `command_json`, `limits_json`, `environment_json`, `verified_inputs_json`, `manifest_sha256` |
+| `experiment_runs` | One replicate | `manifest_id`, `seed`, `status`, `exit_code`, `output_artifact_id`, `metrics_artifact_id`, `metrics_ingested`, `observation_count`, `workspace_path`, `details_json` |
+| `metric_observations` | Declared and recorded metric values | `run_id`, `metric_key`, `value`, `sample_index`, `step`, `source` |
+| `experiment_comparisons` | Immutable verdict | `baseline_experiment_id`, `candidate_experiment_id`, `baseline_definition_sha256`, `candidate_definition_sha256`, `verdict`, `design`, `comparable`, `findings_json`, `metrics_json`, `limitations_json`, `json_sha256` |
+| `project_memories` | Scoped statement | `kind`, `status`, `author_kind`, `statement`, `scope`, `snapshot_id`, `commit_sha`, `confidence`, `supersedes_id` |
+| `memory_sources` | Provenance edge | `memory_id`, `kind`, `ref`, `sha256`, `note` |
+
+`experiment_manifests` and `experiment_runs` are unique on
+`(experiment_id, seed, attempt)`; a retry is a new attempt, never an overwrite.
+Definitions and comparisons are never updated after creation: approval and
+revocation change only `status`/`approval_sha256`, and a definition's
+`content_sha256` covers its entire protocol. `task_contracts` gained
+`require_experiment` so verification can make a comparison mandatory evidence.
+
+Comparison reports are also stored as `EXPERIMENT_REPORT` artifacts; the
+comparison row's `json_sha256` covers the exact JSON payload that produced it.
+Memory provenance rows are validated on read (`kind`/`ref` must exist in the
+named store), and a secret-looking statement or source note is refused before
+insert. A memory pinned to `commit_sha` becomes `STALE` once the project's
+current snapshot has a different commit; nothing rewrites it in place.

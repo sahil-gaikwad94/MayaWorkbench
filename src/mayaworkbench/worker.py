@@ -38,6 +38,8 @@ from mayaworkbench.ids import new_ulid
 from mayaworkbench.observability.logging import get_logger
 from mayaworkbench.tasks.agent import AgentOutcome, ControlledAgent
 from mayaworkbench.tasks.approvals import expected_command_sha, expected_write_sha
+from mayaworkbench.tasks.inloop import DeclaredCheckRunner
+from mayaworkbench.tasks.orientation import build_orientation
 from mayaworkbench.workspace.policy import PathPolicy
 from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
 from mayaworkbench.workspace.tools import ToolGateway
@@ -203,6 +205,41 @@ class Worker:
             policy=CommandPolicy.from_constraints(contract.constraints),
             run_home=Path(workspace.path).parent / "home",
         )
+        # In-loop checks are declared in the contract, not proposed by the model.
+        # They may run only when the same COMMAND_EXECUTION approval that governs
+        # the gateway is present; otherwise the gate records BLOCKED, honestly.
+        checks = DeclaredCheckRunner(
+            contract=contract,
+            workspace=Path(workspace.path),
+            run_home=Path(workspace.path).parent / "check-home",
+            authorized=(
+                command_approval is not None
+                and ApprovalAction.COMMAND_EXECUTION in contract.required_approvals
+            ),
+        )
+        try:
+            orientation = build_orientation(
+                retrieval=self.services.retrieval,
+                files=self.services.files,
+                symbols=self.services.symbols,
+                issues=self.services.issues,
+                snapshot_id=run.snapshot_id,
+                goal=task.goal,
+                allowed_paths=contract.scope.allowed_paths,
+                excluded_paths=contract.scope.excluded_paths,
+            )
+        except Exception as exc:  # noqa: BLE001 - orientation is an aid, never a gate
+            log.warning("orientation unavailable", extra={"run_id": run.id, "error": str(exc)})
+            orientation = {
+                "kind": "repository_orientation",
+                "available": False,
+                "error": f"{type(exc).__name__}: {exc}"[:400],
+            }
+
+        def symbol_lookup(query: str, limit: int) -> list[dict[str, Any]]:
+            hits = self.services.search.search_symbols(run.snapshot_id, query, limit=limit)
+            return [hit.model_dump(mode="json") for hit in hits]
+
         gateway = ToolGateway(
             run=run,
             task=task,
@@ -218,6 +255,8 @@ class Worker:
             command_approval=command_approval,
             expected_command_spec=expected_command_sha(run=run, contract=contract),
             cancel_requested=cancel_requested,
+            check_runner=checks,
+            symbol_lookup=symbol_lookup,
         )
         agent = ControlledAgent(
             settings=self.services.settings,
@@ -231,6 +270,8 @@ class Worker:
             plan=plan,
             tool_gateway=gateway,
             heartbeat=heartbeat,
+            orientation=orientation,
+            events=self.services.events,
         )
         heartbeat()
         outcome = agent.run_loop()

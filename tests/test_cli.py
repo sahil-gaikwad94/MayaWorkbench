@@ -181,3 +181,150 @@ def test_version_flag(capsys):
         main(["--version"])
     assert excinfo.value.code == 0
     assert "MayaWorkbench" in capsys.readouterr().out
+
+
+def test_experiment_and_memory_commands_are_registered():
+    from mayaworkbench.cli.main import build_parser
+
+    parser = build_parser()
+    experiment = next(
+        action for action in parser._actions if action.dest == "command"
+    ).choices["experiment"]
+    memory = next(action for action in parser._actions if action.dest == "command").choices[
+        "memory"
+    ]
+    experiment_actions = next(
+        action for action in experiment._actions if action.dest == "experiment_command"
+    ).choices
+    memory_actions = next(
+        action for action in memory._actions if action.dest == "memory_command"
+    ).choices
+    assert {"create", "run", "compare", "bundle", "verify-bundle"} <= set(
+        experiment_actions
+    )
+    assert {"add", "list", "confirm", "stale", "export"} <= set(memory_actions)
+
+
+def test_metric_spec_parsing_uses_explicit_directions():
+    from mayaworkbench.cli.experiment_commands import parse_metric_spec
+    from mayaworkbench.errors import UsageError
+
+    metric = parse_metric_spec("val_loss,direction=LOWER,aggregation=MEAN,primary=true,unit=nats")
+    assert metric.key == "val_loss"
+    assert metric.direction.value == "LOWER_IS_BETTER"
+    assert metric.aggregation.value == "MEAN"
+    assert metric.primary is True
+    assert metric.unit == "nats"
+    higher = parse_metric_spec("acc,direction=HIGHER,primary=true")
+    assert higher.direction.value == "HIGHER_IS_BETTER"
+    with pytest.raises(UsageError, match="direction"):
+        parse_metric_spec("loss,primary=true")
+
+
+def test_experiment_cli_static_flow(tmp_path, repo: Path, capsys):
+    home = tmp_path / "experiment-cli-home"
+    base = ["--home", str(home), "--json"]
+    assert run(capsys, base + ["init", "--project", "experiments"])[0] == 0
+    _code, attached = run(capsys, base + ["repo", "add", str(repo)])
+    _code, pinned = run(
+        capsys, base + ["snapshot", "create", "--repo", attached["repository"]["id"]]
+    )
+    snapshot_id = pinned["snapshot"]["id"]
+    assert run(capsys, base + ["index", "--snapshot", snapshot_id])[0] == 0
+
+    def create(name, role):
+        return run(
+            capsys,
+            base
+            + [
+                "experiment",
+                "create",
+                "--snapshot",
+                snapshot_id,
+                "--name",
+                name,
+                "--hypothesis",
+                "the candidate reduces loss",
+                "--role",
+                role,
+                "--profile",
+                "STATIC",
+                "--metrics-source",
+                "IMPORTED",
+                "--metric",
+                "loss,direction=LOWER,aggregation=LAST,primary=true",
+                "--seed",
+                "1",
+                "--seed",
+                "2",
+                "--seed",
+                "3",
+            ],
+        )
+
+    code, baseline = create("cli baseline", "BASELINE")
+    assert code == 0, baseline
+    code, candidate = create("cli candidate", "CANDIDATE")
+    assert code == 0, candidate
+    baseline_id = baseline["definition"]["id"]
+    candidate_id = candidate["definition"]["id"]
+    assert run(capsys, base + ["experiment", "approve", baseline_id])[0] == 0
+    assert run(capsys, base + ["experiment", "approve", candidate_id])[0] == 0
+
+    def record(experiment_id, values):
+        for seed, value in values.items():
+            metrics = tmp_path / f"metrics-{experiment_id}-{seed}.json"
+            metrics.write_text(json.dumps({"metrics": {"loss": value}}), encoding="utf-8")
+            code, payload = run(
+                capsys,
+                base
+                + [
+                    "experiment",
+                    "record",
+                    experiment_id,
+                    "--seed",
+                    str(seed),
+                    "--metrics",
+                    str(metrics),
+                    "--note",
+                    "external lab run",
+                ],
+            )
+            assert code == 0, payload
+
+    record(baseline_id, {1: 1.00, 2: 1.01, 3: 0.99})
+    record(candidate_id, {1: 0.90, 2: 0.92, 3: 0.89})
+
+    code, plan = run(capsys, base + ["experiment", "plan", candidate_id])
+    assert code == 0
+    assert plan["blockers"] == []
+
+    code, compared = run(
+        capsys,
+        base
+        + [
+            "experiment",
+            "compare",
+            candidate_id,
+            "--baseline",
+            baseline_id,
+            "--remember",
+        ],
+    )
+    assert code == 0, compared
+    comparison_id = compared["comparison"]["id"]
+    assert compared["comparison"]["verdict"] == "CANDIDATE_ADVANTAGE"
+
+    destination = tmp_path / "cli-experiment-bundle"
+    code, bundled = run(
+        capsys, base + ["experiment", "bundle", comparison_id, str(destination)]
+    )
+    assert code == 0, bundled
+    assert bundled["manifest"]["kind"] == "COMPARISON"
+    code, verified = run(capsys, base + ["experiment", "verify-bundle", str(destination)])
+    assert code == 0, verified
+    assert verified["ok"] is True
+
+    code, memories = run(capsys, base + ["memory", "list"])
+    assert code == 0
+    assert any(item["kind"] == "EXPERIMENT_RESULT" for item in memories["memories"])

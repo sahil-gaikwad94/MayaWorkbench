@@ -8,6 +8,7 @@ pure function directly.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -15,11 +16,18 @@ import pytest
 from mayaworkbench.domain.enums import (
     ApprovalAction,
     CheckOutcome,
+    ExperimentProfile,
+    ExperimentRole,
+    MetricAggregation,
+    MetricDirection,
+    MetricsSourceKind,
     TaskDecision,
     TaskType,
     WorkflowState,
 )
+from mayaworkbench.domain.models import MetricsSource, MetricSpec
 from mayaworkbench.errors import TaskError
+from mayaworkbench.verification.bundle import verify_bundle
 from mayaworkbench.verification.registry import command_check, invariant_check
 from mayaworkbench.worker import Worker
 
@@ -81,6 +89,7 @@ def make_reviewing_run(
     checks=None,
     criteria=None,
     require_command=True,
+    require_experiment=False,
     extra_actions=None,
 ):
     actions = [read_utils(), patch_utils(), *(extra_actions or []), finish_action()]
@@ -97,6 +106,7 @@ def make_reviewing_run(
         allowed_paths=["utils.py"],
         acceptance_criteria=criteria or ["count_tokens returns the number of words"],
         verification_checks=checks or [],
+        require_experiment=require_experiment,
         required_approvals=required,
         constraints={
             "max_steps": 10,
@@ -104,6 +114,11 @@ def make_reviewing_run(
             "max_model_tokens": 20_000,
             "max_runtime_seconds": 120,
             "network_access": "ALLOW_WITH_APPROVAL",
+            # These tests exercise the post-hoc verification report, including
+            # failing checks. Zero repair rounds keeps the agent's finish gate
+            # from asking the scripted model for a repair it did not script;
+            # the gate still runs the check and records the failure.
+            "max_repair_attempts": 0,
         },
     )
     result = services.task_service.start_task(task.id)
@@ -146,6 +161,8 @@ def test_verification_records_evidence_and_verifies_a_criterion(
     assert by_key["patch.reproducible"].outcome == CheckOutcome.PASSED
     assert by_key["test.integrity"].outcome == CheckOutcome.NOT_APPLICABLE
     assert by_key["report.integrity"].outcome == CheckOutcome.PASSED
+    assert by_key["experiment.evidence"].outcome == CheckOutcome.NOT_APPLICABLE
+    assert by_key["experiment.evidence"].required is False
     command = next(check for check in checks if check.key.startswith("command."))
     assert command.outcome == CheckOutcome.PASSED
     assert command.artifact_id
@@ -373,3 +390,189 @@ def test_plan_declares_reviewer_and_builtins(services, indexed, task_model):
     assert reviewer.required is False
     assert reviewer.outcome == CheckOutcome.SKIPPED
     assert "disabled" in reviewer.summary
+
+
+_UNSET = object()
+
+
+def attach_external_comparison(
+    services,
+    indexed,
+    task_id,
+    baseline_values,
+    candidate_values,
+    baseline_snapshot=None,
+    candidate_snapshot=None,
+    candidate_task_id=_UNSET,
+):
+    service = services.experiment_service
+    metric = MetricSpec(
+        key="loss",
+        direction=MetricDirection.LOWER_IS_BETTER,
+        aggregation=MetricAggregation.LAST,
+        primary=True,
+    )
+
+    def arm(role, name, values):
+        arm_task_id = task_id
+        if role == ExperimentRole.CANDIDATE and candidate_task_id is not _UNSET:
+            arm_task_id = candidate_task_id
+        definition = service.create_definition(
+            project_id=indexed.project.id,
+            snapshot_id=(
+                (baseline_snapshot if role == ExperimentRole.BASELINE else candidate_snapshot)
+                or indexed.snapshot
+            ).id,
+            name=name,
+            hypothesis="the candidate reduces loss",
+            role=role,
+            profile=ExperimentProfile.STATIC,
+            command=[],
+            seeds=sorted(values),
+            timeout_seconds=30,
+            metrics=[metric],
+            metrics_source=MetricsSource(kind=MetricsSourceKind.IMPORTED),
+            task_id=arm_task_id,
+        )
+        service.approve(definition.id, reason="test pre-registration")
+        for seed, value in values.items():
+            service.record_external(
+                definition.id,
+                seed=seed,
+                metrics_text=json.dumps({"metrics": {"loss": value}}),
+                note="produced on the test runner outside the workbench",
+            )
+        return definition
+
+    baseline = arm(ExperimentRole.BASELINE, "baseline", baseline_values)
+    candidate = arm(ExperimentRole.CANDIDATE, "candidate", candidate_values)
+    return service.compare(candidate.id, baseline_id=baseline.id)
+
+
+def test_required_experiment_that_is_missing_is_inconclusive(
+    services, indexed, task_model
+):
+    run = make_reviewing_run(
+        services,
+        indexed,
+        task_model,
+        checks=[command_check(CHECK_OK, criteria=["AC1"], timeout_seconds=30)],
+        require_experiment=True,
+    )
+    report, checks = services.task_service.verify_run(run.run.id, include_review=False)
+    check = next(item for item in checks if item.key == "experiment.evidence")
+    assert check.required is True
+    assert check.outcome == CheckOutcome.INCONCLUSIVE
+    assert check.details["mandatory"] is True
+    assert report.decision == TaskDecision.INCONCLUSIVE
+    assert any("experiment.evidence" in item for item in report.blocking)
+    with pytest.raises(TaskError, match="INCONCLUSIVE"):
+        services.task_service.finish_run(
+            run.run.id, accept=True, reason="no experiment was run"
+        )
+
+
+def test_attached_comparison_satisfies_gate_f_and_is_embedded_in_the_bundle(
+    services, indexed, task_model, tmp_path
+):
+    run = make_reviewing_run(
+        services,
+        indexed,
+        task_model,
+        checks=[command_check(CHECK_OK, criteria=["AC1"], timeout_seconds=30)],
+        require_experiment=True,
+    )
+    comparison = attach_external_comparison(
+        services,
+        indexed,
+        run.task.id,
+        {1: 1.00, 2: 1.01, 3: 0.99},
+        {1: 0.90, 2: 0.92, 3: 0.89},
+    )
+    report, checks = services.task_service.verify_run(run.run.id, include_review=False)
+    check = next(item for item in checks if item.key == "experiment.evidence")
+    assert check.outcome == CheckOutcome.PASSED, (check.summary, check.findings)
+    assert check.details["comparison_id"] == comparison.id
+    assert check.details["observations"] == 6
+    assert check.details["comparable"] is True
+    assert any(
+        finding.code == "EXPERIMENT_IMPORTED_RUNS" for finding in check.findings
+    )
+    assert report.decision == TaskDecision.COMPLETED_WITH_LIMITATIONS
+    assert report.details["markdown_artifact_id"]
+    markdown = services.artifacts.read_text(report.details["markdown_artifact_id"])
+    assert "## Experiment evidence" in markdown
+    assert comparison.verdict.value in markdown
+    payload = json.loads(services.artifacts.read_bytes(report.report_artifact_id))
+    assert payload["experiment"]["comparison_id"] == comparison.id
+    assert payload["evidence_classification"]["experimentally_observed"]["value"] is True
+
+    destination = tmp_path / "verification-bundle"
+    services.verification.export_bundle(run.run.id, destination)
+    manifest = json.loads((destination / "manifest.json").read_text())
+    names = {entry["name"] for entry in manifest["files"]}
+    assert "experiments/comparison.json" in names
+    assert "experiments/report.md" in names
+    assert any(name.startswith("experiments/manifests/") for name in names)
+    result = verify_bundle(destination)
+    assert result.ok, result.errors
+
+
+def test_experiment_on_a_different_commit_is_not_evidence(
+    services, indexed, task_model, repo
+):
+    run = make_reviewing_run(
+        services,
+        indexed,
+        task_model,
+        checks=[command_check(CHECK_OK, criteria=["AC1"], timeout_seconds=30)],
+        require_experiment=True,
+    )
+    (repo / "later.py").write_text("VALUE = 2\n", encoding="utf-8")
+    from tests.conftest import git
+
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "later revision")
+    second = services.repository_service.create_snapshot(indexed.repository).snapshot
+    services.indexer.index(second.id)
+    attach_external_comparison(
+        services,
+        indexed,
+        run.task.id,
+        {1: 1.00, 2: 1.01, 3: 0.99},
+        {1: 0.90, 2: 0.92, 3: 0.89},
+        candidate_snapshot=second,
+        candidate_task_id=None,
+    )
+    report, checks = services.task_service.verify_run(run.run.id, include_review=False)
+    check = next(item for item in checks if item.key == "experiment.evidence")
+    assert check.outcome == CheckOutcome.INCONCLUSIVE
+    assert check.details["commit_mismatch"] is True
+    assert any(
+        finding.code == "EXPERIMENT_COMMIT_MISMATCH" for finding in check.findings
+    )
+    assert report.decision == TaskDecision.INCONCLUSIVE
+
+
+def test_baseline_advantage_fails_a_required_gate(services, indexed, task_model):
+    run = make_reviewing_run(
+        services,
+        indexed,
+        task_model,
+        checks=[command_check(CHECK_OK, criteria=["AC1"], timeout_seconds=30)],
+        require_experiment=True,
+    )
+    attach_external_comparison(
+        services,
+        indexed,
+        run.task.id,
+        {1: 1.00, 2: 1.01, 3: 0.99},
+        {1: 1.10, 2: 1.12, 3: 1.09},
+    )
+    report, checks = services.task_service.verify_run(run.run.id, include_review=False)
+    check = next(item for item in checks if item.key == "experiment.evidence")
+    assert check.outcome == CheckOutcome.FAILED
+    assert any(
+        finding.code == "EXPERIMENT_FAVORS_BASELINE" for finding in check.findings
+    )
+    assert report.decision == TaskDecision.REJECTED

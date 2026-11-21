@@ -8,12 +8,15 @@ and verified quote.
 
 Phase 0 (product/architecture contracts), Phase 1 (repository intelligence),
 Phase 2 (research intelligence and claim-to-code mapping), Phase 3 (task
-contracts, approvals, isolated worktrees and the bounded agent loop) and Phase 4
+contracts, approvals, isolated worktrees and the bounded agent loop), Phase 4
 (verification and evidence: deterministic checks, baseline comparison, test
-integrity, ML invariants, independent review, evidence graph and bundles) are
-implemented and covered by tests. Hosted multi-user hardening and labelled
-corpus scoring remain designed but deliberately not stubbed — see
-[docs/phase-4-report.md](docs/phase-4-report.md) and
+integrity, ML invariants, independent review, evidence graph and bundles) and
+Phase 5 (pre-registered A/B experiments, fixed statistics, reproduction bundles
+and scoped project memory) and Phase 6 (a deterministic finish gate with bounded
+repair, retrieval-grounded orientation, a durable working ledger and robustness
+hardening) are implemented and covered by tests. Hosted multi-user hardening and
+labelled corpus scoring remain designed but deliberately not stubbed — see
+[docs/phase-6-report.md](docs/phase-6-report.md) and
 [docs/implementation-gap-analysis.md](docs/implementation-gap-analysis.md).
 
 ## The problem
@@ -128,6 +131,26 @@ namespace cannot be established and verified. `task finish --accept` requires a
 verification report and refuses a `REJECTED`, `BLOCKED` or `INCONCLUSIVE`
 decision unless `--override` is passed with a reason; the override is recorded
 as a limitation and an event, and the report is never rewritten.
+
+### What the agent may and may not decide
+
+`finish` is a request, not a verdict. When the task contract declares checks,
+the application runs them against the candidate worktree *before* the run may
+move to review:
+
+- **all pass** → finish is accepted, and the report still says `maya verify run`
+  re-executes them as the actual evidence;
+- **a real failure, repair budget left** → the model receives a typed
+  `REPAIR_REQUIRED` payload (check, exit code, failing test ids, bounded output)
+  and the same run continues under the same budgets;
+- **a broken checker** (pytest exit 3/4/5/6, blocked or cancelled command) → no
+  repair prompt; the limitation names the check that produced no verdict;
+- **failure with no repair budget** → finish is accepted and the failure is
+  recorded in limitations; verification will fail it.
+
+The model cannot add, skip or edit a check, and `run_check` only accepts keys
+from the immutable contract. Each round is stored as an artifact and an
+`AGENT_CHECK_COMPLETED` event; `maya task status` shows them.
 
 Include uncommitted work on purpose:
 
@@ -252,6 +275,23 @@ features:
 - **The independent reviewer is advisory and needs a model.** It can only read
   the captured diff and check metadata; without a model the check is `SKIPPED`
   and the report says so. It can never turn a failed check into a pass.
+- **In-loop checks are advisory and pytest-aware.** They guide repair; only
+  `maya verify run` produces evidence. pytest exit codes distinguish a test
+  failure from a broken checker, while other runners are treated generically.
+  A misclassification can cost a repair round but can never turn a failure into
+  a pass.
+- **Repair quality depends on the model.** The loop supplies structured evidence
+  and a bounded budget (`max_repair_attempts`); it does not localise the defect
+  or learn from earlier runs.
+- **Lossy reads are labelled.** A non-UTF-8 file can be read with replacement
+  characters for orientation, but `apply_patch` refuses it, so edits never
+  silently corrupt an encoding. UTF-32 is refused rather than guessed at.
+- **Byte-order marks are decoded, not preserved as content.** UTF-8/UTF-16
+  sources with a BOM are indexed and parsed; UTF-16 Python is searchable but
+  honestly reported as `PARSE_ERROR` because Python source must be UTF-8.
+- **Some indexed paths are unreadable by the agent.** A filename containing
+  control characters or bidirectional overrides exists in the index (the
+  repository really contains it) but the gateway refuses to read or write it.
 - **SQLite is single-host.** The database refuses known network filesystems
   (NFS/SMB/9p/…) instead of pretending WAL locking is safe there.
 
@@ -269,11 +309,15 @@ src/mayaworkbench/
   qa/                  prompts, deterministic citation validation, answer pipeline
   research/            documents, passages, claims, DAG, readiness, memos
   mapping/             signals, evidence discovery, rule pack, adjudication
+  tasks/               contracts, plans, approvals, bounded agent loop, in-loop checks
+  workspace/           path policy, patches, command runner, tool gateway, worktrees
   verification/        check registry, test integrity, reviewer, report, bundle
+  experiments/         protocols, manifests, runner, statistics, comparison, bundles
+  memory/              scoped project statements with user confirmation
   app/container.py     composition root
   cli/                 argparse CLI and human/JSON renderers
-tests/                 pytest suite (storage, snapshots, indexing, retrieval, QA, research, mapping, CLI, verification)
-docs/                  Phase 0 contracts and the Phase 1–4 reports
+tests/                 pytest suite (storage, snapshots, indexing, retrieval, QA, research, mapping, CLI, verification, experiments, memory)
+docs/                  Phase 0 contracts and the Phase 1–5 reports
 ```
 
 ## Testing
@@ -303,7 +347,12 @@ the previous index intact, invalid citations withhold the answer, and
 - [Phase 2 report](docs/phase-2-report.md)
 - [Phase 3 report](docs/phase-3-report.md)
 - [Phase 4 report](docs/phase-4-report.md)
+- [Phase 5 report](docs/phase-5-report.md)
 - [ADR 0007 — claims, mapping and readiness](docs/adr/0007-claims-mapping-and-readiness.md)
 - [ADR 0008 — controlled engineering agent](docs/adr/0008-controlled-engineering-agent.md)
 - [ADR 0009 — verification and evidence](docs/adr/0009-verification-and-evidence.md)
+- [Phase 6 report](docs/phase-6-report.md)
+- [Adversarial audit of Phase 6](docs/audit-phase-6.md) — 82 probes, 2 defects found and fixed
+- [ADR 0010 — experiment lab and memory](docs/adr/0010-experiment-lab-and-memory.md)
+- [ADR 0011 — deterministic finish gate and repair](docs/adr/0011-deterministic-finish-gate-and-repair.md)
 - [Architecture decision records](docs/adr/)

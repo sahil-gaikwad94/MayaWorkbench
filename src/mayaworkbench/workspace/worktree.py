@@ -13,11 +13,8 @@ enforced separately by :mod:`mayaworkbench.workspace.runner`.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import shutil
-import stat
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +23,6 @@ from mayaworkbench.domain.enums import (
     ActorKind,
     ArtifactKind,
     EventType,
-    SnapshotKind,
     WorkspaceStatus,
 )
 from mayaworkbench.domain.models import (
@@ -51,6 +47,12 @@ from mayaworkbench.storage.stores import (
     RepositoryStore,
     SnapshotStore,
     WorkspaceStore,
+)
+from mayaworkbench.workspace.materialize import (
+    apply_snapshot_state,
+    ignored_paths,
+    needs_patch_application,
+    verify_snapshot_content,
 )
 from mayaworkbench.workspace.policy import normalize_rel
 
@@ -150,7 +152,7 @@ class WorktreeManager:
                 raise WorkspaceError(
                     f"Worktree HEAD is {actual_head}, expected {snapshot.commit_sha}"
                 )
-            if snapshot.kind == SnapshotKind.WORKTREE or snapshot.includes_worktree_patch:
+            if needs_patch_application(snapshot):
                 self._apply_snapshot_state(git, worktree_git, snapshot)
             verified = self._verify_snapshot_content(snapshot, path)
             # Baseline ignored paths are needed so a task-created ignored file
@@ -209,97 +211,19 @@ class WorktreeManager:
     def _apply_snapshot_state(
         self, git: GitClient, worktree_git: GitClient, snapshot: RepositorySnapshot
     ) -> None:
-        if snapshot.patch_artifact_id:
-            patch = self.artifacts.read_bytes(snapshot.patch_artifact_id)
-            if snapshot.patch_hash:
-                if not snapshot.untracked_manifest_artifact_id:
-                    raise WorkspaceError(
-                        "The snapshot records a patch hash but no untracked manifest"
-                    )
-                manifest_bytes = self.artifacts.read_bytes(
-                    snapshot.untracked_manifest_artifact_id
-                )
-                expected = hashlib.sha256(patch + b"\x00" + manifest_bytes).hexdigest()
-                if expected != snapshot.patch_hash:
-                    raise WorkspaceError(
-                        "The stored snapshot patch does not match its recorded hash"
-                    )
-            if patch.strip():
-                result = worktree_git.run(
-                    "apply",
-                    "--binary",
-                    "--whitespace=nowarn",
-                    input_bytes=patch,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    raise WorkspaceError(
-                        "Could not apply the snapshot's working-tree patch in the workspace",
-                        hint=result.stderr[:800],
-                    )
-        if snapshot.untracked_manifest_artifact_id:
-            manifest = json.loads(
-                self.artifacts.read_text(snapshot.untracked_manifest_artifact_id)
-            )
-            for raw_path, entry in sorted((manifest.get("files") or {}).items()):
-                rel = normalize_rel(raw_path)
-                expected_sha = entry.get("sha256")
-                if not expected_sha:
-                    raise WorkspaceError(
-                        f"Untracked snapshot file cannot be reconstructed: {rel}",
-                        hint=entry.get("note") or "The file was not stored with a hash.",
-                    )
-                indexed = self.files.get_by_path(snapshot.id, rel)
-                if indexed is None or indexed.content_artifact_id is None:
-                    raise WorkspaceError(
-                        f"Untracked snapshot file was not indexed and cannot be reconstructed: {rel}"
-                    )
-                data = self.artifacts.read_bytes(indexed.content_artifact_id)
-                if hashlib.sha256(data).hexdigest() != expected_sha:
-                    raise WorkspaceError(
-                        f"Stored content for untracked snapshot file does not match: {rel}"
-                    )
-                target = (Path(worktree_git.workdir) / rel).resolve()
-                if not target.is_relative_to(Path(worktree_git.workdir).resolve()):
-                    raise WorkspaceError(f"Untracked path escapes the workspace: {rel}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
+        apply_snapshot_state(
+            git,
+            worktree_git,
+            snapshot,
+            artifacts=self.artifacts,
+            files=self.files,
+        )
 
     def _verify_snapshot_content(self, snapshot: RepositorySnapshot, path: Path) -> int:
-        files = self.files.list_by_snapshot(snapshot.id, limit=100_000)
-        verified = 0
-        for indexed in files:
-            if indexed.status.value == "SKIPPED":
-                continue
-            target = path / indexed.path
-            if not target.exists() or not target.is_file():
-                raise WorkspaceError(
-                    f"Workspace is missing indexed snapshot file: {indexed.path}"
-                )
-            if target.is_symlink():
-                raise WorkspaceError(
-                    f"Workspace file is a symlink, which the snapshot cannot represent: {indexed.path}"
-                )
-            digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            if digest != indexed.content_sha256:
-                raise WorkspaceError(
-                    f"Workspace file does not match the pinned snapshot: {indexed.path}",
-                    hint="The snapshot is inconsistent or the repository was modified.",
-                )
-            verified += 1
-        return verified
+        return verify_snapshot_content(snapshot, path, files=self.files)
 
     def _ignored_paths(self, path: Path) -> set[str]:
-        result = GitClient(path).run(
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-            check=False,
-        )
-        raw = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
-        return {normalize_rel(item) for item in raw.split("\x00") if item.strip()}
+        return ignored_paths(path)
 
     # -------------------------------------------------------------------- diff
     def capture_diff(self, workspace: ExecutionWorkspace) -> tuple[bytes, list[DiffFile], list[str]]:

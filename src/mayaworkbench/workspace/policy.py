@@ -43,6 +43,9 @@ SECRET_NAMES = {
     "secrets.json",
     "secrets.yaml",
     "secrets.yml",
+    ".pgpass",
+    ".htpasswd",
+    "kubeconfig",
 }
 
 SECRET_GLOBS = (
@@ -50,11 +53,16 @@ SECRET_GLOBS = (
     "*.key",
     "*.p12",
     "*.pfx",
+    "*.p8",
+    "*.jks",
     "*.keystore",
+    "*.kdbx",
     ".env.*",
     "**/credentials*.json",
     "**/secrets*.yaml",
     "**/secrets*.yml",
+    "**/.docker/config.json",
+    "**/service-account*.json",
 )
 
 # High-confidence credential markers. This is used on file *writes* (not reads)
@@ -71,6 +79,15 @@ _SECRET_CONTENT = re.compile(
 # or a runaway generator.
 MAX_PATH_LENGTH = 512
 MAX_PATH_COMPONENTS = 64
+MAX_COMPONENT_LENGTH = 255
+
+#: Characters that must never reach a path, a log line or a diff header.
+#: C0/C1 controls break line-oriented output, and the bidi overrides and
+#: line/paragraph separators can make a path render as a different path than
+#: the one checked here (Trojan Source, CVE-2021-42574 class of spoofing).
+_DISALLOWED_PATH_CHARS = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\u2028\u2029]"
+)
 
 
 class PolicyViolation(Exception):
@@ -87,6 +104,10 @@ def normalize_rel(path: str) -> str:
         raise PolicyViolation("path must be a non-empty string", path=path)
     if "\x00" in path:
         raise PolicyViolation("path contains a null byte", path=path)
+    if _DISALLOWED_PATH_CHARS.search(path):
+        raise PolicyViolation(
+            "path contains control characters or bidirectional overrides", path=path
+        )
     if len(path) > MAX_PATH_LENGTH:
         raise PolicyViolation(f"path exceeds {MAX_PATH_LENGTH} characters", path=path)
     candidate = path.replace("\\", "/")
@@ -97,6 +118,11 @@ def normalize_rel(path: str) -> str:
         raise PolicyViolation("path must be normalised and may not contain '..'", path=path)
     if len(parts) > MAX_PATH_COMPONENTS:
         raise PolicyViolation("path has too many components", path=path)
+    for part in parts:
+        if len(part.encode("utf-8")) > MAX_COMPONENT_LENGTH:
+            raise PolicyViolation(
+                f"a path component exceeds {MAX_COMPONENT_LENGTH} bytes", path=path
+            )
     if parts[0] == ".git":
         raise PolicyViolation("the .git directory is never accessible", path=path)
     return "/".join(parts)

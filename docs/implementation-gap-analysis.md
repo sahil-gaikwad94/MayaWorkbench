@@ -1,6 +1,6 @@
 # Implementation gap analysis
 
-This document compares the master specification's Phase 0–4 deliverables with
+This document compares the master specification's Phase 0–6 deliverables with
 what is actually implemented, and states what is deliberately absent.
 "Implemented" means: exercised by the test suite or the recorded CLI run, with
 failure behaviour included.
@@ -108,12 +108,68 @@ invariants, independent review, reports and bundles are implemented in Phases
    generation are English.
 10. **No answer streaming or cancellation.** Model calls complete or time out;
     there is no partial-answer protocol.
+11. **Experiments are single-host and wall-clock based.** Concurrency on the
+    same machine is not controlled; the statistics model run-to-run variation,
+    not host interference. Unknown environment fields are reported as gaps.
+12. **No power analysis.** `budget_runs` caps a definition; it does not tell the
+    user how many seeds are needed to detect a given effect.
+13. **Memory has no semantic reconciliation.** It stores scoped statements with
+    provenance but does not deduplicate near-identical entries or resolve
+    contradictions between confirmed memories.
 
-## 6. Risks to the next phase
+## 6. Phase 5 deliverables
+
+| Capability | Status | Evidence |
+| --- | --- | --- |
+| Immutable experiment definitions | Implemented | content hash, DRAFT→APPROVED→REVOKED, no update path |
+| Pre-execution manifests | Implemented | `experiment_manifests`, hash before run, observed input hashes |
+| One replicate per run | Implemented | `seed` unique per attempt; retry is a new attempt |
+| Metrics from stdout/JSON/CSV | Implemented | typed contract; undeclared values recorded but excluded |
+| Fairness classification | Implemented | protocol field classification; undeclared drift is `NOT_COMPARABLE` |
+| Fixed statistics | Implemented | paired t/Welch, Holm, Hedges' g, constant-difference handling |
+| Honest verdicts | Implemented | `INCONCLUSIVE`/`NDD`/advantage/non-inferiority |
+| Reproduction bundles | Implemented | hashes, per-arm commits, verify-bundle |
+| Verification Gate F | Implemented | `require_experiment`, `experiment.evidence` |
+| Scoped memory | Implemented | user-only confirmation, provenance, staleness, secret refusal |
+| Imported/external results | Implemented with limitation | `IMPORTED` runs are labelled and not environment-verified |
+| CLI surfaces | Implemented | create/plan/approve/run/compare/show/bundle/verify-bundle; memory commands |
+| Real-repository run | Done | see [phase-5-report](phase-5-report.md) |
+
+## 7. Phase 6 deliverables
+
+Phase 6 in the specification is "design partners and public alpha". The parts
+that require external users (onboarding, design-partner workflows, repeat-use
+measurement, same-model comparison on held-out tasks) remain open. The
+engineering prerequisites for a public alpha are implemented:
+
+| Capability | Status | Evidence |
+| --- | --- | --- |
+| Deterministic finish gate | Implemented | declared checks run before a finish request is honoured; failure is never a pass |
+| Bounded repair loop | Implemented | typed `REPAIR_REQUIRED` feedback, `max_repair_attempts` rounds, same budgets |
+| Checker-vs-code failure attribution | Implemented | pytest exit 1 vs 3/4/5/6, blocked/cancelled/no-verdict handled separately |
+| Retrieval-grounded orientation | Implemented | bounded base-revision spans, scoped symbols, test files, index issues |
+| Durable working memory | Implemented | ledger derived from audited tool calls; survives pause/resume and prompt truncation |
+| Read-only progress guard | Implemented | repeated identical observation is refused, then the run blocks |
+| Declared-check and symbol tools | Implemented | `run_check` (contract keys only, approval-gated), `find_symbol` (excluded paths filtered) |
+| Encoding robustness | Implemented | UTF-8/UTF-16 BOM decoding, labelled lossy reads, UTF-32 refusal |
+| Write fidelity | Implemented | CRLF/CR and BOM preservation on rewrite |
+| Path hardening | Implemented | control characters, bidi overrides, 255-byte components |
+| CLI robustness | Implemented | broken pipe is success; non-encodable output replaced |
+| Real-repository validation | Done | [phase-6-report](phase-6-report.md) §5.2 |
+
+Deliberately still absent after Phase 6: runner-specific exit-code semantics for
+non-pytest checkers, cross-run repair memory, automatic failure localisation,
+language coverage beyond Python, hosted isolation and multi-user auth, and the
+labelled evaluation corpus. Each is a limitation statement in the README rather
+than a hidden stub.
+
+## 8. Risks to the next phase
 
 | Risk | Mitigation |
 | --- | --- |
 | Claiming verification effectiveness without corpus data | Collect exported bundles and human decisions; do not generalise from one repository |
+| Repair loops increasing spend without improving outcomes | `max_repair_attempts` is explicit; measure repair success per round before raising defaults |
+| Treating an in-loop pass as evidence | In-loop results are labelled advisory and never written as verification checks |
 | Worktree isolation colliding with user's own uncommitted work | Require a clean base or a dedicated worktree root; test both |
 | Test execution becoming an escape hatch | Sandbox boundary, explicit approval, no network by default |
 | Retrieval quality plateauing | Measure Hit@5 on the labelled corpus before adding embeddings |

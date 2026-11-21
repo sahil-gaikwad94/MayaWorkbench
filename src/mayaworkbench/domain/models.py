@@ -42,6 +42,12 @@ from mayaworkbench.domain.enums import (
     EventType,
     EvidenceRelation,
     EvidenceStrength,
+    ExperimentDesign,
+    ExperimentProfile,
+    ExperimentRole,
+    ExperimentRunStatus,
+    ExperimentStatus,
+    ExperimentVerdict,
     FindingSeverity,
     ExtractionStatus,
     FileStatus,
@@ -49,9 +55,16 @@ from mayaworkbench.domain.enums import (
     IssueSeverity,
     MappingAuthor,
     MappingEvidenceRelation,
+    MemoryAuthor,
+    MemoryKind,
+    MemoryStatus,
+    MetricAggregation,
+    MetricDirection,
+    MetricsSourceKind,
     ParseCoverage,
     PassageKind,
     QaStatus,
+    ProtocolComparison,
     RetentionClass,
     RiskCategory,
     RiskSeverity,
@@ -784,6 +797,10 @@ class TaskContract(Record):
     required_approvals: list[ApprovalAction] = Field(
         default_factory=lambda: [ApprovalAction.WRITE_ACCESS, ApprovalAction.COMMAND_EXECUTION]
     )
+    #: Gate F: when true, verification refuses to accept the run without a
+    #: comparable experiment attached to the task. Evidence is required, not a
+    #: particular experimental result.
+    require_experiment: bool = False
     contract_version: str = "1.0"
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_by: str = "local-user"
@@ -1088,6 +1105,411 @@ class EvidenceLink(Record):
     created_at: datetime = Field(default_factory=utcnow)
 
 
+# --------------------------------------------------- experiments (Phase 5)
+METRIC_KEY_RE = r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
+
+#: Protocol fields that may be declared as an intended treatment. A key is a
+#: dotted path into :class:`ExperimentProtocol` (or ``command``), so a user can
+#: say exactly which dimension the intervention changed.
+TREATMENT_DIMENSION_PATHS = (
+    "command",
+    "repository.commit",
+    "repository.patch",
+    "dataset.id",
+    "dataset.version",
+    "dataset.fingerprint",
+    "splits",
+    "preprocessing.code_hash",
+    "preprocessing.description",
+    "evaluation.script_path",
+    "evaluation.script_hash",
+    "model.identity",
+    "model.checkpoint_hash",
+    "config.hash",
+    "config.resolved",
+    "environment.lockfile_path",
+    "environment.lockfile_hash",
+    "environment.image_digest",
+    "environment.python_version",
+    "environment.framework_versions",
+    "hardware.profile",
+    "hardware.device",
+    "hardware.cpu_count",
+    "hardware.memory_mb",
+    "determinism.seeded",
+    "determinism.notes",
+    "batch_size",
+    "sequence_length",
+    "stopping_rule",
+    "runtime_limit_seconds",
+)
+
+
+class MetricSpec(Record):
+    """One declared metric: direction, unit and aggregation are part of the
+    definition, because a comparison that infers them after seeing the numbers
+    is not a pre-registered comparison."""
+
+    key: str = Field(pattern=METRIC_KEY_RE)
+    direction: MetricDirection
+    unit: str = Field(default="", max_length=80)
+    aggregation: MetricAggregation = MetricAggregation.LAST
+    primary: bool = False
+    description: str = Field(default="", max_length=2000)
+
+
+class ExperimentDataset(Record):
+    id: str = Field(default="", max_length=500)
+    version: str = Field(default="", max_length=200)
+    fingerprint: str = Field(default="", max_length=200)
+    fingerprint_method: str = Field(default="", max_length=200)
+    path: str | None = Field(default=None, max_length=2000)
+
+
+class ExperimentPreprocessing(Record):
+    code_hash: str = Field(default="", max_length=200)
+    description: str = Field(default="", max_length=2000)
+
+
+class ExperimentEvaluation(Record):
+    script_path: str | None = Field(default=None, max_length=2000)
+    script_hash: str = Field(default="", max_length=200)
+
+
+class ExperimentModelRef(Record):
+    identity: str = Field(default="", max_length=500)
+    checkpoint_hash: str = Field(default="", max_length=200)
+
+
+class ExperimentConfigRef(Record):
+    resolved: dict[str, Any] = Field(default_factory=dict)
+    hash: str = Field(default="", max_length=200)
+
+
+class ExperimentEnvironment(Record):
+    lockfile_path: str | None = Field(default=None, max_length=2000)
+    lockfile_hash: str = Field(default="", max_length=200)
+    image_digest: str = Field(default="", max_length=200)
+    python_version: str = Field(default="", max_length=80)
+    framework_versions: dict[str, str] = Field(default_factory=dict)
+
+
+class ExperimentHardware(Record):
+    profile: str = Field(default="", max_length=200)
+    device: str = Field(default="", max_length=80)
+    cpu_count: int | None = Field(default=None, ge=1)
+    memory_mb: int | None = Field(default=None, ge=1)
+
+
+class ExperimentDeterminism(Record):
+    seeded: bool = True
+    notes: str = Field(default="", max_length=2000)
+
+
+class ExperimentProtocol(Record):
+    """Everything that must match (or be declared as the treatment) before two
+    experiment arms may be compared. Fields left empty are *unknown*, and a
+    comparison reports them as unknown rather than treating them as equal."""
+
+    dataset: ExperimentDataset = Field(default_factory=ExperimentDataset)
+    splits: dict[str, str] = Field(default_factory=dict)
+    preprocessing: ExperimentPreprocessing = Field(default_factory=ExperimentPreprocessing)
+    evaluation: ExperimentEvaluation = Field(default_factory=ExperimentEvaluation)
+    model: ExperimentModelRef = Field(default_factory=ExperimentModelRef)
+    config: ExperimentConfigRef = Field(default_factory=ExperimentConfigRef)
+    environment: ExperimentEnvironment = Field(default_factory=ExperimentEnvironment)
+    hardware: ExperimentHardware = Field(default_factory=ExperimentHardware)
+    determinism: ExperimentDeterminism = Field(default_factory=ExperimentDeterminism)
+    batch_size: int | None = Field(default=None, ge=1)
+    sequence_length: int | None = Field(default=None, ge=1)
+    stopping_rule: str = Field(default="", max_length=1000)
+    runtime_limit_seconds: int | None = Field(default=None, ge=1)
+
+
+class MetricsSource(Record):
+    """Where a run's metrics come from. ``path`` is workspace-relative and is
+    validated at execution time."""
+
+    kind: MetricsSourceKind = MetricsSourceKind.STDOUT_JSON
+    path: str | None = Field(default=None, max_length=1000)
+
+
+class ExperimentBudget(Record):
+    max_runs: int = Field(default=10, ge=1, le=100)
+    max_total_runtime_seconds: int = Field(default=3600, ge=1, le=7 * 86_400)
+    max_artifact_bytes: int = Field(default=5_000_000, ge=1024, le=200_000_000)
+    max_metric_observations: int = Field(default=10_000, ge=1, le=1_000_000)
+
+
+class ExperimentDefinition(Record):
+    """An immutable, approval-gated experiment declaration.
+
+    The definition is the pre-registration: role, command, seeds, metrics,
+    directions, protocol and budgets. It is hashed in full (including the hash
+    of the protocol), so any later edit produces a different definition that
+    requires its own approval.
+    """
+
+    id: str
+    project_id: str
+    repository_id: str
+    snapshot_id: str
+    base_commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    task_id: str | None = None
+    name: str = Field(min_length=1, max_length=200)
+    hypothesis: str = Field(min_length=1, max_length=8000)
+    role: ExperimentRole
+    profile: ExperimentProfile
+    command: list[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=300, ge=1, le=86_400)
+    seeds: list[int] = Field(min_length=1, max_length=100)
+    metrics: list[MetricSpec] = Field(min_length=1)
+    metrics_source: MetricsSource = Field(default_factory=MetricsSource)
+    protocol: ExperimentProtocol = Field(default_factory=ExperimentProtocol)
+    treatment_dimensions: list[str] = Field(
+        default_factory=lambda: ["command", "repository.commit", "repository.patch"]
+    )
+    allowed_variation: list[str] = Field(default_factory=list)
+    budget: ExperimentBudget = Field(default_factory=ExperimentBudget)
+    min_seeds: int = Field(default=2, ge=1, le=100)
+    non_inferiority_margin: float | None = Field(default=None, ge=0.0)
+    status: ExperimentStatus = ExperimentStatus.DRAFT
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    approval_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    revoked_reason: str | None = Field(default=None, max_length=2000)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_by: str = "local-user"
+    created_at: datetime = Field(default_factory=utcnow)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("seeds")
+    @classmethod
+    def _unique_seeds(cls, value: list[int]) -> list[int]:
+        if len(set(value)) != len(value):
+            raise ValueError("seeds must be unique")
+        if any(seed < 0 for seed in value):
+            raise ValueError("seeds must be non-negative")
+        return value
+
+    @field_validator("metrics")
+    @classmethod
+    def _metrics_shape(cls, value: list[MetricSpec]) -> list[MetricSpec]:
+        keys = [metric.key for metric in value]
+        if len(set(keys)) != len(keys):
+            raise ValueError("metric keys must be unique")
+        primaries = [metric for metric in value if metric.primary]
+        if len(primaries) != 1:
+            raise ValueError("exactly one metric must be primary")
+        return value
+
+    @property
+    def primary_metric(self) -> MetricSpec:
+        return next(metric for metric in self.metrics if metric.primary)
+
+
+class ExperimentManifest(Record):
+    """Immutable pre-run provenance record.
+
+    It is built and hashed *before* the command starts, so a run cannot rewrite
+    what it was asked to do after seeing the result. Outcomes live on
+    :class:`ExperimentRun`, never inside the manifest.
+    """
+
+    id: str
+    experiment_id: str
+    project_id: str
+    snapshot_id: str
+    role: ExperimentRole
+    seed: int = Field(ge=0)
+    attempt: int = Field(ge=1)
+    definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    repository_id: str
+    commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    snapshot_kind: str = Field(max_length=40)
+    includes_worktree_patch: bool = False
+    patch_hash: str | None = Field(default=None, max_length=200)
+    protocol: ExperimentProtocol = Field(default_factory=ExperimentProtocol)
+    command: list[str] = Field(default_factory=list)
+    limits: dict[str, Any] = Field(default_factory=dict)
+    environment: dict[str, Any] = Field(default_factory=dict)
+    verified_inputs: dict[str, Any] = Field(default_factory=dict)
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_version: str = "1.0"
+    created_at: datetime = Field(default_factory=utcnow)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperimentRun(Record):
+    """One execution attempt of one seed. Append-only after completion."""
+
+    id: str
+    experiment_id: str
+    project_id: str
+    task_id: str | None = None
+    manifest_id: str | None = None
+    seed: int = Field(ge=0)
+    attempt: int = Field(ge=1)
+    status: ExperimentRunStatus = ExperimentRunStatus.PENDING
+    command: list[str] = Field(default_factory=list)
+    exit_code: int | None = None
+    timed_out: bool = False
+    blocked: bool = False
+    cancelled: bool = False
+    duration_ms: int | None = None
+    cpu_user_ms: int | None = None
+    cpu_system_ms: int | None = None
+    max_rss_kb: int | None = None
+    output_artifact_id: str | None = None
+    metrics_artifact_id: str | None = None
+    metrics_ingested: bool = False
+    observation_count: int = 0
+    metrics_error: str | None = None
+    error: str | None = None
+    termination_reason: str = ""
+    workspace_kept: bool = False
+    workspace_path: str | None = None
+    started_at: datetime = Field(default_factory=utcnow)
+    completed_at: datetime | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        return self.status == ExperimentRunStatus.COMPLETED and self.metrics_ingested
+
+
+class MetricObservation(Record):
+    """One raw metric value. Replicate aggregation happens at comparison time
+    from these rows, so the raw evidence is never discarded."""
+
+    id: str
+    experiment_id: str
+    run_id: str
+    project_id: str
+    metric_key: str = Field(pattern=METRIC_KEY_RE)
+    value: float
+    sample_index: int = Field(default=0, ge=0)
+    step: float | None = None
+    source: str = Field(default="STDOUT_JSON", max_length=40)
+    recorded_at: datetime = Field(default_factory=utcnow)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("value")
+    @classmethod
+    def _finite(cls, value: float) -> float:
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("metric observations must be finite numbers")
+        return value
+
+
+class ProtocolFinding(Record):
+    """One protocol-field difference between two experiment arms."""
+
+    path: str = Field(min_length=1, max_length=200)
+    classification: ProtocolComparison
+    baseline: Any = None
+    candidate: Any = None
+    note: str = Field(default="", max_length=2000)
+
+
+class MetricComparison(Record):
+    """Per-metric statistics from one fair comparison.
+
+    Optional numbers are ``None`` when the data cannot support them (for
+    example a p-value with one observation). Nothing is fabricated.
+    """
+
+    key: str = Field(pattern=METRIC_KEY_RE)
+    direction: MetricDirection
+    unit: str = ""
+    aggregation: MetricAggregation = MetricAggregation.LAST
+    primary: bool = False
+    baseline_values: list[float] = Field(default_factory=list)
+    candidate_values: list[float] = Field(default_factory=list)
+    baseline_mean: float | None = None
+    candidate_mean: float | None = None
+    baseline_sd: float | None = None
+    candidate_sd: float | None = None
+    baseline_median: float | None = None
+    candidate_median: float | None = None
+    difference: float | None = None
+    ci_low: float | None = None
+    ci_high: float | None = None
+    t_statistic: float | None = None
+    degrees_of_freedom: float | None = None
+    p_value: float | None = None
+    p_value_adjusted: float | None = None
+    effect_size: float | None = None
+    effect_size_ci_low: float | None = None
+    effect_size_ci_high: float | None = None
+    method: str = Field(default="", max_length=80)
+    favors: str = Field(default="", max_length=20)
+    within_margin: bool | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class ExperimentComparison(Record):
+    """A persisted, hash-addressed comparison of two experiment definitions."""
+
+    id: str
+    project_id: str
+    task_id: str | None = None
+    baseline_experiment_id: str
+    candidate_experiment_id: str
+    baseline_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    candidate_definition_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verdict: ExperimentVerdict
+    design: ExperimentDesign
+    comparable: bool
+    findings: list[ProtocolFinding] = Field(default_factory=list)
+    metrics: list[MetricComparison] = Field(default_factory=list)
+    baseline_run_ids: list[str] = Field(default_factory=list)
+    candidate_run_ids: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    report_artifact_id: str | None = None
+    json_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_version: str = "1.0"
+    created_at: datetime = Field(default_factory=utcnow)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class MemorySource(Record):
+    """Typed provenance for one memory item."""
+
+    kind: str = Field(pattern=r"^[A-Z][A-Z0-9_]{2,40}$")
+    ref: str = Field(min_length=1, max_length=1000)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    note: str = Field(default="", max_length=2000)
+
+
+class ProjectMemory(Record):
+    """Durable project knowledge (§15).
+
+    Model-authored items start ``UNCONFIRMED``; only a user decision confirms
+    one. Commit-scoped items go ``STALE`` when the pinned revision is no longer
+    the repository's current commit; a failure is never generalised into a rule.
+    """
+
+    id: str
+    project_id: str
+    kind: MemoryKind
+    status: MemoryStatus = MemoryStatus.UNCONFIRMED
+    author_kind: MemoryAuthor = MemoryAuthor.USER
+    title: str = Field(min_length=1, max_length=200)
+    statement: str = Field(min_length=1, max_length=8000)
+    scope: str = Field(default="project", max_length=500)
+    repository_id: str | None = None
+    snapshot_id: str | None = None
+    commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    confidence: str = Field(default="MEDIUM", pattern=r"^(LOW|MEDIUM|HIGH)$")
+    sources: list[MemorySource] = Field(default_factory=list)
+    supersedes_id: str | None = None
+    last_validated_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class WorkerJob(Record):
     """Durable queue entry for the separate local worker process."""
 
@@ -1154,6 +1576,27 @@ __all__ = [
     "CriterionAssessment",
     "VerificationReport",
     "EvidenceLink",
+    "MetricSpec",
+    "ExperimentDataset",
+    "ExperimentPreprocessing",
+    "ExperimentEvaluation",
+    "ExperimentModelRef",
+    "ExperimentConfigRef",
+    "ExperimentEnvironment",
+    "ExperimentHardware",
+    "ExperimentDeterminism",
+    "ExperimentProtocol",
+    "MetricsSource",
+    "ExperimentBudget",
+    "ExperimentDefinition",
+    "ExperimentManifest",
+    "ExperimentRun",
+    "MetricObservation",
+    "ProtocolFinding",
+    "MetricComparison",
+    "ExperimentComparison",
+    "MemorySource",
+    "ProjectMemory",
     "ArtifactKind",
     "EventType",
     "QaStatus",

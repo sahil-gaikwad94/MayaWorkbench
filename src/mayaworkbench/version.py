@@ -7,7 +7,7 @@ reproduced and stale results can be detected instead of silently reused.
 
 from __future__ import annotations
 
-MAYA_VERSION = "0.3.0"
+MAYA_VERSION = "0.5.0"
 
 #: Bump whenever index output changes in a way that invalidates prior indexes.
 INDEXER_VERSION = "1.0.0"
@@ -16,7 +16,7 @@ INDEXER_VERSION = "1.0.0"
 CONTRACT_VERSION = "1.0"
 
 #: Version of the exported JSON schema bundle.
-SCHEMA_BUNDLE_VERSION = "1.2"
+SCHEMA_BUNDLE_VERSION = "1.4"
 
 #: Version of the deterministic answer protocol used by ``maya ask``.
 QA_PROTOCOL_VERSION = "1.0"
@@ -44,7 +44,18 @@ MEMO_PROTOCOL_VERSION = "1.0"
 TASK_PROTOCOL_VERSION = "1.0"
 
 #: Version of the typed tool gateway contract and command policy.
-TOOL_GATEWAY_VERSION = "1.0"
+TOOL_GATEWAY_VERSION = "1.1"
+
+#: Version of the bounded agent loop protocol (orientation, finish gate,
+#: repair feedback and the durable ledger). A run records this so its behaviour
+#: is interpretable after the loop changes.
+AGENT_LOOP_VERSION = "1.1.0"
+
+#: Version of the experiment definition/manifest/comparison protocol.
+EXPERIMENT_PROTOCOL_VERSION = "1.0"
+
+#: Version of the durable project memory record protocol.
+MEMORY_PROTOCOL_VERSION = "1.0"
 
 __all__ = [
     "MAYA_VERSION",
@@ -60,4 +71,7 @@ __all__ = [
     "MEMO_PROTOCOL_VERSION",
     "TASK_PROTOCOL_VERSION",
     "TOOL_GATEWAY_VERSION",
+    "AGENT_LOOP_VERSION",
+    "EXPERIMENT_PROTOCOL_VERSION",
+    "MEMORY_PROTOCOL_VERSION",
 ]

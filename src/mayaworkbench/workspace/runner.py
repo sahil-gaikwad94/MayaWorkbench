@@ -90,6 +90,10 @@ class CommandPolicy:
     #: the CPU guard is a backstop for a wall-clock failure, not the primary
     #: limit. Tests set it directly to exercise the rlimit path.
     cpu_seconds: int | None = None
+    #: Extra non-secret environment entries for one job (an experiment seed, for
+    #: example). The runner's allowlist is the base; these are merged on top and
+    #: their names are reported in ``env_names`` so provenance stays visible.
+    extra_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_constraints(cls, constraints: TaskConstraints) -> "CommandPolicy":
@@ -158,6 +162,7 @@ class CommandRunner:
         self._tmp = self.run_home / "tmp"
         self._tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._network_state: tuple[bool, str] | None = None
+        self._network_prefix: list[str] | None = None
 
     # ------------------------------------------------------------------ policy
     def validate(self, argv: list[str], *, timeout_seconds: int) -> list[str]:
@@ -234,6 +239,7 @@ class CommandRunner:
     def _environment(self) -> dict[str, str]:
         path = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
         env = {
+            **{key: str(value) for key, value in self.policy.extra_env.items()},
             "PATH": path,
             "HOME": str(self.run_home),
             "TMPDIR": str(self._tmp),
@@ -268,26 +274,45 @@ class CommandRunner:
         if not unshare:
             self._network_state = (False, "unshare is not installed on this host")
             return self._network_state
-        try:
-            probe = subprocess.run(
-                [unshare, "-n", sys.executable, "-c", _NETWORK_PROBE],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            self._network_state = (False, f"network-isolation probe failed: {exc}")
+        # Rootless hosts (Docker without CAP_SYS_ADMIN, many CI runners) refuse
+        # a bare `unshare -n` but allow a user+network namespace. The second
+        # attempt is still a real network namespace with no route; the probe
+        # below verifies that rather than assuming it.
+        attempts: list[tuple[list[str], str]] = [
+            (["-n"], "network_namespace"),
+            (["-Urn"], "network_namespace_user"),
+        ]
+        failures: list[str] = []
+        for flags, enforcement in attempts:
+            try:
+                probe = subprocess.run(
+                    [unshare, *flags, sys.executable, "-c", _NETWORK_PROBE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=10,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failures.append(f"{' '.join(flags)}: {exc}")
+                continue
+            if probe.returncode != 0:
+                detail = (probe.stderr or b"").decode("utf-8", errors="replace").strip()
+                failures.append(
+                    " ".join(flags)
+                    + ": "
+                    + {
+                        "3": "the isolated namespace still has a default route",
+                        "4": "the isolated namespace could not be inspected",
+                    }.get(str(probe.returncode), detail or f"probe exited {probe.returncode}")
+                )
+                continue
+            self._network_prefix = [unshare, *flags, "--"]
+            self._network_state = (True, enforcement)
             return self._network_state
-        if probe.returncode != 0:
-            detail = (probe.stderr or b"").decode("utf-8", errors="replace").strip()
-            reason = {
-                3: "the isolated namespace still has a default route",
-                4: "the isolated namespace could not be inspected",
-            }.get(probe.returncode, detail or f"probe exited {probe.returncode}")
-            self._network_state = (False, f"network isolation unavailable: {reason}")
-            return self._network_state
-        self._network_state = (True, "network_namespace")
+        self._network_state = (
+            False,
+            "network isolation unavailable: " + "; ".join(failures),
+        )
         return self._network_state
 
     # ---------------------------------------------------------- resource limits
@@ -428,7 +453,7 @@ class CommandRunner:
                 env=env,
             )
         if network_isolated:
-            resolved = [shutil.which("unshare") or "unshare", "-n", "--", *resolved]
+            resolved = [*(self._network_prefix or []), *resolved]
 
         limits_available = self._limits_available()
         if not limits_available:

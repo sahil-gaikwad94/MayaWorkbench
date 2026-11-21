@@ -25,13 +25,23 @@ from mayaworkbench.repositories.git import GitClient, TreeEntry
 # High-confidence secret signatures only. Aggressive entropy heuristics create
 # false exclusions, which are themselves an integrity risk, so anything less
 # certain is reported as a low-confidence hint rather than dropped.
-SECRET_CONTENT_PATTERNS: tuple[tuple[re.Pattern[bytes], str], ...] = (
-    (re.compile(rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"), "private key block"),
-    (re.compile(rb"\bAKIA[0-9A-Z]{16}\b"), "AWS access key id"),
-    (re.compile(rb"\bASIA[0-9A-Z]{16}\b"), "AWS temporary access key id"),
-    (re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{30,}\b"), "GitHub token"),
-    (re.compile(rb"\bsk-[A-Za-z0-9]{32,}\b"), "API secret key"),
-    (re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"), "Slack token"),
+SECRET_SIGNATURES: tuple[tuple[str, str], ...] = (
+    (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----", "private key block"),
+    (r"\bAKIA[0-9A-Z]{16}\b", "AWS access key id"),
+    (r"\bASIA[0-9A-Z]{16}\b", "AWS temporary access key id"),
+    (r"\bgh[pousr]_[A-Za-z0-9]{30,}\b", "GitHub token"),
+    (r"\bsk-[A-Za-z0-9]{32,}\b", "API secret key"),
+    (r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", "Slack token"),
+)
+
+SECRET_CONTENT_PATTERNS: tuple[tuple[re.Pattern[bytes], str], ...] = tuple(
+    (re.compile(pattern.encode("utf-8")), label) for pattern, label in SECRET_SIGNATURES
+)
+
+#: The same signatures for already-decoded text (UTF-16/UTF-8 with a BOM), where
+#: the byte patterns would not match because of interleaved NUL bytes.
+SECRET_TEXT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern), label) for pattern, label in SECRET_SIGNATURES
 )
 
 BINARY_SNIFF_BYTES = 8192
@@ -132,23 +142,67 @@ def secret_filename_match(path: str, patterns: tuple[str, ...]) -> str | None:
     return None
 
 
+UTF8_BOM = "\ufeff".encode("utf-8")
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+
+
+def has_text_bom(data: bytes) -> bool:
+    return data.startswith(UTF8_BOM) or data.startswith(UTF16_BOMS)
+
+
+def decode_indexable_text(data: bytes) -> str:
+    """Decode text the way the index stores it, honouring a byte-order mark.
+
+    A BOM is metadata, not content. Left in place, a UTF-8 BOM becomes an
+    invisible ``\ufeff`` character that makes ``ast.parse`` fail with "invalid
+    non-printable character", so a Windows-edited Python file would be indexed
+    as a parse error for no real reason. UTF-16 text contains NUL bytes and is
+    otherwise mistaken for binary. Both are decoded here, once, so the indexer,
+    search and the AST parser agree about what the file contains.
+    """
+    if data.startswith(UTF8_BOM):
+        return data.decode("utf-8-sig")
+    if data.startswith(UTF16_BOMS):
+        return data.decode("utf-16")
+    return data.decode("utf-8")
+
+
 def inspect_content(data: bytes, policy: DiscoveryPolicy) -> tuple[bool, IssueKind | None, str]:
     """Decide whether content is safe/indexable.
 
-    Returns ``(indexable, skip_kind, detail)``. Non-UTF-8 content is skipped
-    rather than guessed at, and secret-looking content is never stored.
+    Returns ``(indexable, skip_kind, detail)``. Content that is not decodable
+    text is skipped rather than guessed at, and secret-looking content is never
+    stored. A byte-order mark is a decoding hint, never a reason to skip.
     """
-    if b"\x00" in data[:BINARY_SNIFF_BYTES]:
-        return False, IssueKind.SKIPPED_BINARY, "binary content (NUL byte)"
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError:
-        return False, IssueKind.ENCODING_ERROR, "not valid UTF-8; content was not indexed"
+    bom_text = False
+    if has_text_bom(data):
+        try:
+            text = decode_indexable_text(data)
+            bom_text = True
+        except UnicodeDecodeError:
+            return (
+                False,
+                IssueKind.ENCODING_ERROR,
+                "content has a byte-order mark but does not decode as text",
+            )
+    else:
+        if b"\x00" in data[:BINARY_SNIFF_BYTES]:
+            return False, IssueKind.SKIPPED_BINARY, "binary content (NUL byte)"
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return False, IssueKind.ENCODING_ERROR, "not valid UTF-8; content was not indexed"
     if policy.scan_content_for_secrets:
-        head = data[:200_000]
-        for pattern, label in SECRET_CONTENT_PATTERNS:
-            if pattern.search(head):
-                return False, IssueKind.SKIPPED_SECRET, f"possible secret ({label})"
+        if bom_text:
+            # The byte patterns would not match across UTF-16's interleaved NULs.
+            for pattern, label in SECRET_TEXT_PATTERNS:
+                if pattern.search(text[:200_000]):
+                    return False, IssueKind.SKIPPED_SECRET, f"possible secret ({label})"
+        else:
+            head = data[:200_000]
+            for pattern, label in SECRET_CONTENT_PATTERNS:
+                if pattern.search(head):
+                    return False, IssueKind.SKIPPED_SECRET, f"possible secret ({label})"
     return True, None, ""
 
 
