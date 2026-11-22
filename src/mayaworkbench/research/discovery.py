@@ -28,6 +28,7 @@ from mayaworkbench.domain.enums import ActorKind, ArtifactKind, EventType
 from mayaworkbench.domain.models import (
     CLAIM_GRAPH_VERSION,
     Project,
+    ResearchDocument,
     SourceMetadata,
     WorkflowEvent,
 )
@@ -38,6 +39,7 @@ from mayaworkbench.research.models import Contract
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.db import Database
 from mayaworkbench.storage.stores import (
+    ClaimCitationStore,
     EventStore,
     ProjectStore,
     ResearchClaimStore,
@@ -262,6 +264,7 @@ class DiscoveryService:
         artifacts: ArtifactStore,
         events: EventStore,
         fetcher: DocumentFetcher,
+        citations: ClaimCitationStore | None = None,
     ):
         self.db = db
         self.projects = projects
@@ -272,6 +275,7 @@ class DiscoveryService:
         self.events = events
         self.fetcher = fetcher
         self._providers: dict[str, SearchProvider] = {}
+        self._citations = citations
 
     def register_provider(self, provider: SearchProvider) -> None:
         """Register or replace a provider (tests inject seeded offline data)."""
@@ -407,18 +411,65 @@ class DiscoveryService:
             )
         return metadata
 
-    def versions(self, project: Project, key: str) -> dict[str, Any]:
+    @property
+    def citations(self) -> ClaimCitationStore:
+        """Lazy citation store used to project which claims cite a bad source."""
+        if self._citations is None:
+            self._citations = ClaimCitationStore(self.db)
+        return self._citations
+
+    def _status_alert(
+        self, metadata: SourceMetadata, documents: Sequence[ResearchDocument]
+    ) -> dict[str, Any]:
+        """Project one non-ACTIVE metadata record into affected documents/claims."""
+        by_id: dict[str, Any] = {
+            citation.id: citation
+            for citation in self.citations.list_by_source(metadata.id)
+        }
+        for citation in self.citations.list_by_documents([item.id for item in documents]):
+            by_id.setdefault(citation.id, citation)
+        affected = sorted(by_id.values(), key=lambda item: (item.created_at, item.id))
+        seen: set[tuple[str, int]] = set()
+        document_refs: list[dict[str, Any]] = []
+        for citation in affected:
+            identity = (citation.document_id, citation.document_version)
+            if identity not in seen:
+                seen.add(identity)
+                document_refs.append({"id": identity[0], "version": identity[1]})
+        return {
+            "source_metadata_id": metadata.id,
+            "document_key": metadata.document_key,
+            "status": metadata.status.value,
+            "version_label": metadata.version_label,
+            "correction_of": metadata.correction_of,
+            "corrected_by": metadata.corrected_by,
+            "retraction_date": metadata.retraction_date,
+            "retraction_reason": metadata.retraction_reason,
+            "relation_note": metadata.relation_note,
+            "documents": document_refs,
+            "claim_ids": sorted({citation.claim_id for citation in affected}),
+        }
+
+    def versions(
+        self, project: Project, document_key: str | None = None
+    ) -> dict[str, Any]:
         """Combine registered document versions with saved source metadata.
 
-        A ``key`` is a document key (a DOI or URL is used verbatim). Versions
-        are returned newest first and carry a claim count so a memo can tell
-        which content version a typed claim actually refers to.
+        A document key (a DOI or URL is used verbatim) narrows the projection;
+        omitting it reports project-wide version alerts. Versions are returned
+        newest first and carry a claim count. ``status_alerts`` lists every
+        non-ACTIVE metadata record with the exact document ids/versions and
+        claim ids that cite it. No external calls are made here.
         """
-        cleaned = (key or "").strip()
-        if not cleaned:
-            raise UsageError("A document key is required")
-        documents = self.documents.list_versions(project.id, cleaned)
-        sources = self.sources.list_by_key(project.id, cleaned)
+        cleaned = (document_key or "").strip()
+        if cleaned:
+            documents = self.documents.list_versions(project.id, cleaned)
+            sources = self.sources.list_by_key(project.id, cleaned)
+            alerting = self.sources.list_non_active_by_key(project.id, cleaned)
+        else:
+            documents = []
+            sources = self.sources.list_by_project(project.id)
+            alerting = self.sources.list_non_active(project.id)
         return {
             "key": cleaned,
             "project_id": project.id,
@@ -430,6 +481,7 @@ class DiscoveryService:
                 for document in documents
             ],
             "source_metadata": [item.model_dump(mode="json") for item in sources],
+            "status_alerts": [self._status_alert(item, documents) for item in alerting],
         }
 
     def get_source(self, metadata_id: str) -> SourceMetadata:

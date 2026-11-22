@@ -194,8 +194,22 @@ class RepositoryMapService:
         ast_languages = sorted(
             {row.language for row in languages if row.language in LANGUAGES_WITH_AST}
         )
+        # The indexer records which parser actually produced each language's
+        # symbols. Use that evidence instead of a static "everything non-Python
+        # is heuristic" string, which became false when Tree-sitter was added.
+        parser_provenance = metadata.get("parser_provenance") or {}
+        cst_languages = sorted(
+            language
+            for language, provenance in parser_provenance.items()
+            if str(provenance).startswith("TREE_SITTER:")
+        )
         heuristic_languages = sorted(
-            {row.language for row in languages if row.language in LANGUAGES_WITH_HEURISTIC_SYMBOLS}
+            {
+                row.language
+                for row in languages
+                if row.language in LANGUAGES_WITH_HEURISTIC_SYMBOLS
+                and row.language not in cst_languages
+            }
         )
         lexical_only = sorted(
             {
@@ -207,9 +221,20 @@ class RepositoryMapService:
             }
         )
         limitations = [
-            "Python is parsed with the standard-library AST; JavaScript/TypeScript/Go/Rust/"
-            "C/C++/CUDA use bounded heuristic declaration discovery with LOW-confidence symbols and "
-            "HEURISTIC relation provenance; every other language is lexical-only.",
+            "Python is parsed with the standard-library AST "
+            + (
+                f"; concrete syntax trees from Tree-sitter are used for {', '.join(cst_languages)} "
+                "with HIGH-confidence AST_SYMBOL provenance"
+                if cst_languages
+                else ""
+            )
+            + (
+                f"; {', '.join(heuristic_languages)} use bounded heuristic declaration "
+                "discovery with LOW-confidence symbols and HEURISTIC relation provenance"
+                if heuristic_languages
+                else ""
+            )
+            + "; every other language is lexical-only.",
             "Static call graphs are incomplete in a dynamic language; unresolved edges are "
             "reported with LOW confidence rather than omitted.",
         ]

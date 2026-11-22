@@ -25,6 +25,7 @@ from mayaworkbench.api.validation import (
     param,
 )
 from mayaworkbench.app.container import Services
+from mayaworkbench.errors import NotFoundError
 
 
 @dataclass
@@ -39,6 +40,57 @@ def _dump(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     return value
+
+
+def _enum_value(value: Any) -> Any:
+    """Serialise a StrEnum to its value without changing plain values."""
+
+    return getattr(value, "value", value)
+
+
+# Only these payload keys may reach a timeline item's free-text detail. This
+# keeps approval nonces, HMACs, full tool arguments and other secrets out of the
+# read-only timeline even though the underlying event payload is unrestricted.
+_SAFE_EVENT_DETAIL_KEYS = (
+    "state",
+    "previous_state",
+    "reason",
+    "action",
+    "summary",
+    "title",
+    "name",
+    "status",
+    "outcome",
+    "decision",
+    "phase",
+    "note",
+    "message",
+)
+
+
+def _event_detail(event: dict[str, Any]) -> str:
+    payload = event.get("payload") or {}
+    parts = [
+        f"{key}={str(payload[key])[:200]}"
+        for key in _SAFE_EVENT_DETAIL_KEYS
+        if key in payload and payload[key] not in (None, "")
+    ]
+    if not parts:
+        parts.append(f"{event.get('entity_type', 'entity')}={event.get('entity_id', '')}")
+    return "; ".join(parts)[:1000]
+
+
+def _tool_call_detail(call: dict[str, Any]) -> str:
+    """The only tool-call fields exposed: no arguments, approvals or secrets."""
+
+    fields = {
+        "tool_name": call.get("tool_name"),
+        "status": call.get("status"),
+        "duration_ms": call.get("duration_ms"),
+        "exit_code": call.get("exit_code"),
+        "error": call.get("error"),
+    }
+    return json.dumps(fields, sort_keys=True, default=str)[:2000]
 
 
 def health_payload(services: Services) -> dict[str, Any]:
@@ -177,6 +229,13 @@ class ControlPlane:
                 "symbols": [_dump(item) for item in hits],
             }
 
+        if path.startswith("/research/reproduction/"):
+            run_id = self._id_segment(path, "/research/reproduction/")
+            svc.runs.get(run_id)  # 404 when the run does not exist
+            # A read must stay a read: no new artifact or event per GET.
+            report, _ = svc.reproduction.build(run_id, persist=False)
+            return {"report": _dump(report)}
+
         if path == "/research/documents":
             project = self._project(query)
             limit = param(query, "limit", as_int=True, minimum=1, maximum=1000, default=50)
@@ -208,6 +267,26 @@ class ControlPlane:
 
         if path.startswith("/runs/"):
             rest = path[len("/runs/") :]
+            if rest.endswith("/diff"):
+                run_id = self._id_segment(rest, "", suffix="/diff")
+                svc.runs.get(run_id)  # 404 when the run does not exist
+                diff = svc.diffs.get_by_run(run_id)
+                if diff is None:
+                    raise ApiError(
+                        404,
+                        "NOT_FOUND",
+                        "This run has no captured candidate patch",
+                        hint="Let the worker finish or call `maya task diff <run>` first.",
+                    )
+                return {
+                    "run_id": run_id,
+                    "patch": svc.artifacts.read_text(diff.patch_artifact_id),
+                    "patch_sha256": diff.patch_sha256,
+                    "base_commit_sha": diff.base_commit_sha,
+                    "files": [_dump(item) for item in diff.files],
+                    "additions": diff.additions,
+                    "deletions": diff.deletions,
+                }
             if rest.endswith("/events"):
                 run_id = self._id_segment(rest, "", suffix="/events")
                 svc.runs.get(run_id)  # 404 when the run does not exist
@@ -217,6 +296,15 @@ class ControlPlane:
                     "run_id": run_id,
                     "events": [_dump(item) for item in events],
                 }
+            if rest.endswith("/timeline"):
+                run_id = self._id_segment(rest, "", suffix="/timeline")
+                return self._timeline(run_id)
+            if rest.endswith("/plan"):
+                run_id = self._id_segment(rest, "", suffix="/plan")
+                return self._plan(run_id)
+            if rest.endswith("/evidence"):
+                run_id = self._id_segment(rest, "", suffix="/evidence")
+                return self._evidence(run_id)
             run_id = self._id_segment(path, "/runs/")
             return svc.task_service.run_view(run_id)
 
@@ -263,6 +351,10 @@ class ControlPlane:
                     for item in definitions
                 ]
             }
+
+        if path.startswith("/experiments/") and path.endswith("/comparison"):
+            identifier = self._id_segment(path, "/experiments/", suffix="/comparison")
+            return self._comparison(identifier)
 
         if path == "/events/stream":
             return self._stream_events(query)
@@ -377,6 +469,185 @@ class ControlPlane:
                         "content": base64.b64encode(data).decode("ascii"),
                     }
             return {"manifest": result.manifest, "files": files}
+
+    # --------------------------------------------------- workbench read views
+    def _timeline(self, run_id: str) -> dict[str, Any]:
+        """Ordered, read-only event + tool-call stream for one run."""
+
+        svc = self.svc
+        run = svc.runs.get(run_id)  # 404 when the run does not exist
+        raw_events, next_cursor, has_more = read_events(
+            svc, project_id=run.project_id, after=0, limit=500
+        )
+        calls = svc.calls.list_by_run(run_id, limit=200)
+
+        items: list[dict[str, Any]] = []
+        for row in raw_events:
+            event = row["event"]
+            if event.get("run_id") != run_id:
+                continue
+            items.append(
+                {
+                    "seq": row["seq"],
+                    "at": event.get("occurred_at"),
+                    "kind": "event",
+                    "label": _enum_value(event.get("event_type")),
+                    "detail": _event_detail(event),
+                    "ref": event.get("entity_id") or None,
+                }
+            )
+        for call_dump in (_dump(call) for call in calls):
+            if call_dump.get("run_id") != run_id:
+                continue
+            items.append(
+                {
+                    "seq": None,
+                    "at": call_dump.get("started_at"),
+                    "kind": "tool_call",
+                    "label": call_dump.get("tool_name"),
+                    "detail": _tool_call_detail(call_dump),
+                    "ref": call_dump.get("id"),
+                }
+            )
+
+        items.sort(
+            key=lambda item: (
+                item["at"] or "",
+                item["seq"] if item["seq"] is not None else -1,
+                item["kind"],
+            )
+        )
+        truncated = bool(has_more) or len(raw_events) >= 500 or len(calls) >= 200
+        return {"run_id": run_id, "items": items, "truncated": truncated}
+
+    def _plan(self, run_id: str) -> dict[str, Any]:
+        """Approved plan, contract projection, scoped approvals and workspace."""
+
+        svc = self.svc
+        run = svc.runs.get(run_id)  # 404 when the run does not exist
+        contract = svc.contracts.get(run.contract_id)
+
+        plan = None
+        try:
+            plan = svc.plans.latest_for_run(run_id)
+        except NotFoundError:
+            if run.plan_id:
+                try:
+                    plan = svc.plans.get(run.plan_id)
+                except NotFoundError:
+                    plan = None
+
+        approvals = [
+            {
+                "id": item.id,
+                "action": _enum_value(item.action),
+                "status": _enum_value(item.status),
+                "resource_scope": item.resource_scope,
+                "spec_sha256": item.spec_sha256,
+                "expires_at": item.expires_at.isoformat(),
+                "reason": item.reason,
+            }
+            for item in svc.approval_service.list_for_run(run_id)
+        ]
+
+        workspace = svc.workspaces.get_by_run(run_id)
+        workspace_view = None
+        if workspace is not None:
+            workspace_view = {
+                "id": workspace.id,
+                "path": workspace.path,
+                "base_commit_sha": workspace.base_commit_sha,
+                "status": _enum_value(workspace.status),
+                "file_count": workspace.file_count,
+            }
+
+        contract_view = {
+            "goal": contract.goal,
+            "acceptance_criteria": list(contract.acceptance_criteria),
+            "constraints": _dump(contract.constraints),
+            "scope": _dump(contract.scope),
+            "required_approvals": [_enum_value(item) for item in contract.required_approvals],
+            "execution_trust": contract.constraints.execution_trust,
+            "content_sha256": contract.content_sha256,
+        }
+        return {
+            "run_id": run_id,
+            "contract": contract_view,
+            "plan": _dump(plan) if plan is not None else None,
+            "steps": [_dump(step) for step in plan.steps] if plan is not None else [],
+            "approvals": approvals,
+            "workspace": workspace_view,
+        }
+
+    def _evidence(self, run_id: str) -> dict[str, Any]:
+        """Read-only evidence graph for one run; degraded sources are named."""
+
+        svc = self.svc
+        run = svc.runs.get(run_id)  # 404 when the run does not exist
+        warnings: list[str] = []
+
+        report = svc.verification.latest_report(run_id)
+        checks = svc.verification.report_checks(report) if report is not None else []
+        links = svc.verification.store.list_links(report.id) if report is not None else []
+
+        mappings_view: list[dict[str, Any]] = []
+        try:
+            for mapping in svc.mappings.list_by_snapshot(run.snapshot_id):
+                mappings_view.append(
+                    {
+                        "claim_id": mapping.claim_id,
+                        "status": _enum_value(mapping.status),
+                        "rule_status": _enum_value((mapping.details or {}).get("rule_status")),
+                        "evidence_count": len(svc.mappings.list_evidence(mapping.id)),
+                        "gaps": list(mapping.gaps),
+                    }
+                )
+        except Exception:  # noqa: BLE001 - a degraded read must not hide the rest
+            warnings.append("claim mappings unavailable for this snapshot")
+
+        reproduction = None
+        try:
+            reproduction, _artifact_id = svc.reproduction.build(run_id, persist=False)
+        except Exception:  # noqa: BLE001 - degrade honestly, never fabricate a tier
+            reproduction = None
+            warnings.append("reproduction report unavailable for this run")
+
+        comparison = svc.experiments.latest_comparison_for_task(run.task_id)
+
+        return {
+            "run_id": run_id,
+            "report": _dump(report) if report is not None else None,
+            "checks": [_dump(item) for item in checks],
+            "links": [_dump(item) for item in links],
+            "mappings": mappings_view,
+            "reproduction": _dump(reproduction) if reproduction is not None else None,
+            "comparison": _dump(comparison) if comparison is not None else None,
+            "warnings": warnings,
+        }
+
+    def _comparison(self, identifier: str) -> dict[str, Any]:
+        """Latest experiment comparison by comparison id or definition id."""
+
+        svc = self.svc
+        if identifier.startswith("xcmp_"):
+            comparison = svc.experiment_store.get_comparison(identifier)  # 404 if unknown
+        else:
+            definition = svc.experiment_store.get_definition(identifier)  # 404 if unknown
+            comparison = svc.experiments.latest_comparison_for_task(definition.task_id)
+            if comparison is None:
+                raise ApiError(
+                    404,
+                    "NOT_FOUND",
+                    f"Experiment {identifier} has no comparison yet.",
+                    hint="Run and compare the experiment before requesting its comparison.",
+                )
+
+        report_markdown = None
+        try:
+            report_markdown = svc.experiments.comparison_markdown(comparison.id)
+        except Exception:  # noqa: BLE001 - Markdown is best-effort, not a verdict
+            report_markdown = None
+        return {"comparison": _dump(comparison), "report_markdown": report_markdown}
 
     # ----------------------------------------------------------------- helpers
     def _project(self, query: dict[str, list[str]]):  # type: ignore[no-untyped-def]

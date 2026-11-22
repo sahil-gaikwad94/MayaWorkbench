@@ -8,6 +8,7 @@ and that only the backend owns workflow state. No network or real model is used.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 from pydantic import ValidationError
@@ -26,7 +27,8 @@ from mayaworkbench.tasks.orchestrator import (
     RoleOrchestrator,
     set_role_plan_enabled,
 )
-from mayaworkbench.tasks.roles import REVIEWER_CONTEXT, AgentRole, build_role_plan
+from mayaworkbench.tasks.parallel import parallel_payloads
+from mayaworkbench.tasks.roles import REVIEWER_CONTEXT, AgentRole, StepState, build_role_plan
 from mayaworkbench.verification.registry import command_check
 from mayaworkbench.worker import Worker
 
@@ -366,3 +368,238 @@ def test_pause_resume_is_idempotent_and_only_backend_owns_state(services, indexe
     assert len(final.details["role_artifacts"]) > first_artifacts
     assert services.runs.get(run_id).state == state_before
     assert state_event_count() == events_before
+
+
+# --------------------------------------------------- parallel discovery (WP-ORCH-1)
+def set_parallel(services, run_id: str, enabled: bool = True) -> None:
+    details = dict(services.runs.get(run_id).details)
+    details["role_plan_parallel"] = bool(enabled)
+    services.runs.update_progress(run_id, details=details)
+
+
+def two_role_plan(task, contract):
+    """Two independent read-only steps with their dependencies already met."""
+    full = build_role_plan(task, contract, None)
+    steps = [
+        full.by_role(AgentRole.TASK_ANALYST).model_copy(update={"dependencies": []}),
+        full.by_role(AgentRole.WORKSPACE_ANALYST).model_copy(update={"dependencies": []}),
+    ]
+    return full.model_copy(update={"steps": steps})
+
+
+def three_role_plan(task, contract):
+    full = build_role_plan(task, contract, None)
+    steps = [
+        full.by_role(role).model_copy(update={"dependencies": []})
+        for role in (
+            AgentRole.TASK_ANALYST,
+            AgentRole.WORKSPACE_ANALYST,
+            AgentRole.ARCHITECT,
+        )
+    ]
+    return full.model_copy(update={"steps": steps})
+
+
+def make_orchestrator(services, task, contract, run_id, plan, **kwargs) -> RoleOrchestrator:
+    return RoleOrchestrator(
+        runs=services.runs,
+        artifacts=services.artifacts,
+        events=services.events,
+        workflow=services.workflow,
+        plan=plan,
+        task=task,
+        contract=contract,
+        run=services.runs.get(run_id),
+        **kwargs,
+    )
+
+
+def artifact_events(services, run_id: str) -> list:
+    return [
+        event
+        for event in services.events.list(run_id=run_id, limit=500)
+        if event.event_type == EventType.ARTIFACT_CREATED
+    ]
+
+
+def test_parallel_payloads_preserves_order_and_captures_errors():
+    def compute(number: int) -> int:
+        if number == 2:
+            raise RuntimeError("bad two")
+        return number * 10
+
+    results = parallel_payloads([3, 2, 1], compute, max_workers=3)
+    assert [item[0] for item in results] == [0, 1, 2]
+    assert results[0][1] == 30 and results[0][2] is None
+    assert results[1][1] is None and results[1][2] == "RuntimeError: bad two"
+    assert results[2][1] == 10 and results[2][2] is None
+    assert parallel_payloads([], compute) == []
+
+
+def test_flag_off_keeps_sequential_publication(services, indexed, task_model, monkeypatch):
+    task, contract = make_task(services, indexed)
+    result = start_approve_prepare(services, task)
+    run_id = result.run.id
+    plan = two_role_plan(task, contract)
+    main_thread = threading.current_thread().name
+    threads: list[str] = []
+
+    def payload(step, artifacts_meta):
+        threads.append(threading.current_thread().name)
+        return {"summary": "ok", "evidence": {}}
+
+    orchestrator = make_orchestrator(services, task, contract, run_id, plan)
+    monkeypatch.setattr(orchestrator, "_deterministic_payload", payload)
+    assert orchestrator.run().state == WorkflowState.REVIEWING
+    assert threads and set(threads) == {main_thread}  # never left the main thread
+    details = services.runs.get(run_id).details
+    assert [item["step_id"] for item in details["role_artifacts"]] == plan.role_ids()
+
+
+def test_parallel_flag_overlaps_independent_steps(services, indexed, task_model, monkeypatch):
+    task, contract = make_task(services, indexed)
+    result = start_approve_prepare(services, task)
+    run_id = result.run.id
+    set_parallel(services, run_id)
+    plan = two_role_plan(task, contract)
+
+    barrier = threading.Barrier(2, timeout=5)
+    entered: list[str] = []
+
+    def payload(step, artifacts_meta):
+        entered.append(step.step_id)
+        barrier.wait()  # both workers must be inside before either returns
+        return {"summary": f"payload for {step.role.value}", "evidence": {"step": step.step_id}}
+
+    orchestrator = make_orchestrator(services, task, contract, run_id, plan)
+    monkeypatch.setattr(orchestrator, "_deterministic_payload", payload)
+    events_before = len(artifact_events(services, run_id))
+
+    assert orchestrator.run().state == WorkflowState.REVIEWING
+    assert len(entered) == 2 and set(entered) == set(plan.role_ids())
+
+    details = services.runs.get(run_id).details
+    assert details["role_plan_completed"] == plan.role_ids()
+    metas = details["role_artifacts"]
+    assert [item["step_id"] for item in metas] == plan.role_ids()  # original order
+    assert all(item["state"] == StepState.SUCCEEDED.value for item in metas)
+    assert all(item["artifact_id"] is not None for item in metas)
+    assert len(artifact_events(services, run_id)) == events_before + 2
+
+
+def test_parallel_payload_error_becomes_failed_artifact(
+    services, indexed, task_model, monkeypatch
+):
+    task, contract = make_task(services, indexed)
+    result = start_approve_prepare(services, task)
+    run_id = result.run.id
+    set_parallel(services, run_id)
+    plan = two_role_plan(task, contract)
+
+    def payload(step, artifacts_meta):
+        if step.role == AgentRole.TASK_ANALYST:
+            raise ValueError("boom from task analyst")
+        return {"summary": "sibling ok", "evidence": {}}
+
+    orchestrator = make_orchestrator(services, task, contract, run_id, plan)
+    monkeypatch.setattr(orchestrator, "_deterministic_payload", payload)
+    events_before = len(artifact_events(services, run_id))
+
+    assert orchestrator.run().state == WorkflowState.REVIEWING
+    details = services.runs.get(run_id).details
+    metas = {item["step_id"]: item for item in details["role_artifacts"]}
+    failed = metas[plan.steps[0].step_id]
+    assert failed["state"] == StepState.FAILED.value
+    assert "parallel_payload_error" in failed["terminal_reason"]
+    assert "ValueError" in failed["terminal_reason"]
+    assert "boom from task analyst" in failed["terminal_reason"]
+    assert failed["evidence"]["payload_error"] == "ValueError: boom from task analyst"
+
+    sibling = metas[plan.steps[1].step_id]
+    assert sibling["state"] == StepState.SUCCEEDED.value
+    assert sibling["artifact_id"] is not None
+    assert details["role_plan_completed"] == plan.role_ids()  # failure is reported, not skipped
+    assert len(artifact_events(services, run_id)) == events_before + 2
+
+
+def test_parallel_resume_executes_only_pending_steps(services, indexed, task_model, monkeypatch):
+    task, contract = make_task(services, indexed)
+    result = start_approve_prepare(services, task)
+    run_id = result.run.id
+    plan = three_role_plan(task, contract)
+    first = plan.steps[0]
+
+    details = dict(services.runs.get(run_id).details)
+    details["role_plan_parallel"] = True
+    details["role_plan_completed"] = [first.step_id]
+    details["role_artifacts"] = [{"step_id": first.step_id, "state": "SUCCEEDED"}]
+    services.runs.update_progress(run_id, details=details)
+
+    computed: list[str] = []
+
+    def payload(step, artifacts_meta):
+        computed.append(step.step_id)
+        return {"summary": "ok", "evidence": {}}
+
+    orchestrator = make_orchestrator(services, task, contract, run_id, plan)
+    monkeypatch.setattr(orchestrator, "_deterministic_payload", payload)
+    assert orchestrator.run().state == WorkflowState.REVIEWING
+
+    assert set(computed) == {step.step_id for step in plan.steps[1:]}
+    assert first.step_id not in computed
+    final = services.runs.get(run_id).details
+    assert final["role_plan_completed"] == plan.role_ids()
+    assert [item["step_id"] for item in final["role_artifacts"]] == plan.role_ids()
+
+
+def test_parallel_pause_between_groups_stops_later_groups(
+    services, indexed, task_model, monkeypatch
+):
+    task, base_contract = make_task(services, indexed)
+    contract = base_contract.model_copy(update={"task_type": TaskType.PAPER_TO_CODE})
+    result = start_approve_prepare(services, task)
+    run_id = result.run.id
+
+    full = build_role_plan(task, contract, None)
+    analyst = full.by_role(AgentRole.TASK_ANALYST)
+    details = dict(services.runs.get(run_id).details)
+    details["role_plan_parallel"] = True
+    details["role_plan_completed"] = [analyst.step_id]
+    services.runs.update_progress(run_id, details=details)
+
+    def payload(step, artifacts_meta):
+        return {"summary": "ok", "evidence": {}}
+
+    implementer = full.by_role(AgentRole.IMPLEMENTER)
+
+    def observer(step_id: str) -> None:
+        if step_id == implementer.step_id:
+            services.runs.set_flags(run_id, pause_requested=True)
+
+    def fake_implementer() -> AgentOutcome:
+        return AgentOutcome(state=WorkflowState.REVIEWING, summary="done")
+
+    orchestrator = make_orchestrator(
+        services,
+        task,
+        contract,
+        run_id,
+        full,
+        implementer=fake_implementer,
+        step_observer=observer,
+    )
+    monkeypatch.setattr(orchestrator, "_deterministic_payload", payload)
+
+    assert orchestrator.run().state == WorkflowState.PAUSED
+    completed = services.runs.get(run_id).details["role_plan_completed"]
+    # The first group and the sequential steps up to the implementer completed.
+    early = [
+        AgentRole.RESEARCH_ANALYST.value,
+        AgentRole.WORKSPACE_ANALYST.value,
+        AgentRole.ARCHITECT.value,
+        AgentRole.IMPLEMENTER.value,
+    ]
+    assert all(step_id in completed for step_id in early)
+    # The group after the implementer never started.
+    later = [AgentRole.QA_TEST_ENGINEER.value, AgentRole.SECURITY_REVIEWER.value]
+    assert all(step_id not in completed for step_id in later)

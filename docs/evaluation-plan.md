@@ -124,7 +124,10 @@ Deviations from targets and why:
 - Correctness of an agent's code change (no task execution yet).
 - Patch application or test-run outcomes.
 - Multi-repository or cross-snapshot reasoning.
-- Embedding-based retrieval quality (no embeddings implemented).
+- Learned semantic embedding / cross-encoder reranking quality. A deterministic
+  hashing-vector embedder, a lexical-overlap reranker and damped PPR exist as
+  optional baselines; they are off by default and are **not** a trained semantic
+  model. Evaluate them as lexical/graph baselines, not as semantic search.
 - Hosted/multi-user security properties.
 
 Those require the Phase 3/4 artefacts (task contracts, isolated worktrees,

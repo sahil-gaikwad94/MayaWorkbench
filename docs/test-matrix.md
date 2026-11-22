@@ -4,8 +4,8 @@
 
 | Item | Value |
 |---|---|
-| Date | 2026-11-21 |
-| Commit | `git rev-parse HEAD` at test time |
+| Date | 2026-11-22 (reconciled after the audit-remediation package) |
+| Commit | `git rev-parse HEAD` at test time (work started at `47c78e3`) |
 | Python | 3.12.3 (CPython, Linux aarch64) |
 | pytest | 9.2.0 |
 | pydantic | 2.14.4 |
@@ -23,10 +23,24 @@ fail with `ModuleNotFoundError`, which is a setup error, not a product defect.
 ## Latest full-suite result
 
 ```
-529 passed, 0 failed
+782 collected, 773 passed, 9 skipped, 0 failed, 0 errors
+(python -m pytest -q --junitxml=..., exit 0)
 ```
 
-Test collection grew from 328 to 529: 6 PDF fallback/parser-policy tests, 8
+The nine skips are explicit: six opt-in live harnesses (`tests/integration/`),
+one Playwright-dependent browser test, and two pre-existing optional-dependency
+cases. A skip never counts as a pass. A machine-readable release record built from this
+JUnit report and the four adversarial harness results is produced by
+`maya release evidence --pytest-report <junit.xml> --adversarial-dir <dir> --out <dir>`.
+
+The two skips are the existing optional-dependency cases; a skipped check never
+counts as a pass. `python -m compileall -q src` also passes.
+
+Test collection grew from 328 to 635. The 2026-11-22 packages added runtime-workspace,
+cgroup, lockfile-environment, API-diff, broken-checker, provider-wiring, native
+tool-call/SSE, MCP transport, pluggable-embedding, optional Tree-sitter, four-tier
+reproduction-report and offline R2I-evaluation regressions.
+Earlier growth included: 6 PDF fallback/parser-policy tests, 8
 runner limit/trust-profile tests, 4 execution-capability CLI tests, 8
 execution-backend/isolation tests, 5 task-capability grant tests, 6
 process-session tests, 4 Engineering Workspace tests, 4 attestation tests,
@@ -61,6 +75,14 @@ and no child outlives the command. A test that merely asserted a claimed
 | Integration | `pytest -q tests/test_snapshots.py tests/test_verification.py tests/test_verification_evidence.py tests/test_experiments.py tests/test_experiment_stats.py tests/test_experiment_comparison.py` | real Git worktrees, SQLite, verification, experiment statistics | `integration` |
 | Worker lifecycle | `pytest -q tests/test_task_workflow.py tests/test_task_cli.py tests/test_concurrency.py` | leases, approvals, CAS, separate worker process, cancellation, stale settlement | `worker` (allow 120 s) |
 | Security / adversarial | `python artifacts/adversarial/harness{1..4}.py` | 82 scripted probes; separately maintained, not folded into unit-test count | `adversarial` (no real provider) |
+| Evaluation integrity | `pytest -q tests/test_evaluation_integrity.py tests/test_method_invariants.py tests/test_constraints.py` | frozen-harness hash gate, four extra method probes, formal-constraint plugin boundary | `unit` |
+| R2I evidence | `pytest -q tests/test_reproduction.py tests/test_reproduction_integration.py tests/test_evaluation_r2i.py` | four-tier report (adversarially reviewed over three cycles), offline gold-corpus evaluator | `unit` + `integration` |
+| Release evidence | `maya release evidence --pytest-report … --adversarial-dir … --out …` | machine-readable record from real inputs; no guessed counts; redaction guard | `release` |
+| Workbench UI | `pytest -q tests/test_workbench_ui.py` | four read-only run endpoints plus structured browser panels; DOM-free assertions and a Playwright-gated smoke test | `unit` + `ui` |
+| Research evidence quality | `pytest -q tests/test_research_evidence_quality.py` | version-bound citations, typed disagreements, paper status alerts, migration 0011 | `integration` |
+| Signed run bundles | `pytest -q tests/test_runner_bundles.py tests/test_attestation.py` | sign/verify/import with named key, verify-time HMAC, swapped-envelope rejection | `unit` |
+| Live-model benchmark | `pytest -q tests/test_eval_live.py` | 25-task internal seed corpus, offline dry-run, hard spend cap, evidence-based rates | `unit` |
+| Parallel discovery | `pytest -q tests/test_role_orchestrator.py` | opt-in bounded parallel payloads with ordered sequential publication | `unit` |
 | Real-model smoke | opt-in, protected job with low-privilege key and cost cap | real structured output and tool-call quality | `model-smoke` (manual approval) |
 | Platform | Linux non-root first; Windows/macOS only if advertised | cross-platform behavior | `platform` (future) |
 
@@ -79,8 +101,15 @@ penetration test.
 - Worker crash *during each workflow state* with resume/idempotency; DB
   durability under SIGKILL is tested, mid-agent termination is not.
 - Non-Linux platforms and hosted multi-user deployment.
-- cgroup-backed process/memory/CPU enforcement end-to-end in a task run: the
-  `RootlessContainerBackend` exists and is unit-tested with a stubbed capability
-  probe and a fake OCI client, but the worker is not yet routed through it and
-  this host has no cgroup v2 controllers.
-- Real host-canary/secret isolation inside an actual rootless container.
+- cgroup-backed process/memory/CPU enforcement end-to-end in a task run: the worker
+  now opts into a verified cgroup v2 pids scope and routes isolated profiles through
+  a populated `RuntimeWorkspace` + `BackendCommandRunner`, but this host has no cgroup
+  v2 delegation and no OCI runtime, so those paths are covered only by fake-root and
+  fake-OCI unit tests.
+- Real host-canary/secret isolation and limit read-back inside an actual rootless
+  container. A bounded `MAYA_OCI_SMOKE=1` probe exists and the profile stays unavailable
+  until it passes; it has not been run here.
+- Native provider adapters (OpenAI SSE + tool calls, Anthropic tool_use, Gemini function
+  calls), pluggable embeddings/RRF, optional Tree-sitter parsing and MCP stdio transport
+  are implemented and covered with fake transports; no live provider, OCI runtime or
+  third-party MCP server was exercised. See `IMPLEMENTATION_STATUS.md`.

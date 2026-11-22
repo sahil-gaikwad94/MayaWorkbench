@@ -11,29 +11,664 @@ header{padding:16px 24px;border-bottom:1px solid var(--border)}h1{margin:0;font-
 main{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;padding:20px;max-width:1400px;margin:auto}
 section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;min-height:120px}
 h2{font-size:14px;margin:0 0 10px;color:var(--accent)}pre{margin:0;white-space:pre-wrap;word-break:break-word;color:var(--muted);font-size:12px;max-height:320px;overflow:auto}
-button{background:var(--accent);color:#00121c;border:0;border-radius:4px;padding:6px 12px;cursor:pointer;font-weight:600}
+button{background:var(--accent);color:#00121c;border:0;border-radius:4px;padding:6px 12px;cursor:pointer;font-weight:600;margin:2px}
 input{background:#0c0e12;color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:6px;width:70%}
-.row{display:flex;gap:8px;margin-bottom:8px}.muted{color:var(--muted);font-size:12px}
+.row{display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap}.muted{color:var(--muted);font-size:12px}
+.approval{display:flex;gap:8px;align-items:center;margin:4px 0;flex-wrap:wrap}
+.ok{color:#7ee787}.warn{color:#ffd479}.bad{color:#ff7b72}
+.badge{display:inline-block;background:#232936;color:var(--accent);border-radius:3px;padding:0 6px;margin-right:6px;font-size:11px}
+ul{margin:2px 0 8px;padding-left:18px}li{margin:1px 0}
 </style>
 </head>
 <body>
 <header><h1>MayaWorkbench — local control plane</h1><div class="muted">Evidence-first engineering workspace · loopback only · no auth in this local alpha</div></header>
 <main>
+<section><h2>Load run (all panels)</h2><div class="row"><input id="runLoadId" placeholder="run id"><button onclick="loadRun()">Load run</button></div><div class="muted">Loads the run view, plan, timeline and evidence together. Each panel below also has its own loader.</div></section>
+<section><h2>Workspace</h2><div class="row"><button onclick="refreshProjectsSummary()">Refresh projects</button></div><div id="workspacePanel" class="muted">Load a run to see its workspace.</div><pre id="workspaceProjects" class="muted"></pre></section>
+<section><h2>Task overview</h2><div id="taskOverviewPanel" class="muted">Load a run to see its objective, criteria, budget and trust profile.</div></section>
+<section><h2>Plan &amp; approvals</h2><div id="planPanel" class="muted">Load a run to see its plan and approvals.</div><pre id="planApprovalStatus" class="muted"></pre></section>
+<section><h2>Execution timeline</h2><div id="timelinePanel" class="muted">Load a run to see its execution timeline.</div></section>
+<section><h2>Evidence graph</h2><div id="evidenceGraphPanel" class="muted">Load a run to see its verification and evidence graph.</div></section>
+<section><h2>Experiment comparator</h2><div class="row"><input id="comparisonId" placeholder="comparison id"><button onclick="loadComparison()">Load comparison</button></div><div id="comparisonPanel" class="muted">Enter a comparison id to inspect its metrics.</div></section>
 <section><h2>Health</h2><pre id="health">loading…</pre></section>
 <section><h2>Projects / workspaces</h2><button onclick="refresh()">Refresh</button><pre id="projects"></pre></section>
 <section><h2>Tasks</h2><div class="row"><input id="taskId" placeholder="task id"><button onclick="loadTask()">Load</button></div><pre id="task"></pre></section>
-<section><h2>Approvals</h2><pre id="approvals">Select a task to inspect its approvals.</pre></section>
-<section><h2>Live events (durable cursor)</h2><div class="row"><input id="after" value="0" placeholder="after seq"><button onclick="connect()">Connect</button></div><pre id="events"></pre></section>
-<section><h2>Diff / evidence</h2><div class="row"><input id="runId" placeholder="run id"><button onclick="loadEvidence()">Load</button></div><pre id="evidence"></pre></section>
+<section><h2>Approvals</h2><div id="approvals" class="muted">Select a task to inspect its approvals.</div><pre id="approvalStatus" class="muted"></pre></section>
+<section><h2>Live events (durable cursor)</h2><div class="row"><input id="after" value="0" placeholder="after seq"><button onclick="connect()">Connect</button><button onclick="disconnect()">Disconnect</button></div><pre id="events"></pre></section>
+<section><h2>Source diff</h2><div class="row"><input id="diffRunId" placeholder="run id"><button onclick="loadDiff()">Load captured patch</button></div><div class="muted">The exact patch stored by the worker, with its SHA-256 and file list. Text is rendered literally, never as HTML.</div><pre id="diff"></pre></section>
+<section><h2>Verification / evidence</h2><div class="row"><input id="runId" placeholder="run id"><button onclick="loadEvidence()">Load</button></div><div class="muted">Shows the verification report and the exported evidence bundle manifest/hashes.</div><pre id="evidence"></pre></section>
+<section><h2>Task controls</h2><div class="row"><input id="controlTaskId" placeholder="task id"><button onclick="taskControl('pause')">Pause</button><button onclick="taskControl('resume')">Resume</button><button onclick="taskControl('cancel')">Cancel</button></div><pre id="controlStatus" class="muted">No control action requested.</pre></section>
 </main>
 <script>
-const get=async p=>(await fetch(p)).json();
-async function refresh(){try{const h=await get('/health');document.getElementById('health').textContent=JSON.stringify(h,null,2);const p=await get('/projects');document.getElementById('projects').textContent=JSON.stringify(p,null,2);}catch(e){document.getElementById('health').textContent='error: '+e}}
-async function loadTask(){const id=document.getElementById('taskId').value.trim();if(!id)return;try{const t=await get('/tasks/'+encodeURIComponent(id));document.getElementById('task').textContent=JSON.stringify(t,null,2);}catch(e){document.getElementById('task').textContent='error: '+e}}
-async function loadEvidence(){const id=document.getElementById('runId').value.trim();if(!id)return;try{const r=await get('/verification/'+encodeURIComponent(id)+'/report');document.getElementById('evidence').textContent=JSON.stringify(r,null,2);}catch(e){document.getElementById('evidence').textContent='error: '+e}}
-let source=null;
-function connect(){if(source)source.close();const after=document.getElementById('after').value||'0';const out=document.getElementById('events');out.textContent='streaming from seq '+after+'\n';source=new EventSource('/events/stream?after='+encodeURIComponent(after));source.onmessage=e=>{out.textContent+=e.data+'\n';out.scrollTop=out.scrollHeight;const d=JSON.parse(e.data);if(d.seq)document.getElementById('after').value=d.seq;};source.onerror=()=>{out.textContent+='\n[stream ended; reconnect with fresh cursor]\n';source.close();};}
+const get = async p => {
+  const r = await fetch(p);
+  if (!r.ok) {
+    let detail = '';
+    try { detail = (await r.json()).error || ''; } catch (_) {}
+    throw new Error('HTTP ' + r.status + (detail ? ': ' + detail : ''));
+  }
+  return r.json();
+};
+
+// ----------------------------------------------------- DOM helpers (text only)
+// Every value from the server is placed in a text node via textContent. The UI
+// never builds markup from server data and never runs it as script.
+function el(tag, text, cls) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  if (cls) node.className = cls;
+  return node;
+}
+function clear(node) { node.textContent = ''; }
+function fmt(value) {
+  if (value === null || value === undefined) return '(not recorded)';
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+function kv(label, value) {
+  const row = el('div');
+  row.appendChild(el('span', label + ': ', 'muted'));
+  const v = (value === null || value === undefined || value === '') ? '(not recorded)' : fmt(value);
+  row.appendChild(el('span', v));
+  return row;
+}
+function list(label, items) {
+  const wrap = el('div');
+  wrap.appendChild(el('div', label + ':', 'muted'));
+  const ul = el('ul');
+  const values = Array.isArray(items) ? items : [];
+  if (!values.length) ul.appendChild(el('li', '(none recorded)', 'muted'));
+  else for (const item of values) ul.appendChild(el('li', fmt(item)));
+  wrap.appendChild(ul);
+  return wrap;
+}
+function statusClass(status) {
+  const s = String(status || '').toUpperCase();
+  if (s === 'VERIFIED') return 'ok';
+  if (s === 'PARTIAL') return 'warn';
+  if (s === 'FAILED') return 'bad';
+  return 'muted';
+}
+async function tryGet(path) {
+  try { return {ok: true, value: await get(path)}; }
+  catch (e) { return {ok: false, error: String(e)}; }
+}
+
+async function refresh() {
+  try {
+    const h = await get('/health');
+    document.getElementById('health').textContent = JSON.stringify(h, null, 2);
+    const p = await get('/projects');
+    document.getElementById('projects').textContent = JSON.stringify(p, null, 2);
+  } catch (e) {
+    document.getElementById('health').textContent = 'error: ' + e;
+  }
+}
+
+async function refreshProjectsSummary() {
+  const out = document.getElementById('workspaceProjects');
+  const res = await tryGet('/projects');
+  clear(out);
+  if (!res.ok) { out.textContent = 'Projects summary not available: ' + res.error; return; }
+  const rows = (res.value && res.value.projects) || [];
+  if (!rows.length) { out.textContent = '(no projects recorded)'; return; }
+  for (const p of rows) {
+    out.appendChild(el('div',
+      (p.name || p.slug || p.id) + ' — repos: ' + (p.repositories || 0) +
+      ', snapshots: ' + (p.snapshots || 0) + ', indexed: ' + (p.indexed || 0)));
+  }
+}
+
+// ------------------------------------------------ one run -> all new panels
+let currentRunId = '';
+let currentTaskId = '';
+
+async function loadRun() {
+  const id = document.getElementById('runLoadId').value.trim();
+  if (!id) return;
+  const enc = encodeURIComponent(id);
+  currentRunId = id;
+  for (const panel of ['workspacePanel', 'taskOverviewPanel', 'planPanel',
+                       'timelinePanel', 'evidenceGraphPanel']) {
+    document.getElementById(panel).textContent = 'loading…';
+  }
+  document.getElementById('planApprovalStatus').textContent = '';
+  const [viewRes, planRes, timelineRes, evidenceRes] = await Promise.all([
+    tryGet('/runs/' + enc),
+    tryGet('/runs/' + enc + '/plan'),
+    tryGet('/runs/' + enc + '/timeline'),
+    tryGet('/runs/' + enc + '/evidence'),
+  ]);
+  if (viewRes.ok && viewRes.value && viewRes.value.task) {
+    currentTaskId = viewRes.value.task.id || currentTaskId;
+  }
+  renderWorkspace(planRes);
+  renderTaskOverview(viewRes);
+  renderPlanApprovals(planRes);
+  renderTimeline(timelineRes);
+  renderEvidenceGraph(evidenceRes);
+  refreshProjectsSummary();
+}
+
+function renderWorkspace(res) {
+  const out = document.getElementById('workspacePanel');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Workspace not available: ' + res.error, 'muted')); return; }
+  const w = res.value && res.value.workspace;
+  if (!w) { out.appendChild(el('div', '(no workspace recorded for this run)', 'muted')); return; }
+  out.appendChild(kv('Workspace id', w.id));
+  out.appendChild(kv('Path', w.path));
+  out.appendChild(kv('Snapshot', w.snapshot_id));
+  out.appendChild(kv('Status', w.status));
+  out.appendChild(kv('File count', w.file_count));
+}
+
+function renderTaskOverview(res) {
+  const out = document.getElementById('taskOverviewPanel');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Task overview not available: ' + res.error, 'muted')); return; }
+  const v = res.value || {};
+  const contract = v.contract || {};
+  const run = v.run || {};
+  const constraints = contract.constraints || {};
+  const scope = contract.scope || {};
+  out.appendChild(kv('Objective', contract.goal));
+  out.appendChild(kv('State', run.state));
+  out.appendChild(list('Acceptance criteria', contract.acceptance_criteria));
+  out.appendChild(el('div', 'Budget', 'muted'));
+  out.appendChild(kv('Max runtime (s)', constraints.max_runtime_seconds));
+  out.appendChild(kv('Max model tokens', constraints.max_model_tokens));
+  out.appendChild(list('Capabilities', constraints.capabilities));
+  out.appendChild(kv('Execution trust', constraints.execution_trust || contract.execution_trust));
+  out.appendChild(el('div', 'Scope paths', 'muted'));
+  out.appendChild(list('Allowed', scope.allowed_paths));
+  out.appendChild(list('Excluded', scope.excluded_paths));
+  out.appendChild(kv('Base commit', scope.base_commit_sha));
+}
+
+function renderPlanApprovals(res) {
+  const out = document.getElementById('planPanel');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Plan not available: ' + res.error, 'muted')); return; }
+  const p = res.value || {};
+  const plan = (p.plan && typeof p.plan === 'object') ? p.plan : {};
+  out.appendChild(kv('Plan summary', plan.summary || p.summary));
+  const steps = Array.isArray(p.steps) ? p.steps
+    : (Array.isArray(plan.steps) ? plan.steps : []);
+  out.appendChild(el('div', 'Steps:', 'muted'));
+  if (!steps.length) out.appendChild(el('div', '(no steps recorded)', 'muted'));
+  steps.forEach((s, i) => {
+    const row = el('div', (i + 1) + '. ' + (s.description || '(no description)'));
+    row.appendChild(el('span', ' · files: ' + ((s.files || []).join(', ') || '(none)'), 'muted'));
+    row.appendChild(el('span', ' · checks: ' + ((s.checks || []).join(', ') || '(none)'), 'muted'));
+    out.appendChild(row);
+  });
+  const approvals = Array.isArray(p.approvals) ? p.approvals : [];
+  out.appendChild(el('div', 'Approvals:', 'muted'));
+  if (!approvals.length) {
+    const required = (p.contract && p.contract.required_approvals) || [];
+    out.appendChild(el('div',
+      '(none recorded; contract requires: ' + (required.join(', ') || 'none') + ')', 'muted'));
+  } else {
+    approvals.forEach(ap => {
+      const row = el('div');
+      row.className = 'approval';
+      row.appendChild(el('span', (ap.action || '?') + ' · ' + (ap.status || '?')));
+      row.appendChild(el('span', 'expires ' + fmt(ap.expires_at), 'muted'));
+      row.appendChild(el('span', 'scope: ' + fmt(ap.resource_scope), 'muted'));
+      row.appendChild(el('span', 'spec: ' + fmt(ap.spec_sha256), 'muted'));
+      if (ap.reason) row.appendChild(el('span', 'reason: ' + ap.reason, 'muted'));
+      if (ap.status === 'PENDING') {
+        const btn = el('button', 'Approve');
+        btn.onclick = () => approvePlan(currentTaskId, ap.id);
+        row.appendChild(btn);
+      }
+      out.appendChild(row);
+    });
+  }
+}
+
+async function approvePlan(taskId, approvalId) {
+  const status = document.getElementById('planApprovalStatus');
+  status.textContent = 'submitting approval ' + approvalId + '…';
+  try {
+    const response = await fetch('/tasks/' + encodeURIComponent(taskId) + '/approve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({approval_id: approvalId})
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = 'Approve failed: ' + (payload.error || ('HTTP ' + response.status));
+      return;
+    }
+    const next = payload.approval && payload.approval.status ? payload.approval.status : 'unknown';
+    status.textContent = 'Approved ' + approvalId + ' → ' + next + '; reloading run…';
+    loadRun();
+  } catch (e) {
+    status.textContent = 'Approve error: ' + e;
+  }
+}
+
+const MAX_TIMELINE_ITEMS = 300;
+function renderTimeline(res) {
+  const out = document.getElementById('timelinePanel');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Timeline not available: ' + res.error, 'muted')); return; }
+  const t = res.value || {};
+  const items = Array.isArray(t.items) ? t.items : [];
+  if (t.truncated) out.appendChild(el('div', 'Notice: the backend truncated the timeline.', 'warn'));
+  if (!items.length) { out.appendChild(el('div', '(no timeline items recorded)', 'muted')); return; }
+  const shown = items.slice(0, MAX_TIMELINE_ITEMS);
+  shown.forEach(it => {
+    const row = el('div');
+    row.className = 'approval';
+    row.appendChild(el('span', fmt(it.at !== undefined ? it.at : it.seq), 'muted'));
+    row.appendChild(el('span', it.kind || '?', 'badge'));
+    row.appendChild(el('span', it.label || ''));
+    if (it.detail) row.appendChild(el('span', it.detail, 'muted'));
+    if (it.ref) row.appendChild(el('span', 'ref: ' + fmt(it.ref), 'muted'));
+    out.appendChild(row);
+  });
+  if (items.length > shown.length) {
+    out.appendChild(el('div',
+      'Showing first ' + shown.length + ' of ' + items.length + ' items (capped at ' +
+      MAX_TIMELINE_ITEMS + ').', 'muted'));
+  }
+}
+
+const TIER_NAMES = ['METHOD_CODE_FOUND', 'METHOD_IMPLEMENTED',
+                    'METHOD_VALIDATED', 'RESULT_REPRODUCED'];
+function renderEvidenceGraph(res) {
+  const out = document.getElementById('evidenceGraphPanel');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Evidence graph not available: ' + res.error, 'muted')); return; }
+  const e = res.value || {};
+  const report = e.report || {};
+
+  out.appendChild(kv('Verification decision', report.decision));
+  out.appendChild(el('div', 'Acceptance criteria:', 'muted'));
+  const criteria = Array.isArray(report.criteria) ? report.criteria : [];
+  if (!criteria.length) out.appendChild(el('div', '(no criteria assessments recorded)', 'muted'));
+  criteria.forEach(c => {
+    const row = el('div');
+    row.appendChild(el('span', (c.criterion_id || '?') + ' ' + (c.text || '')));
+    row.appendChild(el('span', ' [' + (c.status || 'UNVERIFIED') + ']', statusClass(c.status)));
+    if (c.note) row.appendChild(el('span', ' — ' + c.note, 'muted'));
+    out.appendChild(row);
+  });
+
+  out.appendChild(el('div', 'Checks:', 'muted'));
+  const checks = Array.isArray(e.checks) ? e.checks : [];
+  if (!checks.length) out.appendChild(el('div', '(no checks recorded)', 'muted'));
+  checks.forEach(c => {
+    const row = el('div');
+    row.appendChild(el('span', (c.key || '?') + ' · ' + (c.gate || '?') + ' · ' + (c.outcome || '?'),
+      statusClass(c.outcome)));
+    if (c.title) row.appendChild(el('span', ' ' + c.title, 'muted'));
+    if (c.summary) row.appendChild(el('span', ' — ' + c.summary, 'muted'));
+    out.appendChild(row);
+  });
+
+  out.appendChild(el('div', 'Evidence links:', 'muted'));
+  const links = Array.isArray(e.links) ? e.links : [];
+  if (!links.length) out.appendChild(el('div', '(no evidence links recorded)', 'muted'));
+  links.forEach(l => {
+    const from = (l.from_kind || '?') + ':' + (l.from_ref || '?');
+    const to = (l.to_kind || '?') + ':' + (l.to_ref || '?');
+    const row = el('div', from + ' → ' + (l.relation || '?') + ' → ' + to);
+    if (l.note) row.appendChild(el('span', ' — ' + l.note, 'muted'));
+    out.appendChild(row);
+  });
+
+  out.appendChild(el('div', 'Claim mappings:', 'muted'));
+  const mappings = Array.isArray(e.mappings) ? e.mappings : [];
+  if (!mappings.length) out.appendChild(el('div', '(no claim mappings recorded)', 'muted'));
+  mappings.forEach(m => {
+    const row = el('div');
+    row.appendChild(el('span', (m.claim_id || '?') + ' ' + (m.status || '?'), statusClass(m.status)));
+    if (m.status_reason) row.appendChild(el('span', ' — ' + m.status_reason, 'muted'));
+    const gaps = Array.isArray(m.gaps) ? m.gaps : [];
+    if (gaps.length) row.appendChild(el('span', ' gaps: ' + gaps.join('; '), 'muted'));
+    out.appendChild(row);
+  });
+
+  out.appendChild(el('div', 'Reproduction tiers:', 'muted'));
+  const tiers = (e.reproduction && e.reproduction.tiers) || {};
+  TIER_NAMES.forEach(name => {
+    const tier = tiers[name] || {};
+    const row = el('div');
+    row.appendChild(el('span', name + ': ' + (tier.level || 'NOT_CHECKED'), statusClass(tier.level)));
+    const gaps = Array.isArray(tier.gaps) ? tier.gaps : [];
+    if (gaps.length) row.appendChild(el('span', ' gaps: ' + gaps.join('; '), 'muted'));
+    out.appendChild(row);
+  });
+
+  if (e.comparison) out.appendChild(kv('Linked comparison verdict', e.comparison.verdict));
+
+  out.appendChild(list('Warnings', e.warnings));
+  const repLimitations = (e.reproduction && e.reproduction.limitations) || [];
+  out.appendChild(list('Reproduction limitations', repLimitations));
+}
+
+async function loadComparison() {
+  const id = document.getElementById('comparisonId').value.trim();
+  const out = document.getElementById('comparisonPanel');
+  if (!id) { out.textContent = 'Enter a comparison id.'; return; }
+  out.textContent = 'loading…';
+  const res = await tryGet('/experiments/' + encodeURIComponent(id) + '/comparison');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Comparison not available: ' + res.error, 'muted')); return; }
+  const c = (res.value && res.value.comparison) || {};
+  out.appendChild(kv('Verdict', c.verdict));
+  out.appendChild(kv('Comparable', c.comparable));
+  const metrics = Array.isArray(c.metrics) ? c.metrics : [];
+  const primary = metrics.find(m => m.primary) || null;
+  out.appendChild(el('div', 'Primary metric:', 'muted'));
+  if (!primary) {
+    out.appendChild(el('div', '(no primary metric recorded)', 'muted'));
+  } else {
+    out.appendChild(kv('Name', primary.key || primary.name));
+    out.appendChild(kv('Baseline mean', primary.baseline_mean));
+    out.appendChild(kv('Candidate mean', primary.candidate_mean));
+    out.appendChild(kv('Difference', primary.difference));
+    out.appendChild(kv('95% CI', fmt(primary.ci_low) + ' .. ' + fmt(primary.ci_high)));
+    out.appendChild(kv('p value', primary.p_value));
+    out.appendChild(kv('Effect size', primary.effect_size));
+    out.appendChild(kv('Favors', primary.favors));
+    out.appendChild(kv('Within margin', primary.within_margin));
+  }
+  const findings = (c.findings || []).map(f =>
+    (f.path || '?') + ' ' + (f.classification || '') + ': ' + (f.note || ''));
+  out.appendChild(list('Fairness findings', findings));
+  out.appendChild(list('Limitations', c.limitations));
+  if (res.value.report_markdown) {
+    out.appendChild(el('div', 'Report (text):', 'muted'));
+    out.appendChild(el('pre', res.value.report_markdown));
+  }
+}
+
+// ------------------------------------------------------- task view + approvals
+async function loadTask() {
+  const id = document.getElementById('taskId').value.trim();
+  if (!id) return;
+  const taskOut = document.getElementById('task');
+  const approvalsOut = document.getElementById('approvals');
+  taskOut.textContent = 'loading…';
+  approvalsOut.textContent = 'loading…';
+  try {
+    const view = await get('/tasks/' + encodeURIComponent(id));
+    taskOut.textContent = JSON.stringify(view, null, 2);
+    await renderApprovals(id, view, approvalsOut);
+  } catch (e) {
+    taskOut.textContent = 'error: ' + e;
+    approvalsOut.textContent = 'error loading task: ' + e;
+  }
+}
+
+async function renderApprovals(taskId, view, out) {
+  const lines = [];
+  const task = view.task || {};
+  const contract = view.contract || {};
+  const constraints = contract.constraints || {};
+  const scope = contract.scope || {};
+
+  lines.push('Task: ' + (task.title || task.id || taskId));
+  lines.push('Required approvals (contract): ' + ((contract.required_approvals || []).join(', ') || '(none)'));
+  lines.push('Requested capabilities (contract): ' + ((constraints.capabilities || []).join(', ') || '(none declared)'));
+  lines.push('Network access: ' + (constraints.network_access || '(unknown)'));
+  lines.push('Execution trust: ' + (constraints.execution_trust || '(unknown)'));
+  lines.push('Scope allowed paths: ' + ((scope.allowed_paths || []).join(', ') || '(none)'));
+  lines.push('Scope excluded paths: ' + ((scope.excluded_paths || []).join(', ') || '(none)'));
+  lines.push('Scope base commit: ' + (scope.base_commit_sha || '(unknown)'));
+
+  const runs = view.runs || [];
+  const latest = runs.length ? runs[runs.length - 1] : null;
+  if (!latest) {
+    lines.push('');
+    lines.push('No run yet, so there are no approval requests to grant. Start the task to create them.');
+    out.textContent = lines.join('\n');
+    return;
+  }
+
+  let runView;
+  try {
+    // The task view exposes runs but not the per-run approval records; the run
+    // view is the authoritative source for approval ids and their status.
+    runView = await get('/runs/' + encodeURIComponent(latest.id));
+  } catch (e) {
+    lines.push('');
+    lines.push('error loading approval requests for run ' + latest.id + ': ' + e);
+    out.textContent = lines.join('\n');
+    return;
+  }
+  const approvals = runView.approvals || [];
+  lines.push('');
+  lines.push('Approval requests for run ' + latest.id + ':');
+  if (!approvals.length) lines.push('(none recorded)');
+  out.textContent = lines.join('\n');
+
+  for (const ap of approvals) {
+    const row = document.createElement('div');
+    row.className = 'approval';
+    const label = document.createElement('span');
+    label.textContent = ap.id + ' · ' + ap.action + ' · ' + ap.status;
+    row.appendChild(label);
+    if (ap.status === 'PENDING') {
+      const btn = document.createElement('button');
+      btn.textContent = 'Approve';
+      btn.onclick = () => approve(taskId, ap.id);
+      row.appendChild(btn);
+    }
+    out.appendChild(row);
+  }
+}
+
+async function approve(taskId, approvalId) {
+  const status = document.getElementById('approvalStatus');
+  status.textContent = 'submitting approval ' + approvalId + '…';
+  try {
+    const response = await fetch('/tasks/' + encodeURIComponent(taskId) + '/approve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({approval_id: approvalId})
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = 'Approve failed: ' + (payload.error || ('HTTP ' + response.status));
+      return;
+    }
+    const next = payload.approval && payload.approval.status ? payload.approval.status : 'unknown';
+    status.textContent = 'Approved ' + approvalId + ' → ' + next + '; reloading task…';
+    loadTask();
+  } catch (e) {
+    status.textContent = 'Approve error: ' + e;
+  }
+}
+
+// ---------------------------------------------- NDJSON event stream (not SSE)
+let streamAbort = null;
+let reconnectTimer = null;
+let streamGeneration = 0;
+
+function stopStream() {
+  streamGeneration += 1;
+  if (streamAbort) { try { streamAbort.abort(); } catch (_) {} streamAbort = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+
+function disconnect() {
+  stopStream();
+  const out = document.getElementById('events');
+  out.textContent += '\n[disconnected]\n';
+  out.scrollTop = out.scrollHeight;
+}
+
+function appendStreamLine(out, text) {
+  out.textContent += text + '\n';
+  out.scrollTop = out.scrollHeight;
+}
+
+function handleStreamLine(line, gen, out, afterInput) {
+  if (gen !== streamGeneration) return;
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch (_) {
+    appendStreamLine(out, '[skipped malformed NDJSON line: ' + line.slice(0, 120) + ']');
+    return;
+  }
+  if (typeof message.seq === 'number') afterInput.value = String(message.seq);
+  if (message.type === 'heartbeat') {
+    appendStreamLine(out, '[heartbeat seq ' + message.seq + ']');
+  } else if (message.type === 'end') {
+    appendStreamLine(out, '[end seq ' + message.seq + ']');
+  } else if (message.type === 'event') {
+    appendStreamLine(out, line);
+  } else {
+    appendStreamLine(out, '[unknown line type: ' + (message.type || '?') + ']');
+  }
+}
+
+async function connect() {
+  stopStream();
+  const gen = streamGeneration;
+  const afterInput = document.getElementById('after');
+  const out = document.getElementById('events');
+  const after = afterInput.value.trim() || '0';
+  const controller = new AbortController();
+  streamAbort = controller;
+  out.textContent = 'connecting (NDJSON) from seq ' + after + '\n';
+  try {
+    const response = await fetch(
+      '/events/stream?after=' + encodeURIComponent(after) + '&seconds=10',
+      {signal: controller.signal, headers: {'Accept': 'application/x-ndjson'}}
+    );
+    if (gen !== streamGeneration) return;
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const contentType = response.headers.get('Content-Type') || '';
+    if (contentType.indexOf('application/x-ndjson') < 0) {
+      appendStreamLine(out, '[warning: unexpected content type ' + contentType + ']');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (gen === streamGeneration) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, {stream: true});
+      let newline = buffer.indexOf('\n');
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.trim()) handleStreamLine(line, gen, out, afterInput);
+        newline = buffer.indexOf('\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() && gen === streamGeneration) handleStreamLine(buffer, gen, out, afterInput);
+    if (gen === streamGeneration) {
+      appendStreamLine(out, '[stream closed; reconnecting with fresh cursor ' + (afterInput.value.trim() || '0') + ']');
+      scheduleReconnect(gen);
+    }
+  } catch (e) {
+    if (gen !== streamGeneration) return;
+    if (e.name !== 'AbortError') {
+      appendStreamLine(out, '[stream error: ' + e.message + '; reconnecting]');
+      scheduleReconnect(gen);
+    }
+  }
+}
+
+function scheduleReconnect(gen) {
+  if (gen !== streamGeneration) return;
+  reconnectTimer = setTimeout(function () {
+    reconnectTimer = null;
+    if (gen === streamGeneration) connect();
+  }, 500);
+}
+
+// -------------------------------------------------- verification + evidence
+async function loadEvidence() {
+  const id = document.getElementById('runId').value.trim();
+  if (!id) return;
+  const out = document.getElementById('evidence');
+  const enc = encodeURIComponent(id);
+  out.textContent = 'loading…';
+  let reportText;
+  try {
+    reportText = JSON.stringify(await get('/verification/' + enc + '/report'), null, 2);
+  } catch (e) {
+    reportText = 'error: ' + e;
+  }
+  let bundleText;
+  try {
+    const response = await fetch('/evidence/' + enc + '/bundle');
+    if (response.status === 404) {
+      bundleText = '404 — no evidence bundle is available for this run.';
+    } else if (!response.ok) {
+      bundleText = 'error HTTP ' + response.status;
+    } else {
+      const bundle = await response.json();
+      const names = Object.keys(bundle.files || {});
+      bundleText = 'manifest:\n' + JSON.stringify(bundle.manifest, null, 2) +
+        '\n\nfiles (' + names.length + '): ' + (names.join(', ') || '(none)');
+    }
+  } catch (e) {
+    bundleText = 'error: ' + e;
+  }
+  out.textContent = 'Verification report:\n' + reportText + '\n\nEvidence bundle:\n' + bundleText;
+}
+
+async function loadDiff() {
+  const id = document.getElementById('diffRunId').value.trim();
+  if (!id) return;
+  const out = document.getElementById('diff');
+  out.textContent = 'loading…';
+  try {
+    const diff = await get('/runs/' + encodeURIComponent(id) + '/diff');
+    const files = (diff.files || []).map(f => f.path + ' (' + f.status + ')').join('\n') || '(none)';
+    out.textContent =
+      'base commit: ' + diff.base_commit_sha + '\n' +
+      'patch sha256: ' + diff.patch_sha256 + '\n' +
+      'files:\n' + files + '\n\n' + diff.patch;
+  } catch (e) {
+    out.textContent = 'error: ' + e;
+  }
+}
+
+// ------------------------------------------------------- task control surface
+async function taskControl(action) {
+  const id = document.getElementById('controlTaskId').value.trim();
+  const status = document.getElementById('controlStatus');
+  if (!id) { status.textContent = 'Enter a task id first.'; return; }
+  if (!window.confirm(action.toUpperCase() + ' task ' + id + '?')) {
+    status.textContent = action + ' cancelled by user.';
+    return;
+  }
+  status.textContent = 'requesting ' + action + '…';
+  try {
+    const body = action === 'cancel' ? {reason: 'cancelled via control plane UI'} : {};
+    const response = await fetch('/tasks/' + encodeURIComponent(id) + '/' + action, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = action + ' failed: ' + (payload.error || ('HTTP ' + response.status));
+      return;
+    }
+    status.textContent = action + ' ok — run state: ' + ((payload.run && payload.run.state) || '?');
+  } catch (e) {
+    status.textContent = action + ' error: ' + e;
+  }
+}
+
 refresh();
+refreshProjectsSummary();
 </script>
 </body>
 </html>

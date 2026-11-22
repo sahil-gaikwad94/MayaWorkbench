@@ -1345,6 +1345,8 @@ class ExperimentService:
         destination: str | Path,
         *,
         attestation: dict[str, Any] | None = None,
+        sign: bool = False,
+        signing_key: bytes | str | None = None,
     ) -> Any:
         """Export one run, or a comparison's two arms, as a portable archive.
 
@@ -1353,9 +1355,15 @@ class ExperimentService:
         carries exact commands, declared seeds, commit and patch hashes,
         environment locks, a dataset fingerprint, expected output hashes and
         hardware metadata. Nothing here claims that a remote runner is trusted.
+
+        With ``sign=True`` the existing attestation helper adds an HMAC envelope
+        over the manifest root. ``signing_key`` is only ever passed through to
+        that helper; it is never stored in the archive or logged here.
         """
         from mayaworkbench.experiments.bundle import (
             compute_dataset_fingerprint,
+            sha256_file,
+            sign_run_bundle,
             write_run_bundle,
         )
 
@@ -1453,7 +1461,7 @@ class ExperimentService:
             "key, it does not prove the scientific result"
         )
         context = self._runner_bundle_context(definitions)
-        return write_run_bundle(
+        result = write_run_bundle(
             destination,
             definition_doc,
             manifest_docs,
@@ -1467,14 +1475,27 @@ class ExperimentService:
             attestation=attestation,
             context=context,
         )
+        if sign:
+            sign_run_bundle(result.path, key=signing_key)
+            # The archive changed; the previously computed hash no longer
+            # describes the bytes a recipient would verify.
+            result.archive_sha256 = sha256_file(result.path)
+        return result
 
-    def import_run_bundle(self, path: str | Path) -> Any:
-        """Import verified bundle results as IMPORTED, never as local evidence."""
+    def import_run_bundle(
+        self, path: str | Path, *, key: bytes | str | None = None
+    ) -> Any:
+        """Import verified bundle results as IMPORTED, never as local evidence.
+
+        ``key`` is threaded to the strict verification path: when it is supplied,
+        a bad or swapped attestation aborts the import instead of silently
+        downgrading the evidence to UNATTESTED.
+        """
         from mayaworkbench.experiments.bundle import (
             import_run_bundle as import_bundle_records,
         )
 
-        result = import_bundle_records(path, self.store)
+        result = import_bundle_records(path, self.store, key=key)
         definitions = {item.id: item for item in result.definitions}
         for run in result.runs:
             if run.id not in result.created_run_ids:

@@ -113,6 +113,78 @@ def start_and_approve(services, task):
 
 
 # ---------------------------------------------------------------- finish gate
+def test_rootless_task_provisions_one_shared_overlay(
+    services, indexed, home, monkeypatch
+):
+    """An isolated task must route tools and commands through one populated tree."""
+    from mayaworkbench.workspace import capabilities as caps_mod
+    from mayaworkbench.workspace.backends import (
+        RootlessContainerBackend,
+        RuntimeCapabilities,
+    )
+    from mayaworkbench.workspace.runner import LimitEnforcement
+    from mayaworkbench.worker import Worker
+
+    available = caps_mod.probe_execution_capability_report()
+    available.trust_profiles["ROOTLESS_CONTAINER"] = {
+        "available": True,
+        "reason": "fake smoke-verified runtime",
+        "boundary": "test",
+    }
+    monkeypatch.setattr(
+        caps_mod, "probe_execution_capability_report", lambda: available
+    )
+    monkeypatch.setattr(
+        RootlessContainerBackend,
+        "capabilities",
+        lambda self: RuntimeCapabilities(
+            True,
+            ("fake rootless runtime",),
+            {
+                "wall_time": LimitEnforcement("enforced", "supervisor"),
+                "cpu": LimitEnforcement("not_applied", None),
+                "memory": LimitEnforcement("not_applied", None),
+                "process_count": LimitEnforcement("not_applied", None),
+                "file_size": LimitEnforcement("unsupported", None),
+                "open_files": LimitEnforcement("unsupported", None),
+            },
+            "none",
+        ),
+    )
+
+    task, _contract = services.task_service.create_task(
+        project_id=indexed.project.id,
+        title="Isolated overlay task",
+        goal="Finish without changing files",
+        task_type=TaskType.ENGINEERING_CHANGE,
+        snapshot_id=indexed.snapshot.id,
+        allowed_paths=["utils.py"],
+        acceptance_criteria=["no edits"],
+        verification_checks=[],
+        required_approvals=[ApprovalAction.WRITE_ACCESS],
+        constraints={
+            "max_steps": 6,
+            "execution_trust": "ROOTLESS_CONTAINER",
+            "network_access": "DENY_BY_DEFAULT",
+        },
+    )
+    provider = RecordingProvider()
+    provider.actions = [finish("Isolated run complete.")]
+    install_task_model(services, home, monkeypatch, provider)
+    result = start_and_approve(services, task)
+    Worker(services).run(once=True, run_id=result.run.id)
+    run = services.runs.get(result.run.id)
+    assert run.state == WorkflowState.REVIEWING, (run.state, run.error)
+    binding = run.details["runtime_binding"]
+    assert binding["kind"] == "container"
+    assert binding["trust_profile"] == "ROOTLESS_CONTAINER"
+    assert binding["runtime_ref"]["backend"] == "rootless-container"
+    from pathlib import Path
+
+    overlay = Path(binding["active_path"])
+    assert (overlay / "utils.py").is_file()  # the overlay is populated, not empty
+
+
 def test_finish_is_a_request_and_a_failed_check_drives_one_repair_round(
     services, indexed, home, monkeypatch
 ):
@@ -207,7 +279,7 @@ def test_a_broken_checker_is_not_sent_back_as_a_code_failure(
 
     run = services.runs.get(result.run.id)
     assert run.state == WorkflowState.REVIEWING, run.error
-    assert run.details["in_loop_verdict"] == "NO_VERDICT"
+    assert run.details["in_loop_verdict"] == "BROKEN_CHECKER"
     assert len(run.details["in_loop_check_rounds"]) == 1
     assert any("produced no verdict in-loop" in item for item in run.limitations)
     assert not any("REPAIR_REQUIRED" in message for message in provider.messages)
@@ -319,24 +391,34 @@ def test_repeating_a_read_only_action_is_refused_instead_of_burning_the_budget(
 
 # -------------------------------------------------------------- unit: feedback
 @pytest.mark.parametrize(
-    ("argv", "exit_code", "infrastructure"),
+    ("argv", "exit_code", "infrastructure", "output"),
     [
-        (["python", "-m", "pytest", "tests", "-q"], 0, False),
-        (["python", "-m", "pytest", "tests", "-q"], 1, False),
-        (["python", "-m", "pytest", "tests", "-q"], 2, False),
-        (["python", "-m", "pytest", "tests", "-q"], 3, True),
-        (["python", "-m", "pytest", "tests", "-q"], 4, True),
-        (["python", "-m", "pytest", "tests", "-q"], 5, True),
-        (["python", "-m", "pytest", "tests", "-q"], 6, True),
-        (["pytest", "-q"], 1, False),
-        (["python", "-c", "raise SystemExit(1)"], 1, False),
-        (["python", "-c", "pass"], None, True),
+        (["python", "-m", "pytest", "tests", "-q"], 0, False, ""),
+        (["python", "-m", "pytest", "tests", "-q"], 1, False, ""),
+        (["python", "-m", "pytest", "tests", "-q"], 2, False, ""),
+        (["python", "-m", "pytest", "tests", "-q"], 3, True, ""),
+        (["python", "-m", "pytest", "tests", "-q"], 4, True, ""),
+        (["python", "-m", "pytest", "tests", "-q"], 5, True, ""),
+        (["python", "-m", "pytest", "tests", "-q"], 6, True, ""),
+        (["pytest", "-q"], 1, False, ""),
+        (["python", "-c", "raise SystemExit(1)"], 1, False, ""),
+        (["python", "-c", "pass"], None, True, ""),
+        # A checker that cannot import itself is broken apparatus, never a code
+        # failure — even though pytest/python exits 1 for ModuleNotFoundError.
+        (
+            ["python", "-m", "pytest", "-q"],
+            1,
+            True,
+            "No module named pytest",
+        ),
+        (["python", "-m", "pytest", "--definitely-not-a-flag"], 4, True, "unrecognized arguments: --definitely-not-a-flag"),
+        (["pytest", "-q"], 127, True, "pytest: command not found"),
     ],
 )
 def test_exit_code_classification_separates_code_failures_from_broken_checkers(
-    argv, exit_code, infrastructure
+    argv, exit_code, infrastructure, output
 ):
-    is_infrastructure, reason = classify_exit(argv, exit_code)
+    is_infrastructure, reason = classify_exit(argv, exit_code, output)
     assert is_infrastructure is infrastructure
     assert reason
 

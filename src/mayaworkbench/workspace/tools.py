@@ -93,6 +93,13 @@ ToolName = Literal[
     "skill_run",
 ]
 
+#: Tools that only read repository state. ``READ_ONLY_ANALYSIS`` constraints the
+#: gateway to exactly this set regardless of any contract grant — the profile is
+#: enforced in code, not by a prompt or a disabled UI button.
+READ_ONLY_TOOLS: frozenset[str] = frozenset(
+    {"read_file", "list_files", "search_text", "find_symbol", "git_status", "git_diff"}
+)
+
 #: Capability required by each tool. A non-empty contract grant list is closed.
 TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "read_file": ("file.read",),
@@ -351,6 +358,7 @@ class ToolGateway:
         allowed_log_dirs: tuple[str, ...] = (),
         http: Callable[[str, str, dict[str, str], bytes | None], dict[str, Any]] | None = None,
         symbol_lookup: Callable[[str, int], list[dict[str, Any]]] | None = None,
+        read_only_profile: bool = False,
     ):
         self.run = run
         self.task = task
@@ -373,6 +381,7 @@ class ToolGateway:
         self.allowed_log_dirs = tuple(allowed_log_dirs)
         self.http = http
         self.symbol_lookup = symbol_lookup
+        self.read_only_profile = read_only_profile
         self._cancelled = False
 
     # ------------------------------------------------------------------ public
@@ -544,8 +553,14 @@ class ToolGateway:
 
         A legacy contract with no grants keeps the approval/path policy as the
         authority. A non-empty grant list is a closed allowlist: no prompt, file
-        content, or tool output can widen it.
+        content, or tool output can widen it. ``READ_ONLY_ANALYSIS`` is a hard
+        code-level mask that even a broader contract grant cannot widen.
         """
+        if self.read_only_profile and tool not in READ_ONLY_TOOLS:
+            raise ToolBlocked(
+                f"tool {tool!r} is forbidden by the READ_ONLY_ANALYSIS trust profile; "
+                "no writes, subprocesses, sessions, network or advanced tools are permitted"
+            )
         granted = set(getattr(self.contract.constraints, "capabilities", ()) or ())
         if not granted:
             return

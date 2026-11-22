@@ -12,3 +12,22 @@
 
 Verified: python -m compileall -q src OK; python -m pytest -q => 373 passed, 0 failed.
 Truth table: IMPLEMENTATION_STATUS.md. Test matrix: docs/test-matrix.md.
+
+## 2026-11-22 audit remediation (post-47c78e3)
+
+- One canonical `ExecutionCapabilityReport`: controller presence is no longer an
+  enforcement claim; rootless OCI needs a real smoke test; `READ_ONLY_ANALYSIS`
+  is a code-enforced read-only tool mask.
+- cgroup v2: exact finite `pids.max` readback (`max` rejected), live-pid drain and
+  `rmdir` cleanup, worker opt-in with fail-closed auto-discovery.
+- One `RuntimeWorkspace` per task: isolated overlays populated from the pinned
+  snapshot, shared by file tools, commands, in-loop checks, artifact/diff capture
+  and verification; retained candidate overlay, separate clean baseline.
+- Agent loop: broken checkers are apparatus failures (`BROKEN_CHECKER`), finish
+  after provider failure settles as REVIEWING with an explicit in-loop error.
+- Lockfile-aware environment plans; NDJSON `fetch()` UI client with working
+  approvals, task controls, real stored-diff view and `/ui` alias.
+- Experience memory recalled during orientation and failed attempts recorded.
+- Docs reconciled from one status registry; see `docs/wiki/audit-2026-11-22-remediation.md`.
+
+Verification numbers for this package are recorded in `docs/test-matrix.md`.

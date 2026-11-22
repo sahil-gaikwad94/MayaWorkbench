@@ -9,7 +9,9 @@ described as a shipped capability. Status values:
 - `SPEC_ONLY` — designed/specified in a vision document but not implemented.
 - `NOT_STARTED` — no implementation.
 
-Generated/verified on 21 November 2026. See `docs/test-matrix.md` for the
+Generated/verified on 21 November 2026; reconciled with the 22 November 2026
+audit-remediation work package (commit `47c78e3` + follow-up fixes). See
+`docs/test-matrix.md` for the
 declared test environment and the latest full-suite result. The authoritative
 product specification is `MayaWorkbench_MasterProductandEngineeringSpec.md`
 (v2.1), which explicitly states that its requirements are specifications, not
@@ -17,10 +19,10 @@ claims of implementation.
 
 ## Product direction
 
-| Vision claim | Actual implementation | Status |
-|---|---|---|
-| Research-to-Implementation as flagship wedge | repository + research + mapping + task + verification pipeline | `SHIPPED` (alpha scope) |
-| One connected workflow, not four products | shared project/snapshot/evidence/task model | `SHIPPED` |
+| Vision claim | Actual implementation | Test | Status |
+|---|---|---|---|
+| Research-to-Implementation as flagship wedge | repository + research + mapping + task + verification pipeline | `tests/test_task_workflow.py` | `SHIPPED` (alpha scope) |
+| One connected workflow, not four products | shared project/snapshot/evidence/task model | `tests/test_cli.py` | `SHIPPED` |
 | North star: verified task completion per human supervision and cost | `evaluation/metrics.py` + `maya eval score`; only accepted+evidenced outcomes count | `tests/test_evaluation.py` | `SHIPPED` |
 | Engineering Workspace (multi-repo, data, services, environments) | `workspaces`, `resource_attachments`, `environment_specs`, `workspace_sessions`, `evidence_items` + `WorkspaceService` + `maya workspace` CLI | `tests/test_workspace_v2.py` | `SHIPPED` (typed attachments and evidence; no connector/resource-specific adapters yet) |
 | Hosted multi-user control plane / auth / tenancy | none | `NOT_STARTED` |
@@ -32,7 +34,7 @@ claims of implementation.
 |---|---|---|---|
 | Immutable commit-pinned snapshots, worktree patch + hash | `repositories/snapshots.py` | `tests/test_snapshots.py` | `SHIPPED` |
 | Python AST symbols/imports/calls with confidence | `indexing/python_parser.py`, `indexing/resolve.py` | `tests/test_indexing.py` | `SHIPPED` |
-| JS/TS/Go/Rust symbol discovery | `indexing/language_adapters.py` heuristic declarations/imports/calls, LOW confidence, `HEURISTIC` provenance, `PARTIAL` coverage; repo map + search + `symbol show` | `tests/test_multi_language.py` | `SHIPPED` (heuristic, not AST) |
+| JS/TS/Go/Rust symbol discovery | `indexing/language_adapters.py`: optional `TreeSitterAdapter` (real CST, HIGH confidence, `AST_SYMBOL`/`AST_IMPORT` provenance) activated only when `tree-sitter` extras are installed; deterministic regex/LOW/HEURISTIC fallback otherwise. The repository map reports the parser that actually ran. | `tests/test_multi_language.py` | `SHIPPED` (fallback), `SHIPPED` (tree-sitter path via injected fakes; no live grammar here) |
 | C/C++/CUDA and other languages | `language_adapters.py` heuristic declarations for C/C++/CUDA, LOW confidence, HEURISTIC provenance; others lexical-only | `tests/test_multi_language.py` | `SHIPPED` (C-family), `PARTIAL` (exotic languages) |
 | BM25 + exact + regex + symbol retrieval | `retrieval/search.py` | `tests/test_search.py` | `SHIPPED` |
 | Context pack with revision, exclusions, token estimate | `ContextPack.snapshot_id`, `query`, `candidates_manifest`, `ambiguities`, deterministic exclusions | `tests/test_context_provenance.py` | `SHIPPED` |
@@ -74,12 +76,12 @@ claims of implementation.
 | Many specialist agents / swarm | explicitly rejected by v2.1 | — | `NOT_STARTED` |
 | Persistent process sessions (stream/replay/input/lifetime/cleanup) | `workspace/sessions.py`, 5 ToolGateway session tools, worker lifecycle cleanup | `tests/test_sessions.py` | `SHIPPED` (in-process; no cross-process reconnect) |
 | PTY mode / cross-process session reconnect | PTY sessions with fd-safe cleanup + durable event record replay (`session_replay`); live process reattach across interpreters remains impossible | `tests/test_sessions.py` | `SHIPPED` (record replay), live reattach not applicable |
-| Environment detection/provisioning (Python, Node, Rust, Go, …) | `workspace/environments.py` + `maya env detect|plan|doctor`; argv-only plans, no host install | `tests/test_environments.py` | `SHIPPED` |
+| Environment detection/lockfile-aware planning (Python, Node, Rust, Go, Java, C/C++) | `workspace/environments.py`: uv/poetry/requirements/pyproject, npm/pnpm/yarn, Cargo, Go, wrapper-first Maven/Gradle, CMake/Make; content fingerprint; argv-only plans, no host install | `tests/test_environments.py` | `SHIPPED` (dry-run plans; no provisioning execution) |
 | Tool families beyond workspace/Git/command/check | 18 typed tools incl. API/DB/log/notebook/env/session/skill families | `tests/test_advanced_tools.py` | `SHIPPED` |
-| Execution trust profiles | `ExecutionTrust` enum; only `LOCAL_TRUSTED` implemented; others block | `tests/test_runner_limits.py`, `tests/test_runner_capabilities.py` | `SHIPPED` (profiles), `NOT_STARTED` (isolation backends) |
+| Execution trust profiles | `ExecutionTrust` enum; `LOCAL_TRUSTED` and code-enforced `READ_ONLY_ANALYSIS` available; isolated profiles block unless a real runtime is verified | `tests/test_runner_limits.py`, `tests/test_runner_capabilities.py`, `tests/test_tool_gateway_runner.py` | `SHIPPED` |
 | `ExecutionBackend` protocol + `TrustedLocalBackend` | `workspace/backends.py` | `tests/test_execution_backends.py` | `SHIPPED` |
-| `RootlessContainerBackend` (read-only source, writable overlay, cgroup limits, no home/socket/secrets, deny network) | `workspace/backends.py`; capability probe + fail-closed provision | `tests/test_execution_backends.py` | `SHIPPED` |
-| Worker routing by contract trust profile | `BackendCommandRunner`; worker selects isolated backend or fails closed | `tests/test_execution_backends.py` | `SHIPPED` (backend path unit-tested with fake OCI client) |
+| `RootlessContainerBackend` (read-only source at `/src`, populated writable overlay at `/work`, cgroup args, no home/socket/secrets, deny network) | `workspace/backends.py`; no "enforced" claim from controller names; must be smoke-verified before provision | `tests/test_execution_backends.py`, `tests/test_runtime_workspace.py` | `EXPERIMENTAL` (fail-closed; no real OCI host in CI) |
+| Worker routing by contract trust profile | worker provisions one `RuntimeWorkspace` and one `CommandRunnerTaskRuntime` for file tools, commands, in-loop checks and artifact/diff capture | `tests/test_runtime_workspace.py`, `tests/test_task_workflow.py` | `SHIPPED` (routing/boundary); `EXPERIMENTAL` (real isolation) |
 | Remote microVM / user-owned GPU runner backends | `workspace/remote_backends.py`: allowlisted endpoint/executor, fail-closed provision/submit, no secret forwarding | `tests/test_remote_backends.py` | `SHIPPED` as adapters (execution needs user infrastructure) |
 
 ## Execution trust and resource enforcement (WP0)
@@ -87,10 +89,10 @@ claims of implementation.
 | Claim | Implementation | Test | Status |
 |---|---|---|---|
 | Per-limit enforcement evidence | `runner.LimitEnforcement`, child-side `setrlimit` + `getrlimit` readback, derived `limits_enforcement` | `tests/test_runner_limits.py` | `SHIPPED` |
-| Process-count limit (`max_processes`) | reported `unsupported`; `RLIMIT_NPROC` removed; isolated profiles blocked before spawn | `tests/test_runner_limits.py` | `SHIPPED` as truthful reporting; `NOT_STARTED` as enforcement |
-| Fork bomb containment | verified cgroup v2 `pids.max` limiter with readback + cleanup; fail-closed when unavailable | `tests/test_cgroup_limits.py` | `SHIPPED` (requires cgroup-capable host) |
-| Network deny-by-default | verified `unshare` probe, fail-closed before spawn | `tests/test_tool_gateway_runner.py` | `SHIPPED` |
-| Runtime capability report | `workspace/capabilities.py`, `maya runner doctor\|profiles` | `tests/test_runner_capabilities.py` | `SHIPPED` |
+| Process-count limit (`max_processes`) | `RLIMIT_NPROC` removed; verified cgroup v2 scope auto-created by the worker runner when a writable delegation exists ("max" readback rejected), otherwise `unsupported`; container `pids.max` only when smoke-verified | `tests/test_runner_limits.py`, `tests/test_cgroup_limits.py` | `SHIPPED` (truthful reporting + verified scope) |
+| Fork bomb containment | cgroup v2 `pids.max` limiter with exact readback, live-pid drain and `rmdir` cleanup; fail-closed when unavailable | `tests/test_cgroup_limits.py` | `SHIPPED` (requires cgroup-capable host) |
+| Network deny-by-default | positive loopback-unreachability probe used by both the runner and the canonical capability report; fail-closed before spawn | `tests/test_tool_gateway_runner.py`, `tests/test_runner_capabilities.py` | `SHIPPED` |
+| Runtime capability report | one `ExecutionCapabilityReport` in `workspace/capabilities.py`, `maya runner doctor\|profiles`; controller presence != enforcement; OCI smoke opt-in | `tests/test_runner_capabilities.py` | `SHIPPED` |
 | Host-canary / secret isolation fixtures for a container backend | adversarial argv assertions: no canary/home/SSH/socket/token in OCI flags, sanitized PATH | `tests/test_execution_backends.py` | `SHIPPED` (argv-level; real kernel escape test needs OCI host) |
 
 ## Verification, evidence and experiments
@@ -116,11 +118,13 @@ claims of implementation.
 |---|---|---|---|
 | Provenance-aware, user-confirmed, commit-stale memory | `memory/service.py` | `tests/test_memory.py` | `SHIPPED` |
 | Negative-result records | `MemoryKind.NEGATIVE_RESULT` with scoped details, expiry and similarity recall | `tests/test_experience_memory.py`, `tests/test_experiment_comparison.py` | `SHIPPED` |
-| Experience learning / failure-signature retrieval | `memory/experience.py`, `maya experience record\|suggest`, confirmation/expiry gates, advisory suggestions | `tests/test_experience_memory.py` | `SHIPPED` |
+| Experience learning / failure-signature retrieval | `memory/experience.py`, `maya experience record\|suggest`, confirmation/expiry gates, advisory suggestions; **wired into the live worker**: prior confirmed failures are attached to orientation and failed runs record unconfirmed negative results | `tests/test_experience_memory.py`, `tests/test_task_workflow.py` | `SHIPPED` (advisory, not prohibitive) |
 | Provider-neutral chat gateway + OpenAI-compatible adapter | `models/` | `tests/test_qa.py`, `tests/test_cli.py` | `SHIPPED` |
-| Chat/Embedding/Reranker/Vision/ToolConnector interfaces, routing, health | `models/capabilities.py`, `models/routing.py`, local deterministic embeddings/reranker, explicit unsupported vision, health tracking | `tests/test_model_platform.py` | `SHIPPED` (interfaces + routing; real vision adapter not claimed) |
-| GitHub read-only connector, MCP integrations | `models/connectors/github.py` + `models/connectors/mcp.py`: verified contracts, local capability gate, provenance hashes, revoke; MCP is protocol only | `tests/test_model_platform.py`, `tests/test_mcp.py` | `SHIPPED` (GitHub read-only, MCP adapter) |
-| Web/API control plane and UI | stdlib loopback JSON API + NDJSON event streaming + thin truth-surface UI (health, projects, tasks, approvals, events, evidence) | `tests/test_api_control_plane.py` | `SHIPPED` (thin local UI; no auth/multi-user) |
+| Chat/Embedding/Reranker/Vision/ToolConnector interfaces, routing, health | `models/capabilities.py`, `models/routing.py`, local deterministic hashing embeddings/reranker, explicit unsupported vision, health tracking | `tests/test_model_platform.py` | `SHIPPED` (interfaces + routing; hashing is lexical, not learned semantic) |
+| Native tool calling and streaming | `models/base.py` (`ToolDefinition`, `ToolCall`, stream/cache fields), `openai_compatible.py` (tools/tool_calls, SSE streaming), `anthropic_adapter.py` (tool_use + ephemeral caching), `gemini_adapter.py` (function calling); all selectable from config and the gateway | `tests/test_model_platform.py`, `tests/test_provider_wiring.py` | `SHIPPED` (adapters tested with fake transports; no live provider keys) |
+| Pluggable embeddings + hybrid fusion | `retrieval/semantic.py`: `EmbeddingProvider`, fail-closed `ApiEmbeddingProvider`, `reciprocal_rank_fusion` over BM25/PPR/dense; opt-in, hashing fallback stays deterministic | `tests/test_semantic_retrieval.py` | `SHIPPED` (no learned semantic model claimed) |
+| GitHub read-only connector, MCP integrations | `models/connectors/github.py` + `models/connectors/mcp.py`: real stdio JSON-RPC 2.0 transport, risk-tiered tool contracts, one-time hash-bound grants, revoke; MCP remains transport, not trust | `tests/test_model_platform.py`, `tests/test_mcp.py`, `tests/test_advanced_connectors.py` | `SHIPPED` (contract and transport; no live MCP server in CI) |
+| Web/API control plane and UI | stdlib loopback JSON API + NDJSON event streaming; browser client uses `fetch()` line-buffered NDJSON (not SSE), working approve/reject and task controls, verification/evidence view, `/ui`→`/` redirect | `tests/test_api_control_plane.py` | `SHIPPED` (thin local truth surface; no auth/multi-user, no source-diff rendering) |
 
 ## Advanced capabilities added after WP12
 
@@ -132,6 +136,85 @@ claims of implementation.
 | Raw LLM / agent capabilities | `tasks/llm_capabilities.py`: task routing, bounded structured-output repair, tool reliability, usage accounting; wired into agent loop; `maya task reliability|explain-params` | `tests/test_agent_capabilities.py` | `SHIPPED` (scripted providers only) |
 | Advanced memory governance | `memory/advanced.py`: conflict audit, retention/expiry, portable bundles with unconfirmed imports; `maya memory audit|retention|export-bundle|import-bundle` | `tests/test_memory_advanced.py` | `SHIPPED` |
 
+## 2026-11-22 final audit gaps (WP LSP-1 / WP MLFLOW-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Optional LSP client adapter | `indexing/lsp_client.py` stdio JSON-RPC (definition/references/hover), allowlisted binaries, sanitized env, fail-closed `unsupported`; `maya inspect lsp-*` | `tests/test_lsp_client.py` | `SHIPPED` (disabled by default; no live language server here) |
+| Read-only MLflow tracking connector | `models/connectors/mlflow.py` with allowlisted https endpoint, env token, redacted errors, IMPORTED/UNATTESTED provenance, registry grant, `maya connector mlflow-link` | `tests/test_mlflow_connector.py` | `SHIPPED` (no live MLflow server here) |
+
+## 2026-11-22 real-model eval harness (WP EVAL-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Versioned 25-task internal seed corpus | `evaluation/tasks.py` + `evaluation/gold/eval_tasks_seed.json`; stable corpus hash; five families | `tests/test_eval_live.py` | `SHIPPED` (internal seed, not external benchmark) |
+| Verified-completion benchmark with hard spend cap | `evaluation/live.py` + `maya eval run/tasks`; scripted offline dry-run by default, live mode gated by `MAYA_LIVE_EVAL`, key and positive cap; rates computed from recorded evidence | `tests/test_eval_live.py` | `SHIPPED` (no live provider run here) |
+
+## 2026-11-22 parallel discovery (WP ORCH-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Opt-in parallel read-only role discovery with ordered publication | `tasks/parallel.py` (pure bounded worker pool), `RoleOrchestrator._run_parallel`; workers compute payloads only, main thread publishes artifacts/events/state sequentially; default sequential | `tests/test_role_orchestrator.py` | `SHIPPED` (opt-in via `run.details.role_plan_parallel`) |
+
+## 2026-11-22 research evidence quality (WP RESEARCH-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Claim-granularity, version-bound citations | `ClaimCitation` record + migration 0011 + store + `ClaimService.cite/verify_citations`; verbatim quote verification reuses the existing authority | `tests/test_research_evidence_quality.py` | `SHIPPED` |
+| Typed cross-source disagreements with append-only resolution | `EvidenceDisagreement` record, store, `ClaimService.record_disagreement/list_disagreements/resolve_disagreement`, event types, CLI commands | `tests/test_research_evidence_quality.py` | `SHIPPED` |
+| Paper status / correction / retraction alerts | `SourceMetadata` status fields + migration 0011 + `DiscoveryService.versions` `status_alerts` + `research versions --alerts` | `tests/test_research_evidence_quality.py` | `SHIPPED` |
+
+## 2026-11-22 signed run bundles (WP RUNBUNDLE-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Sign/verify/import portable run bundles with named key | `sign_run_bundle`, `verify_run_bundle(key=...)` with structured attestation fields, key threading through service and CLI (`--sign`, `--verify-with`) | `tests/test_runner_bundles.py`, `tests/test_attestation.py` | `SHIPPED` (HMAC user key; no CI identity claim) |
+
+## 2026-11-22 workbench UI package (WP UI-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Read-only task workbench endpoints | `GET /runs/{id}/timeline`, `/plan`, `/evidence`, `GET /experiments/{id}/comparison`: real service data, no new artifacts/events, typed 404/empty states | `tests/test_api_control_plane.py` | `SHIPPED` |
+| Supervisable browser trust surfaces | Workspace, task overview, plan & approvals, execution timeline, evidence graph, diff, experiment comparator, working Approve action; `textContent`-only rendering, NDJSON stream intact | `tests/test_workbench_ui.py`, real browser smoke check | `SHIPPED` (local loopback, no auth) |
+
+## 2026-11-22 evaluation-integrity package (WP R2I-2)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Frozen evaluation harness with hash-bound approved treatments | `verification/evaluation_integrity.py` + `evaluation.integrity` built-in check; declared via `CheckSpec.details["evaluation_paths"]`/`["approved_evaluation_changes"]` | `tests/test_evaluation_integrity.py` | `SHIPPED` |
+| Additional method-specific property probes | `verification/math_invariants.py`: reduced-precision stability, gradient-flow contract, dataset-split parity, seed determinism; PASS/FAIL/SKIP discipline, no proof claim | `tests/test_method_invariants.py` | `SHIPPED` |
+| Formal-constraint plugin boundary | `verification/constraints.py`: `ConstraintVerifier`, `ConstraintRegistry`; no verifier → `NOT_CHECKED`, never PASSED | `tests/test_constraints.py` | `SHIPPED` (no solver adapter shipped) |
+
+## 2026-11-22 launch-readiness package (WP LAUNCH-1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Real OCI boundary harness | `tests/integration/test_container_escape_live.py`: host/secret canary denial, argv flags, network none, pids honesty, cleanup; opt-in `MAYA_OCI_LIVE=1` | collected; skips with explicit reason without a verified runtime | `SHIPPED` as harness; `UNVERIFIED` on this host |
+| Live model harness with hard spend cap | `tests/integration/test_model_live.py`: schema-valid output, declared tool calls; `MAYA_LIVE_MODEL=1` + key + positive cap; fails closed without cap | collected; skips with explicit reason without gates | `SHIPPED` as harness; `UNVERIFIED` without a key |
+| Release gate documentation | `docs/release-gates.md`: exact commands, pass/skip semantics, artifact fields | documentation | `SHIPPED` |
+| Machine-readable release evidence | `release/evidence.py` + `maya release evidence`: real git/version/capability/test-report inputs, redaction guard, canonical hash, fail-closed on missing report | `tests/test_release_evidence.py` | `SHIPPED` |
+
+## 2026-11-22 R2I evidence package (WP R2I-E1)
+
+| Claim | Implementation | Test | Status |
+|---|---|---|---|
+| Four-tier reproducibility report (code found / implemented / validated / reproduced) | `research/reproduction.py` (pure, backend-assigned), `research/reproduction_service.py`, `REPRODUCIBILITY_REPORT` artifact + append-only event, CLI `maya research reproduction`, API `GET /research/reproduction/{run}` | `tests/test_reproduction.py`, `tests/test_reproduction_integration.py` | `SHIPPED` |
+| Typed validation obligations derived from claims/checks | `research/obligations.py` | `tests/test_reproduction.py` | `SHIPPED` |
+| Offline R2I evaluation (claim precision/recall/F1, span validity, mapping uncertainty) | `evaluation/r2i.py` + versioned seed corpus in `evaluation/gold/` + `maya eval r2i` | `tests/test_evaluation_r2i.py` | `SHIPPED` (internal seed corpus; no external benchmark claim) |
+
+## 2026-11-22 audit-remediation package
+
+| Fix | Implementation | Test | Status |
+|---|---|---|---|
+| Cgroup finite-limit readback, `rmdir` cleanup, worker opt-in wiring | `workspace/cgroups.py`, `workspace/runner.py` | `tests/test_cgroup_limits.py` | `SHIPPED` |
+| One canonical, probe-driven capability report; honest rootless limits | `workspace/capabilities.py`, `workspace/backends.py` | `tests/test_runner_capabilities.py`, `tests/test_execution_backends.py` | `SHIPPED` |
+| `READ_ONLY_ANALYSIS` enforced by a read-only tool mask | `workspace/tools.py`, `workspace/task_runtime.py`, `worker.py` | `tests/test_runner_capabilities.py`, `tests/test_tool_gateway_runner.py` | `SHIPPED` |
+| One `RuntimeWorkspace` for file tools, commands, checks and artifacts | `workspace/runtime_workspace.py`, `workspace/task_runtime.py`, `worker.py`, `verification/service.py` | `tests/test_runtime_workspace.py` | `SHIPPED` (host); `EXPERIMENTAL` (container isolation) |
+| Broken-checker classification and clean REVIEWING transition | `tasks/inloop.py`, `tasks/agent.py` | `tests/test_agent_intelligence.py` | `SHIPPED` |
+| Native-language lockfile planning and CLI ergonomics | `workspace/environments.py`, `cli/environment_commands.py` | `tests/test_environments.py` | `SHIPPED` |
+| NDJSON `fetch` client, real approvals, `/ui` redirect | `api/ui/index.html`, `api/server.py` | `tests/test_api_control_plane.py` | `SHIPPED` |
+| Experience memory wired into the live agent context | `worker.py` | `tests/test_task_workflow.py` | `SHIPPED` |
+
 ## Reconciliation of the separate v2.0 blueprint
 
 The separate V2.0 document claims `maya_workbench_engine.py` and
@@ -139,8 +222,12 @@ The separate V2.0 document claims `maya_workbench_engine.py` and
 `ExperimentLabAuditor`, `RepoIntelligenceEngine` with damped PPR, a submodular
 token-knapsack packer, HMAC approval tokens, an 18-state orchestrator, a remote
 Kaggle/Colab bridge, a signed `.maya-proof.json`, a Veritas/Vexx symbolic bridge
-and an "anti-gaming proof". **None of those named artifacts exist in this
-repository.** Its status line should read "Target Architecture and Algorithm
-Specification; implementation coverage varies by module", not
-"Architecture-Verified & Core Engine Implemented". This table is the matrix the
-audit requested; link future acceptance tests here as work packages land.
+and an "anti-gaming proof". The named `.py` files do **not** exist; the three
+named engines exist only as honest thin facades (rows above), while damped PPR,
+submodular packing, HMAC tokens, 18 states, runner bundles and signed proofs are
+real, separately named implementations. There is **no** Veritas/Vexx symbolic
+bridge and no general anti-gaming proof. Its status line should read "Target
+Architecture and Algorithm Specification; implementation coverage varies by
+module", not "Architecture-Verified & Core Engine Implemented". This table is
+the authoritative matrix; link future acceptance tests here as work packages
+land.

@@ -250,10 +250,22 @@ def execute_check(
     argv: list[str] | None,
     script: str | None,
     timeout_seconds: int,
+    runtime: Any | None = None,
 ) -> CommandResult:
-    """Run one declared check on one tree and record which tree it ran on."""
-    runner = make_runner(workspace, constraints=constraints, run_home=run_home)
+    """Run one declared check on one tree and record which tree it ran on.
+
+    When ``runtime`` is supplied it is the task's single injected runtime, so a
+    candidate check executes against the exact overlay the agent edited. It is
+    never used for the baseline, which must stay in a separate clean tree.
+    """
     del owner  # retained so callers can label the tree in their own records
+    if runtime is not None:
+        if script is not None:
+            return runtime.exec_script(script, timeout_seconds=timeout_seconds, run_home=run_home)
+        if not argv:
+            raise VerificationError("A command check has no argv")
+        return runtime.exec(list(argv), timeout_seconds=timeout_seconds, run_home=run_home)
+    runner = make_runner(workspace, constraints=constraints, run_home=run_home)
     if script is not None:
         return runner.run_script(script, timeout_seconds=timeout_seconds)
     if not argv:

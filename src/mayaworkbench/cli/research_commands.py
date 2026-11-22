@@ -13,11 +13,15 @@ from pathlib import Path
 from typing import Any
 
 from mayaworkbench.domain.enums import (
+    CitationGranularity,
+    CitationRelation,
     ClaimConfidence,
     ClaimExplicitness,
     ClaimKind,
     ClaimTargetKind,
     ClaimType,
+    DisagreementKind,
+    DisagreementStatus,
 )
 from mayaworkbench.errors import UsageError
 from mayaworkbench.research.ingestion import MetadataOverrides
@@ -99,6 +103,58 @@ def register_research_commands(sub: argparse._SubParsersAction) -> None:  # type
     claim_add.add_argument("--parent")
     claim_add.set_defaults(func=cmd_research_claim_add)
 
+    cite = claim_sub.add_parser("cite", help="Record a verbatim, version-bound citation")
+    cite.add_argument("claim_id")
+    cite.add_argument("--passage", required=True, help="Id of the pinned source passage")
+    cite.add_argument("--quote", required=True, help="Verbatim quote from that passage")
+    cite.add_argument(
+        "--granularity",
+        choices=[item.value for item in CitationGranularity],
+        default=CitationGranularity.PASSAGE.value,
+    )
+    cite.add_argument(
+        "--relation",
+        choices=[item.value for item in CitationRelation],
+        default=CitationRelation.SUPPORTS.value,
+    )
+    cite.add_argument("--document-version", type=int)
+    cite.add_argument("--source-metadata-id")
+    cite.set_defaults(func=cmd_research_claim_cite)
+
+    citations = claim_sub.add_parser("citations", help="List a claim's stored citations")
+    citations.add_argument("claim_id")
+    citations.set_defaults(func=cmd_research_claim_citations)
+
+    disagree = claim_sub.add_parser("disagree", help="Record a typed evidence disagreement")
+    disagree.add_argument("claim_id")
+    disagree.add_argument(
+        "--kind", choices=[item.value for item in DisagreementKind], required=True
+    )
+    disagree.add_argument("--detail", required=True)
+    disagree.add_argument("--passage-id")
+    disagree.add_argument("--quote")
+    disagree.add_argument("--mapping-id")
+    disagree.add_argument("--run-id")
+    disagree.set_defaults(func=cmd_research_claim_disagree)
+
+    disagreements = claim_sub.add_parser(
+        "disagreements", help="List a claim's evidence disagreements"
+    )
+    disagreements.add_argument("claim_id")
+    disagreements.set_defaults(func=cmd_research_claim_disagreements)
+
+    resolve = claim_sub.add_parser(
+        "resolve-disagreement", help="Append a resolution without rewriting history"
+    )
+    resolve.add_argument("disagreement_id")
+    resolve.add_argument(
+        "--status",
+        choices=[DisagreementStatus.RESOLVED.value, DisagreementStatus.DISMISSED.value],
+        required=True,
+    )
+    resolve.add_argument("--resolution", required=True)
+    resolve.set_defaults(func=cmd_research_claim_resolve_disagreement)
+
     search = research_sub.add_parser("search", help="Search literature metadata")
     search.add_argument("--project")
     search.add_argument("query")
@@ -114,7 +170,12 @@ def register_research_commands(sub: argparse._SubParsersAction) -> None:  # type
 
     versions = research_sub.add_parser("versions", help="List immutable source versions")
     versions.add_argument("--project")
-    versions.add_argument("key")
+    versions.add_argument("key", nargs="?", help="Document key; omit with --alerts")
+    versions.add_argument(
+        "--alerts",
+        action="store_true",
+        help="Show claims affected by retracted/corrected/superseded sources",
+    )
     versions.set_defaults(func=cmd_research_versions)
 
     memo = research_sub.add_parser("memo", help="Build a source-linked research memo")
@@ -125,6 +186,15 @@ def register_research_commands(sub: argparse._SubParsersAction) -> None:  # type
     memo.add_argument("--deviations", action="append", default=[])
     memo.add_argument("--out", help="Write the memo Markdown to this path")
     memo.set_defaults(func=cmd_research_memo)
+
+    reproduction = research_sub.add_parser(
+        "reproduction", help="Build the four-tier reproducibility report for a run"
+    )
+    reproduction.add_argument("run_id")
+    reproduction.add_argument(
+        "--out", help="Write the Markdown rendering to this path"
+    )
+    reproduction.set_defaults(func=cmd_research_reproduction)
 
     mapping = sub.add_parser("map", help="Map claims to code in a pinned snapshot")
     map_sub = mapping.add_subparsers(dest="map_command", metavar="<action>")
@@ -149,6 +219,28 @@ def register_research_commands(sub: argparse._SubParsersAction) -> None:  # type
     claim.add_argument("--snapshot")
     claim.add_argument("--model", action="store_true")
     claim.set_defaults(func=cmd_map_claim)
+
+
+def cmd_research_reproduction(args: argparse.Namespace) -> int:
+    svc = _services(args)
+    report, artifact_id = svc.reproduction.build(args.run_id)
+    if args.out:
+        from mayaworkbench.research.reproduction import render_reproduction_markdown
+
+        Path(args.out).write_text(render_reproduction_markdown(report), encoding="utf-8")
+    if args.console.json_mode:
+        args.console.json(
+            {
+                "report": report.model_dump(mode="json"),
+                "artifact_id": artifact_id,
+            }
+        )
+    else:
+        from mayaworkbench.research.reproduction import render_reproduction_markdown
+
+        args.console.print(render_reproduction_markdown(report))
+        args.console.print(f"report artifact: {artifact_id or 'not persisted'}")
+    return 0
 
 
 def _overrides(args: argparse.Namespace) -> MetadataOverrides:
@@ -422,6 +514,122 @@ def cmd_research_claim_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_research_claim_cite(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    claim = svc.claim_service.get(args.claim_id)
+    passage = svc.passages.get(args.passage)
+    citation = svc.claim_service.cite(
+        claim,
+        passage,
+        args.quote,
+        granularity=CitationGranularity(args.granularity),
+        relation=CitationRelation(args.relation),
+        document_version=args.document_version,
+        source_metadata_id=args.source_metadata_id,
+    )
+    if console.json_mode:
+        console.json({"citation": citation.model_dump(mode="json")})
+    else:
+        console.print(
+            f"Recorded citation {citation.id} for claim {claim.id} "
+            f"at document version {citation.document_version}"
+        )
+    return 0
+
+
+def cmd_research_claim_citations(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    svc.claim_service.get(args.claim_id)
+    payload = {
+        "citations": [
+            item.model_dump(mode="json")
+            for item in svc.claim_service.list_citations(args.claim_id)
+        ],
+        "verification": svc.claim_service.verify_citations(args.claim_id),
+    }
+    if console.json_mode:
+        console.json(payload)
+    else:
+        console.table(
+            ["citation", "document", "version", "granularity", "relation", "verified"],
+            [
+                [
+                    result["citation_id"],
+                    result["document_id"],
+                    result["document_version"],
+                    result["granularity"],
+                    result["relation"],
+                    "yes" if result["verified"] else "no",
+                ]
+                for result in payload["verification"]
+            ],
+        )
+    return 0
+
+
+def cmd_research_claim_disagree(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    claim = svc.claim_service.get(args.claim_id)
+    passage = svc.passages.get(args.passage_id) if args.passage_id else None
+    disagreement = svc.claim_service.record_disagreement(
+        claim,
+        kind=DisagreementKind(args.kind),
+        detail=args.detail,
+        paper_quote=args.quote,
+        passage=passage,
+        mapping=args.mapping_id,
+        run_id=args.run_id,
+    )
+    if console.json_mode:
+        console.json({"disagreement": disagreement.model_dump(mode="json")})
+    else:
+        console.print(
+            f"Recorded {disagreement.kind.value} disagreement {disagreement.id} "
+            f"for claim {claim.id}"
+        )
+    return 0
+
+
+def cmd_research_claim_disagreements(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    svc.claim_service.get(args.claim_id)
+    disagreements = [
+        item.model_dump(mode="json")
+        for item in svc.claim_service.list_disagreements(args.claim_id)
+    ]
+    if console.json_mode:
+        console.json({"disagreements": disagreements})
+    else:
+        console.table(
+            ["disagreement", "kind", "status", "detail"],
+            [
+                [item["id"], item["kind"], item["status"], item["detail"]]
+                for item in disagreements
+            ],
+            max_column=60,
+        )
+    return 0
+
+
+def cmd_research_claim_resolve_disagreement(args: argparse.Namespace) -> int:
+    console = args.console
+    svc = _services(args)
+    record = svc.claim_service.resolve_disagreement(
+        args.disagreement_id,
+        status=DisagreementStatus(args.status),
+        resolution=args.resolution,
+    )
+    if console.json_mode:
+        console.json({"disagreement": record.model_dump(mode="json")})
+    else:
+        console.print(f"{record.id} {record.status.value} for claim {record.claim_id}")
+    return 0
+
+
 def cmd_research_search(args: argparse.Namespace) -> int:
     console = args.console
     svc = _services(args)
@@ -483,14 +691,23 @@ def cmd_research_versions(args: argparse.Namespace) -> int:
     console = args.console
     svc = _services(args)
     project = svc.resolve_project(args.project)
-    payload = svc.discovery_service.versions(project, args.key)
+    payload = svc.discovery_service.versions(project, getattr(args, "key", None))
     if console.json_mode:
         console.json(payload)
-    else:
-        console.print(
-            f"Source key {args.key}: {len(payload.get('documents', []))} document "
-            f"version(s), {len(payload.get('source_metadata', []))} metadata record(s)"
-        )
+        return 0
+    console.print(
+        f"Source key {args.key or '(all)'}: {len(payload.get('documents', []))} document "
+        f"version(s), {len(payload.get('source_metadata', []))} metadata record(s)"
+    )
+    alerts = payload.get("status_alerts", [])
+    if args.alerts:
+        if not alerts:
+            console.note("No source status alerts for this project.")
+        for alert in alerts:
+            console.warning(
+                f"{alert['status']} {alert['document_key']}: "
+                f"claims {', '.join(alert['claim_ids']) or 'none'}"
+            )
     return 0
 
 

@@ -55,6 +55,7 @@ from typing import Callable
 from mayaworkbench.domain.enums import ExecutionTrust
 from mayaworkbench.domain.models import TaskConstraints
 from mayaworkbench.errors import PolicyError
+from mayaworkbench.workspace.cgroups import CgroupV2Scope, discover_cgroup_root
 
 try:  # POSIX only; Windows has no resource module.
     import resource  # type: ignore[import-not-found]
@@ -239,10 +240,16 @@ class CommandRunner:
         policy: CommandPolicy,
         run_home: Path,
         cgroup_scope: Any | None = None,
+        use_cgroup_scope: bool = False,
     ):
         self.workspace = Path(workspace).resolve()
         self.policy = policy
         self.cgroup_scope = cgroup_scope
+        # Opt-in so a host without a *writable, verified* cgroup v2 delegation
+        # keeps reporting process_count: unsupported instead of blocking every
+        # ordinary trusted command. Production tasks opt in; direct callers and
+        # existing tests keep the previous behaviour unless they opt in too.
+        self.use_cgroup_scope = use_cgroup_scope
         self.run_home = Path(run_home).resolve()
         self.run_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._tmp = self.run_home / "tmp"
@@ -646,6 +653,21 @@ class CommandRunner:
                 network=(network_isolated, network_reason),
             )
 
+        # Establish the process-tree scope BEFORE spawning. An explicitly
+        # supplied scope that cannot be established fails closed below; an
+        # auto-discovered one that cannot be established simply leaves
+        # process_count reported as unsupported (never as "enforced").
+        scope = self.cgroup_scope
+        if scope is None and self.use_cgroup_scope and self.policy.max_processes > 0:
+            root = discover_cgroup_root()
+            if root is not None:
+                candidate = CgroupV2Scope(root, name=f"maya-run-{uuid.uuid4().hex[:12]}")
+                try:
+                    candidate.create(self.policy.max_processes)
+                    scope = candidate
+                except Exception:  # noqa: BLE001 - unverifiable scope stays unsupported
+                    scope = None
+
         preexec, limits_fd, evidence = self._limit_probe(
             cpu_seconds=max(
                 1,
@@ -667,6 +689,11 @@ class CommandRunner:
                 preexec_fn=preexec,
             )
         except OSError as exc:
+            if scope is not None and scope is not self.cgroup_scope:
+                try:
+                    scope.cleanup()
+                except Exception:  # noqa: BLE001 - never mask the spawn error
+                    pass
             os.close(limits_fd)
             raise PolicyError(f"Could not start command: {exc}") from exc
         finally:
@@ -680,14 +707,20 @@ class CommandRunner:
             on_start(process.pid, resolved)
 
         cgroup_active = False
-        if self.cgroup_scope is not None:
+        if scope is not None:
             try:
-                self.cgroup_scope.create(self.policy.max_processes)
-                self.cgroup_scope.attach(process.pid)
+                if not scope.created:  # an explicit scope is created here
+                    scope.create(self.policy.max_processes)
+                scope.attach(process.pid)
                 cgroup_active = True
             except Exception as exc:  # noqa: BLE001 - fail closed on cgroup setup
                 self._kill_group(process.pid)
                 process.wait(timeout=5)
+                if scope is not self.cgroup_scope:
+                    try:
+                        scope.cleanup()
+                    except Exception:  # noqa: BLE001 - never mask the setup error
+                        pass
                 raise PolicyError(
                     f"Process-tree limit could not be established: {exc}",
                     hint="Use a rootless container backend or disable the cgroup request.",
@@ -736,9 +769,9 @@ class CommandRunner:
         # The leader exiting must not leave descendants behind: a command could
         # start a server or daemon and return immediately.
         cleanup_required, cleanup_succeeded = self._cleanup_descendants(pgid)
-        if cgroup_active and self.cgroup_scope is not None:
+        if cgroup_active and scope is not None:
             try:
-                self.cgroup_scope.cleanup()
+                scope.cleanup()
             except Exception:  # noqa: BLE001 - cleanup must not mask the result
                 cleanup_succeeded = False
 

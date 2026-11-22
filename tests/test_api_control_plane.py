@@ -25,6 +25,23 @@ from mayaworkbench.verification.registry import command_check
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep 3xx responses visible so redirect headers can be asserted."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect()
+)
+
+
+def _served_html(base: str) -> str:
+    with _OPENER.open(base + "/", timeout=5) as response:
+        return response.read().decode("utf-8")
+
+
 @pytest.fixture
 def api_server(services: Services):
     server = create_server(services, host="127.0.0.1", port=0)
@@ -101,6 +118,65 @@ def test_root_serves_truth_surface_ui(api_server: str) -> None:
     assert "text/html" in response.headers.get("Content-Type", "")
     assert "events/stream" in html and "approvals" in html
     assert "no auth in this local alpha" in html
+
+
+def test_source_diff_panel_and_route(api_server: str) -> None:
+    """The UI has a real diff panel backed by the stored candidate patch."""
+    html = _served_html(api_server)
+    assert 'id="diff"' in html
+    assert "'/runs/'" in html and "'/diff'" in html
+    status, payload = _get(api_server, "/runs/not-a-real-run/diff")
+    assert status == 404
+    assert payload["code"] == "NOT_FOUND"
+
+
+def test_browser_client_uses_fetch_ndjson_reader_not_sse(api_server: str) -> None:
+    """The browser client must read the NDJSON stream with fetch, not EventSource.
+
+    A future regression to ``new EventSource(...)`` (SSE) would break the stream
+    contract, so this test pins the client technology directly. A DOM-free check
+    is appropriate here: the served asset is a single inline HTML document.
+    """
+    html = _served_html(api_server)
+    assert "new EventSource" not in html
+    assert "EventSource" not in html
+    assert "fetch(" in html
+    # The three pieces of a fetch-based NDJSON reader.
+    assert "getReader" in html
+    assert "TextDecoder" in html
+    assert "JSON.parse" in html
+    assert "application/x-ndjson" in html
+    assert "heartbeat" in html and "'end'" in html
+
+
+def test_browser_client_wires_approvals_to_task_view(api_server: str) -> None:
+    """Approvals must be rendered from the task view and granted via the API."""
+    html = _served_html(api_server)
+    assert "getElementById('approvals')" in html
+    # The task view (GET /tasks/{id}) shape is consumed by the panel.
+    assert "view.contract" in html and "view.runs" in html
+    # The Approve action posts to the real route with the required field.
+    assert "/approve" in html
+    assert "approval_id" in html
+    assert "method: 'POST'" in html
+
+
+def test_ui_alias_redirects_to_root(api_server: str) -> None:
+    request = urllib.request.Request(api_server + "/ui", method="GET")
+    try:
+        _NO_REDIRECT_OPENER.open(request, timeout=5)
+        pytest.fail("GET /ui should not be a 2xx response")
+    except urllib.error.HTTPError as exc:
+        assert 300 <= exc.code < 400
+        assert exc.code == 302
+        assert exc.headers.get("Location") == "/"
+
+    # Following the redirect with a normal opener serves the truth-surface HTML.
+    with _OPENER.open(api_server + "/ui", timeout=5) as response:
+        html = response.read().decode("utf-8")
+        assert response.status == 200
+        assert "text/html" in response.headers.get("Content-Type", "")
+    assert "events/stream" in html and "approvals" in html
 
 
 def test_health_and_project_reads(api_server: str, services: Services, project) -> None:
@@ -303,11 +379,17 @@ def test_event_cursor_reconnect_and_ndjson_stream(
     assert all(item["seq"] > first_cursor for item in payload["events"])
     assert any(item["event"]["event_type"] == "WORKSPACE_CREATED" for item in payload["events"])
 
-    # NDJSON is read raw: it is a stream of independent JSON lines, not one object.
+    # NDJSON is read raw: it is a stream of independent JSON lines, not one
+    # object. Pin the server's content type to the browser client's fetch-based
+    # NDJSON reader so the two cannot drift apart unnoticed.
     url = api_server + f"/events/stream?after={first_cursor}&seconds=1&limit=10"
     with _OPENER.open(url, timeout=10) as response:
         assert response.status == 200
+        assert "application/x-ndjson" in response.headers.get("Content-Type", "")
         raw = response.read().decode("utf-8")
+    html = _served_html(api_server)
+    assert "new EventSource" not in html
+    assert "application/x-ndjson" in html and "getReader" in html
     lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
     assert lines
     assert lines[-1]["type"] == "end"
@@ -359,3 +441,171 @@ def test_security_path_and_query_limits(api_server: str) -> None:
     status, payload = _post(api_server, "/tasks/task_1/approve", oversized_body)
     assert status == 400
     assert payload["code"] == "FIELD_TOO_LONG"
+
+
+def test_workbench_read_endpoints_with_real_data(
+    api_server: str,
+    services: Services,
+    indexed,
+    task_model,
+) -> None:
+    """The four WP-UI-1 read routes project real run/experiment state."""
+
+    from tests.test_verification import (
+        CHECK_OK,
+        attach_external_comparison,
+        make_reviewing_run,
+    )
+
+    reviewed = make_reviewing_run(
+        services,
+        indexed,
+        task_model,
+        checks=[command_check(CHECK_OK, criteria=["AC1"], timeout_seconds=30)],
+    )
+    run = reviewed.run
+    report, _checks = services.task_service.verify_run(run.id, include_review=False)
+    assert report is not None
+
+    comparison = attach_external_comparison(
+        services,
+        indexed,
+        reviewed.task.id,
+        baseline_values={1: 0.9, 2: 0.85},
+        candidate_values={1: 0.7, 2: 0.6},
+    )
+
+    # 1. timeline — ordered event/tool-call items with the exact item contract.
+    status, payload = _get(api_server, f"/runs/{run.id}/timeline")
+    assert status == 200
+    assert set(payload) == {"run_id", "items", "truncated"}
+    assert payload["run_id"] == run.id
+    assert isinstance(payload["truncated"], bool)
+    items = payload["items"]
+    assert items
+    assert all(
+        {"seq", "at", "kind", "label", "detail", "ref"} <= set(item) for item in items
+    )
+    assert any(item["kind"] == "event" for item in items)
+    order_keys = [
+        (item["at"], item["seq"] if item["seq"] is not None else -1, item["kind"])
+        for item in items
+    ]
+    assert order_keys == sorted(order_keys)
+    # Tool-call details never carry raw arguments or secrets.
+    for item in items:
+        if item["kind"] == "tool_call":
+            assert "arguments" not in item["detail"]
+
+    # 2. plan — contract projection, plan steps, scoped approvals, workspace.
+    status, payload = _get(api_server, f"/runs/{run.id}/plan")
+    assert status == 200
+    assert set(payload) == {
+        "run_id",
+        "contract",
+        "plan",
+        "steps",
+        "approvals",
+        "workspace",
+    }
+    assert payload["run_id"] == run.id
+    assert set(payload["contract"]) == {
+        "goal",
+        "acceptance_criteria",
+        "constraints",
+        "scope",
+        "required_approvals",
+        "execution_trust",
+        "content_sha256",
+    }
+    assert payload["contract"]["goal"] == reviewed.contract.goal
+    assert payload["contract"]["content_sha256"] == reviewed.contract.content_sha256
+    assert payload["plan"] is not None
+    assert payload["plan"]["id"] == run.plan_id
+    assert payload["steps"]
+    assert payload["approvals"]
+    for approval in payload["approvals"]:
+        assert set(approval) == {
+            "id",
+            "action",
+            "status",
+            "resource_scope",
+            "spec_sha256",
+            "expires_at",
+            "reason",
+        }
+    assert payload["workspace"] is not None
+    assert set(payload["workspace"]) == {
+        "id",
+        "path",
+        "base_commit_sha",
+        "status",
+        "file_count",
+    }
+    assert payload["workspace"]["id"] == reviewed.workspace.id
+    # No approval nonces, HMACs or fixture secrets leak through /plan.
+    plan_blob = json.dumps(payload)
+    for secret in ("nonce", "approval_hmac", "hmac", "sk-not-a-real-key"):
+        assert secret not in plan_blob
+
+    # 3. evidence — report, checks, links, mappings, reproduction, comparison.
+    status, payload = _get(api_server, f"/runs/{run.id}/evidence")
+    assert status == 200
+    assert set(payload) == {
+        "run_id",
+        "report",
+        "checks",
+        "links",
+        "mappings",
+        "reproduction",
+        "comparison",
+        "warnings",
+    }
+    assert payload["run_id"] == run.id
+    assert payload["report"] is not None
+    assert payload["report"]["id"] == report.id
+    assert payload["checks"]
+    assert isinstance(payload["links"], list)
+    assert payload["links"]
+    assert isinstance(payload["mappings"], list)
+    for mapping in payload["mappings"]:
+        assert set(mapping) == {
+            "claim_id",
+            "status",
+            "rule_status",
+            "evidence_count",
+            "gaps",
+        }
+    assert payload["reproduction"] is not None
+    assert "tiers" in payload["reproduction"]
+    assert payload["comparison"] is not None
+    assert payload["comparison"]["id"] == comparison.id
+    assert isinstance(payload["warnings"], list)
+
+    # 4. comparison — by comparison id and by definition id.
+    status, payload = _get(api_server, f"/experiments/{comparison.id}/comparison")
+    assert status == 200
+    assert set(payload) == {"comparison", "report_markdown"}
+    assert payload["comparison"]["id"] == comparison.id
+    assert isinstance(payload["report_markdown"], str)
+    assert payload["report_markdown"]
+
+    status, payload = _get(
+        api_server, f"/experiments/{comparison.candidate_experiment_id}/comparison"
+    )
+    assert status == 200
+    assert payload["comparison"]["id"] == comparison.id
+
+
+def test_workbench_read_routes_404_for_unknown_ids(api_server: str) -> None:
+    """Missing runs and experiments yield typed NOT_FOUND responses."""
+
+    for suffix in ("timeline", "plan", "evidence"):
+        status, payload = _get(api_server, f"/runs/run_does_not_exist/{suffix}")
+        assert status == 404
+        assert payload["code"] == "NOT_FOUND"
+
+    for identifier in ("xcmp_does_not_exist", "exp_does_not_exist"):
+        status, payload = _get(api_server, f"/experiments/{identifier}/comparison")
+        assert status == 404
+        assert payload["code"] == "NOT_FOUND"

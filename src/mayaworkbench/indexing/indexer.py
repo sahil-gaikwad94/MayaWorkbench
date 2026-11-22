@@ -62,7 +62,11 @@ from mayaworkbench.indexing.languages import (
     is_test_path,
     module_name_for_path,
 )
-from mayaworkbench.indexing.language_adapters import adapter_for_language
+from mayaworkbench.indexing.language_adapters import (
+    HeuristicAdapter,
+    TreeSitterAdapter,
+    adapter_for_language,
+)
 from mayaworkbench.indexing.python_parser import ParsedModule, parse_python
 from mayaworkbench.indexing.resolve import EdgeResolver, clean_target_name
 from mayaworkbench.observability.logging import get_logger
@@ -555,13 +559,54 @@ class Indexer:
         # None means "keep the Python AST defaults" (HIGH / ast.<edge_type>).
         symbol_confidence: EdgeConfidence | None = None
         relation_source: str | None = None
+        import_provenance: str | None = None
         if language in LANGUAGES_WITH_HEURISTIC_SYMBOLS:
             adapter = adapter_for_language(language)
             if adapter is not None:
-                parsed = adapter.parse(candidate.path, text)
-                coverage = ParseCoverage.PARTIAL
-                symbol_confidence = EdgeConfidence.LOW
-                relation_source = RelationSource.HEURISTIC.value
+                if isinstance(adapter, TreeSitterAdapter):
+                    result = adapter.parse_detailed(candidate.path, text)
+                    has_ast_symbols = any(
+                        item.kind is not SymbolKind.MODULE for item in result.module.symbols
+                    )
+                    if result.parse_ok and has_ast_symbols:
+                        # A real concrete syntax tree produced these symbols:
+                        # FULL / HIGH / AST provenance are earned, not assumed.
+                        parsed = result.module
+                        status = FileStatus.PARSED
+                        coverage = ParseCoverage.FULL
+                        symbol_confidence = EdgeConfidence.HIGH
+                        relation_source = result.source.value
+                        import_provenance = (
+                            result.import_source.value
+                            if result.import_source is not None
+                            else result.source.value
+                        )
+                        collector.parser_provenance[language] = f"TREE_SITTER:{result.parser}"
+                    else:
+                        # Missing grammar, ERROR nodes or no declarations found:
+                        # do not claim AST coverage; record the fallback.
+                        parsed = HeuristicAdapter().parse(candidate.path, text)
+                        coverage = ParseCoverage.PARTIAL
+                        symbol_confidence = EdgeConfidence.LOW
+                        relation_source = RelationSource.HEURISTIC.value
+                        collector.parser_provenance[language] = "HEURISTIC_FALLBACK"
+                        if result.module.parse_error:
+                            batch.issues.append(
+                                _issue(
+                                    snapshot.id,
+                                    IssueKind.PARSE_ERROR,
+                                    f"{result.module.parse_error}; using heuristic symbols",
+                                    path=candidate.path,
+                                    file_id=file_id,
+                                    severity=IssueSeverity.INFO,
+                                )
+                            )
+                else:
+                    parsed = adapter.parse(candidate.path, text)
+                    coverage = ParseCoverage.PARTIAL
+                    symbol_confidence = EdgeConfidence.LOW
+                    relation_source = RelationSource.HEURISTIC.value
+                    collector.parser_provenance[language] = "HEURISTIC"
         if language == "python":
             parsed = parse_python(
                 text, module_name=module_name_for_path(candidate.path), path=candidate.path
@@ -635,6 +680,7 @@ class Indexer:
                 collector,
                 confidence=symbol_confidence,
                 provenance=relation_source,
+                import_provenance=import_provenance,
             )
         if parsed is not None and parsed.truncated:
             batch.issues.append(
@@ -659,6 +705,7 @@ class Indexer:
         *,
         confidence: EdgeConfidence | None = None,
         provenance: str | None = None,
+        import_provenance: str | None = None,
     ) -> None:
         used_ids: set[str] = set()
         id_by_qualified: dict[str, str] = {}
@@ -715,6 +762,13 @@ class Indexer:
             key = (source_symbol_id, edge_type.value, line, target_name)
             ordinal = edge_ordinals[key]
             edge_ordinals[key] = ordinal + 1
+            # Import edges from a real CST get the more specific AST_IMPORT
+            # provenance; symbol/call edges keep the primary AST source.
+            edge_provenance = (
+                import_provenance
+                if edge_type is EdgeType.IMPORTS and import_provenance is not None
+                else provenance
+            )
             batch.edges.append(
                 self._edge(
                     snapshot.id,
@@ -724,7 +778,7 @@ class Indexer:
                     target_name=target_name,
                     line=line,
                     ordinal=ordinal,
-                    provenance=provenance,
+                    provenance=edge_provenance,
                 )
             )
 
@@ -969,6 +1023,9 @@ class _Collector:
         self.coverage: Counter[str] = Counter()
         self.manifest: list[dict] = []
         self.main_guard_paths: set[str] = set()
+        #: language -> parser used (TREE_SITTER:<grammar>, HEURISTIC_FALLBACK or
+        #: HEURISTIC). Surfaced in index metadata for honest provenance reporting.
+        self.parser_provenance: dict[str, str] = {}
         self.manifest_artifact_id: str | None = None
 
     def add_manifest(self, entries: list[dict]) -> None:
@@ -993,6 +1050,7 @@ class _Collector:
             "lines_indexed": report.lines_indexed,
             "languages": report.languages,
             "parse_coverage": report.parse_coverage,
+            "parser_provenance": dict(sorted(self.parser_provenance.items())),
             "duration_ms": report.duration_ms,
             "prepare_ms": report.prepare_ms,
             "write_ms": report.write_ms,

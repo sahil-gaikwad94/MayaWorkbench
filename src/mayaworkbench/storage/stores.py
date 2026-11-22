@@ -18,18 +18,22 @@ from mayaworkbench.domain.enums import (
     ClaimKind,
     ClaimReviewStatus,
     ClaimType,
+    DisagreementStatus,
     IssueKind,
     IssueSeverity,
+    PaperStatus,
     SnapshotStatus,
     SymbolKind,
     WorkflowState,
     WorkerJobStatus,
 )
 from mayaworkbench.domain.models import (
+    ClaimCitation,
     ClaimDependency,
     ClaimMapping,
     ClaimRevision,
     ClaimRiskFactor,
+    EvidenceDisagreement,
     IndexIssue,
     IndexedFile,
     MappingEvidence,
@@ -1489,6 +1493,145 @@ class SourceMetadataStore:
                 (project_id,),
             )
         return int(row["n"])
+
+    def list_by_project(self, project_id: str, limit: int = 500) -> list[SourceMetadata]:
+        rows = self.db.fetchall(
+            "SELECT * FROM source_metadata WHERE project_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (project_id, limit),
+        )
+        return [_row_to_model(SourceMetadata, row, json_fields=self.JSON) for row in rows]
+
+    def _non_active(
+        self, clause: str, params: Sequence[Any]
+    ) -> list[SourceMetadata]:
+        rows = self.db.fetchall(
+            "SELECT * FROM source_metadata WHERE status != ? "
+            f"AND {clause} ORDER BY created_at DESC, id DESC",
+            [PaperStatus.ACTIVE.value, *params],
+        )
+        return [_row_to_model(SourceMetadata, row, json_fields=self.JSON) for row in rows]
+
+    def list_non_active_by_key(
+        self, project_id: str, document_key: str
+    ) -> list[SourceMetadata]:
+        """Source metadata for a key whose status needs a version alert."""
+        return self._non_active(
+            "project_id = ? AND document_key = ?", [project_id, document_key]
+        )
+
+    def list_non_active(self, project_id: str) -> list[SourceMetadata]:
+        """All alerting source metadata in a project (key-independent view)."""
+        return self._non_active("project_id = ?", [project_id])
+
+
+# ------------------------------------------------------- research citations
+class ClaimCitationStore:
+    """Append-only store for version-bound, granular claim citations."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, citation: ClaimCitation) -> ClaimCitation:
+        _insert(self.db, "claim_citations", citation.model_dump(mode="json"))
+        return citation
+
+    def get(self, citation_id: str) -> ClaimCitation:
+        row = self.db.fetchone(
+            "SELECT * FROM claim_citations WHERE id = ?", (citation_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Claim citation {citation_id!r} not found")
+        return ClaimCitation.model_validate(dict(row))
+
+    def _list(self, clause: str, params: Sequence[Any], limit: int) -> list[ClaimCitation]:
+        rows = self.db.fetchall(
+            f"SELECT * FROM claim_citations WHERE {clause} "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            [*params, limit],
+        )
+        return [ClaimCitation.model_validate(dict(row)) for row in rows]
+
+    def list_by_claim(self, claim_id: str, limit: int = 500) -> list[ClaimCitation]:
+        return self._list("claim_id = ?", [claim_id], limit)
+
+    def list_by_document(self, document_id: str, limit: int = 500) -> list[ClaimCitation]:
+        return self._list("document_id = ?", [document_id], limit)
+
+    def list_by_project(self, project_id: str, limit: int = 500) -> list[ClaimCitation]:
+        return self._list("project_id = ?", [project_id], limit)
+
+    def list_by_source(
+        self, source_metadata_id: str, limit: int = 500
+    ) -> list[ClaimCitation]:
+        return self._list("source_metadata_id = ?", [source_metadata_id], limit)
+
+    def list_by_documents(
+        self, document_ids: Sequence[str], limit: int = 500
+    ) -> list[ClaimCitation]:
+        ids = list(dict.fromkeys(document_ids))
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        return self._list(f"document_id IN ({placeholders})", ids, limit)
+
+
+# ------------------------------------------------- research disagreements
+class EvidenceDisagreementStore:
+    """Append-only store for typed evidence disagreements and their resolutions.
+
+    A resolution is a *new* record with its own id; the original OPEN row is
+    never updated or deleted. There is deliberately no ``update``/``delete``
+    method on this store.
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, disagreement: EvidenceDisagreement) -> EvidenceDisagreement:
+        _insert(self.db, "evidence_disagreements", disagreement.model_dump(mode="json"))
+        return disagreement
+
+    def append_resolution(
+        self, disagreement: EvidenceDisagreement
+    ) -> EvidenceDisagreement:
+        """Append a resolved/dismissed record without rewriting history."""
+        if disagreement.status is DisagreementStatus.OPEN:
+            raise ValueError("a resolution record cannot be OPEN")
+        return self.create(disagreement)
+
+    def get(self, disagreement_id: str) -> EvidenceDisagreement:
+        row = self.db.fetchone(
+            "SELECT * FROM evidence_disagreements WHERE id = ?", (disagreement_id,)
+        )
+        if row is None:
+            raise NotFoundError(f"Evidence disagreement {disagreement_id!r} not found")
+        return EvidenceDisagreement.model_validate(dict(row))
+
+    def _list(
+        self, clause: str, params: Sequence[Any], limit: int
+    ) -> list[EvidenceDisagreement]:
+        rows = self.db.fetchall(
+            f"SELECT * FROM evidence_disagreements WHERE {clause} "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            [*params, limit],
+        )
+        return [EvidenceDisagreement.model_validate(dict(row)) for row in rows]
+
+    def list_by_claim(
+        self, claim_id: str, limit: int = 500
+    ) -> list[EvidenceDisagreement]:
+        return self._list("claim_id = ?", [claim_id], limit)
+
+    def list_by_document(
+        self, document_id: str, limit: int = 500
+    ) -> list[EvidenceDisagreement]:
+        return self._list("document_id = ?", [document_id], limit)
+
+    def list_by_project(
+        self, project_id: str, limit: int = 500
+    ) -> list[EvidenceDisagreement]:
+        return self._list("project_id = ?", [project_id], limit)
 
 
 # ------------------------------------------------------------ claim mappings
@@ -3367,6 +3510,9 @@ __all__ = [
     "ResearchDocumentStore",
     "SourcePassageStore",
     "ResearchClaimStore",
+    "SourceMetadataStore",
+    "ClaimCitationStore",
+    "EvidenceDisagreementStore",
     "ClaimMappingStore",
     "ResearchMemoStore",
     "ResearchExtractionStore",

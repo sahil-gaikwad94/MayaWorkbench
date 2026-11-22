@@ -97,6 +97,24 @@ def classify_exit(argv: Iterable[str], exit_code: int | None, output: str = "") 
         return True, "the check produced no exit code"
     if exit_code == 0:
         return False, "command exited 0"
+    lowered = output.lower()
+    # A checker that cannot import itself, or a command that does not exist,
+    # produced no verdict. exit 1 for "No module named pytest" is NOT a test
+    # failure; calling it one sends the model into a pointless repair loop.
+    broken_markers = (
+        "no module named",
+        "modulenotfounderror",
+        "importerror",
+        "command not found",
+        "not recognized as an internal or external command",
+        "no such file or directory",
+        "unrecognized arguments",
+        "no such option",
+    )
+    if any(marker in lowered for marker in broken_markers):
+        return True, "the checker could not start: the declared command cannot produce a verdict"
+    if exit_code == 127:
+        return True, "the checker executable was not found (exit 127)"
     if _is_pytest(argv):
         if "KeyboardInterrupt" in output:
             return True, "the check was interrupted"
@@ -261,9 +279,22 @@ class FeedbackRound:
         """Failures the model can plausibly repair."""
         return bool(self.failures) and not self.passed
 
+    @property
+    def broken_checker(self) -> bool:
+        """True when the round produced no verdict because the apparatus failed."""
+        return bool(self.results) and not self.passed and not self.failures
+
+    @property
+    def verdict(self) -> str:
+        if self.passed:
+            return "PASSED"
+        if self.failures:
+            return "FAILED"
+        return "BROKEN_CHECKER" if self.broken_checker else "NO_VERDICT"
+
     def to_payload(self) -> dict[str, Any]:
         return {
-            "verdict": "PASSED" if self.passed else ("FAILED" if self.failures else "NO_VERDICT"),
+            "verdict": self.verdict,
             "duration_ms": self.duration_ms,
             "checks": [item.to_payload() for item in self.results],
         }

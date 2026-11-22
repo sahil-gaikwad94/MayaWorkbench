@@ -29,6 +29,10 @@ from mayaworkbench.domain.enums import (
     ArtifactKind,
     CheckKind,
     CheckOutcome,
+    CitationGranularity,
+    CitationRelation,
+    DisagreementKind,
+    DisagreementStatus,
     ClaimAuthor,
     ClaimConfidence,
     ClaimExplicitness,
@@ -69,6 +73,7 @@ from mayaworkbench.domain.enums import (
     MetricsSourceKind,
     ParseCoverage,
     PassageKind,
+    PaperStatus,
     QaStatus,
     ProtocolComparison,
     ResourceKind,
@@ -575,6 +580,9 @@ class SourceMetadata(Record):
     The record is a small index over an artifact holding the exact provider
     payload. There is deliberately no update path: retrieval time, URL/DOI,
     paper version and content hash describe what was actually observed.
+    ``status`` and the correction/retraction fields are recorded facts about the
+    source version; a non-ACTIVE status downgrades readiness inputs but never
+    fabricates a claim verdict.
     """
 
     id: str
@@ -593,7 +601,87 @@ class SourceMetadata(Record):
     retrieved_at: datetime = Field(default_factory=utcnow)
     artifact_id: str = Field(min_length=1)
     protocol_version: str = CLAIM_GRAPH_VERSION
+    status: PaperStatus = PaperStatus.ACTIVE
+    version_label: str | None = None
+    correction_of: str | None = None
+    corrected_by: str | None = None
+    retraction_date: str | None = None
+    retraction_reason: str | None = None
+    relation_note: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
+
+    @property
+    def is_alerting(self) -> bool:
+        """Whether this source status warrants a version alert."""
+        return self.status is not PaperStatus.ACTIVE
+
+
+class ClaimCitation(Record):
+    """One version-bound, granular citation of a verified source quote.
+
+    A citation is only written after its quote has been verified verbatim against
+    the pinned passage by the claim service. ``quote_hash`` is the hash of the
+    whitespace-normalised quote and ``document_version`` pins the immutable
+    document version the passage belongs to. ``supersedes_citation_id`` links a
+    replacement citation to the older one without rewriting it.
+    """
+
+    id: str
+    project_id: str
+    claim_id: str
+    document_id: str
+    document_version: int = Field(ge=1)
+    source_metadata_id: str | None = None
+    passage_id: str
+    quote: str = Field(min_length=1)
+    quote_hash: str = Field(min_length=64, max_length=64)
+    page: int | None = Field(default=None, ge=1)
+    page_end: int | None = Field(default=None, ge=1)
+    section: str = ""
+    equation: str | None = None
+    char_start: int | None = Field(default=None, ge=0)
+    char_end: int | None = Field(default=None, ge=0)
+    granularity: CitationGranularity = CitationGranularity.PASSAGE
+    relation: CitationRelation = CitationRelation.SUPPORTS
+    confidence: ClaimConfidence = ClaimConfidence.HIGH
+    verified_at: datetime | None = None
+    verified_by: str = "local-user"
+    supersedes_citation_id: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("char_end")
+    @classmethod
+    def _char_order(cls, value: int | None, info: Any) -> int | None:
+        start = info.data.get("char_start")
+        if value is not None and start is not None and value < start:
+            raise ValueError("char_end must be >= char_start")
+        return value
+
+
+class EvidenceDisagreement(Record):
+    """A typed disagreement between evidence axes, with resolution state.
+
+    At least two evidence anchors (verified quote, mapping id/evidence span,
+    experiment run id) must be named before a disagreement is recorded. A
+    resolution appends a new record instead of rewriting an earlier one, so the
+    original OPEN record and its history are preserved.
+    """
+
+    id: str
+    project_id: str
+    claim_id: str
+    document_id: str | None = None
+    passage_id: str | None = None
+    mapping_id: str | None = None
+    run_id: str | None = None
+    kind: DisagreementKind
+    detail: str = Field(min_length=1, max_length=4000)
+    status: DisagreementStatus = DisagreementStatus.OPEN
+    resolution: str = ""
+    created_by: str = "local-user"
+    created_at: datetime = Field(default_factory=utcnow)
+    resolved_at: datetime | None = None
+    resolved_by: str | None = None
 
 
 class ClaimDependency(Record):
@@ -1745,6 +1833,8 @@ __all__ = [
     "ClaimTarget",
     "ResearchClaim",
     "SourceMetadata",
+    "ClaimCitation",
+    "EvidenceDisagreement",
     "CLAIM_GRAPH_VERSION",
     "ClaimDependency",
     "ResearchExtraction",

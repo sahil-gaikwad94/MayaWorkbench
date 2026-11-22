@@ -151,6 +151,21 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("--snapshot")
     inspect.add_argument("--save", action="store_true", help="Store the map as an evidence artifact")
     inspect.set_defaults(func=cmd_inspect)
+    # Optional, fail-closed LSP queries. These are subcommands of ``inspect``;
+    # the bare ``maya inspect`` command keeps working (cmd_inspect dispatches).
+    inspect_sub = inspect.add_subparsers(dest="inspect_command", metavar="<action>")
+    for _name, _kind, _help in (
+        ("lsp-definition", "LSP_DEFINITION", "Go to definition via an optional LSP server"),
+        ("lsp-references", "LSP_REFERENCE", "Find references via an optional LSP server"),
+        ("lsp-hover", "LSP_HOVER", "Request hover text via an optional LSP server"),
+    ):
+        _lsp = inspect_sub.add_parser(_name, help=_help)
+        _lsp.add_argument("target", help="<file>:<line>:<column>, relative to the snapshot")
+        _lsp.add_argument("--language", help="Language key (default: inferred from the file)")
+        # SUPPRESS keeps the parent's --snapshot/--json values when absent here.
+        _lsp.add_argument("--snapshot", default=argparse.SUPPRESS)
+        _lsp.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        _lsp.set_defaults(lsp_kind=_kind)
 
     # search ----------------------------------------------------------------
     search = sub.add_parser("search", help="Search text or symbols in an indexed snapshot")
@@ -273,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     from mayaworkbench.cli.evaluation_commands import register_evaluation_commands
     from mayaworkbench.cli.experience_commands import register_experience_commands
     from mayaworkbench.cli.model_commands import register_model_commands
+    from mayaworkbench.cli.release_commands import register_release_commands
     from mayaworkbench.cli.runner_bundle_commands import register_runner_bundle_commands
     from mayaworkbench.cli.runner_commands import register_runner_commands
     from mayaworkbench.cli.semantic_commands import register_semantic_commands
@@ -293,6 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_environment_commands(sub)
     register_api_commands(sub)
     register_model_commands(sub)
+    register_release_commands(sub)
     register_runner_bundle_commands(sub)
     register_skill_commands(sub)
     register_semantic_commands(sub)
@@ -928,6 +945,8 @@ def _render_map(console: Any, repository_map: RepositoryMap) -> None:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
+    if getattr(args, "inspect_command", None):
+        return cmd_inspect_lsp(args)
     console = args.console
     svc = services(args)
     _project, _repository, snapshot = resolve_target_snapshot(args, svc)
@@ -951,6 +970,96 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     _render_map(console, repository_map)
     if artifact_id:
         console.note(f"saved map artifact: {artifact_id}")
+    return 0
+
+
+# ------------------------------------------------------------------ inspect lsp
+def _parse_lsp_target(target: str) -> tuple[str, int, int]:
+    """Split ``<file>:<line>:<column>`` into a relative path and 1-based position."""
+    try:
+        path_part, line_raw, column_raw = target.rsplit(":", 2)
+        line, column = int(line_raw), int(column_raw)
+    except ValueError as exc:
+        raise UsageError(
+            f"Expected <file>:<line>:<column>, got {target!r}",
+            hint="Use a snapshot-relative path with 1-based line and column, e.g. src/app.py:12:3.",
+        ) from exc
+    if not path_part or line < 1 or column < 1:
+        raise UsageError(
+            f"Expected <file>:<line>:<column> with positive line/column, got {target!r}"
+        )
+    return path_part, line, column
+
+
+def cmd_inspect_lsp(args: argparse.Namespace) -> int:
+    """Answer an advisory LSP query, or report a typed reason it cannot."""
+    from mayaworkbench.indexing.lsp_client import (
+        LspError,
+        LspErrorPayload,
+        LspQuery,
+        LspUnsupported,
+        lsp_adapter_for,
+        lsp_unsupported_reason,
+    )
+    from mayaworkbench.indexing.languages import detect_language
+
+    console = args.console
+    path_part, line, column = _parse_lsp_target(args.target)
+    language = args.language or detect_language(path_part)
+    snapshot_id = getattr(args, "snapshot", None)
+
+    # Fail closed before touching the database when no server is configured.
+    reason = lsp_unsupported_reason(language)
+    if reason is not None:
+        payload = LspUnsupported(reason=reason, language=language, snapshot_id=snapshot_id)
+        console.json(payload.model_dump(mode="json"))
+        return 0
+
+    svc = services(args)
+    _project, _repository, snapshot = resolve_target_snapshot(args, svc)
+    root = (snapshot.index_metadata or {}).get("repository_root")
+    if not root:
+        repository = svc.repositories.get(snapshot.repository_id)
+        root = repository.root_path
+
+    reason = lsp_unsupported_reason(language, snapshot_path=root)
+    if reason is not None:
+        payload = LspUnsupported(
+            reason=reason, language=language, snapshot_id=snapshot.id
+        )
+        console.json(payload.model_dump(mode="json"))
+        return 0
+
+    client = lsp_adapter_for(language, snapshot_path=root, snapshot_id=snapshot.id)
+    if client is None:  # defensive: reason already reported above
+        payload = LspUnsupported(
+            reason="LSP adapter is unavailable", language=language, snapshot_id=snapshot.id
+        )
+        console.json(payload.model_dump(mode="json"))
+        return 0
+
+    query = LspQuery(
+        kind=args.lsp_kind,
+        path=path_part,
+        line=line,
+        column=column,
+        language=language,
+        snapshot_id=snapshot.id,
+    )
+    try:
+        result = client.query(query)
+    except LspError as exc:
+        error = LspErrorPayload(
+            reason=str(exc),
+            code=exc.code,
+            language=language,
+            snapshot_id=snapshot.id,
+        )
+        console.json(error.model_dump(mode="json"))
+        return exc.exit_code
+    finally:
+        client.close()
+    console.json(result.model_dump(mode="json"))
     return 0
 
 

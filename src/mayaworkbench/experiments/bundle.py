@@ -439,6 +439,12 @@ class RunBundleVerification:
     documents: dict[str, Any] = field(default_factory=dict)
     archive_sha256: str = ""
     attestation_present: bool = False
+    # Structural claims about the attestation envelope. ``attestation_level``
+    # reports what the envelope says even when no key was supplied; it is never
+    # a claim that the signature was checked. Only ``attestation_verified`` may
+    # be true when a held key actually verified the HMAC over the manifest root.
+    attestation_level: str = "UNATTESTED"
+    attestation_verified: bool = False
 
 
 @dataclass
@@ -453,6 +459,9 @@ class RunBundleImportResult:
     created_run_ids: list[str] = field(default_factory=list)
     observation_count: int = 0
     notes: list[str] = field(default_factory=list)
+    attestation_level: str = "UNATTESTED"
+    attestation_verified: bool = False
+    attestation_key_id: str | None = None
 
 
 def sha256_file(path: str | Path) -> str:
@@ -581,6 +590,36 @@ def _runner_reproduce(
     }
 
 
+def _write_run_archive(documents: dict[str, bytes], target: Path) -> str:
+    """Write ``documents`` as the deterministic portable gzip-tar archive.
+
+    This is the single writer shared by initial export and re-signing. Member
+    bytes are written unchanged; only the member set decides the archive. The
+    returned string is the sha256 of the compressed archive bytes.
+    """
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, data in sorted(documents.items()):
+            if len(name.encode("utf-8")) > 100:
+                raise ExperimentError(
+                    f"bundle member name is too long for a portable tar: {name!r}"
+                )
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.type = tarfile.REGTYPE
+            archive.addfile(info, io.BytesIO(data))
+    payload = gzip.compress(raw.getvalue(), compresslevel=9, mtime=0)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(payload)
+    return _sha256(payload)
+
+
 def write_run_bundle(
     destination: str | Path,
     definition: dict[str, Any],
@@ -681,29 +720,64 @@ def write_run_bundle(
             )
         documents["attestation.json"] = _json_bytes(attestation)
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for name, data in sorted(documents.items()):
-            if len(name.encode("utf-8")) > 100:
-                raise ExperimentError(
-                    f"bundle member name is too long for a portable tar: {name!r}"
-                )
-            info = tarfile.TarInfo(name=name)
-            info.size = len(data)
-            info.mtime = 0
-            info.mode = 0o644
-            info.uid = 0
-            info.gid = 0
-            info.uname = ""
-            info.gname = ""
-            info.type = tarfile.REGTYPE
-            archive.addfile(info, io.BytesIO(data))
-    payload = gzip.compress(raw.getvalue(), compresslevel=9, mtime=0)
-    target.write_bytes(payload)
-    return RunBundleResult(
-        path=target, manifest=manifest_doc, archive_sha256=_sha256(payload)
+    archive_sha = _write_run_archive(documents, target)
+    return RunBundleResult(path=target, manifest=manifest_doc, archive_sha256=archive_sha)
+
+
+def sign_run_bundle(path: str | Path, *, key: bytes | str | None = None) -> Path:
+    """Add or replace ``attestation.json`` in a run bundle and return its path.
+
+    The envelope is produced by the existing ``verification.attestation`` helper
+    over the manifest root; no key material is written to the archive or printed.
+    Every existing member is preserved byte-for-byte. Malformed archives fail
+    closed. The rewrite is atomic, so a failed signing never leaves a half-written
+    bundle behind.
+    """
+    from mayaworkbench.verification.attestation import sign_bundle
+
+    source = Path(path).expanduser().resolve()
+    errors: list[str] = []
+    contents, _ = _read_run_archive(source, errors)
+    if errors:
+        raise ExperimentError(
+            "Cannot sign run bundle: " + "; ".join(errors[:3]),
+            hint="Export a fresh bundle with `maya runner export` and sign that instead.",
+        )
+    if not contents or RUN_BUNDLE_MANIFEST not in contents:
+        raise ExperimentError("Cannot sign run bundle: manifest.json is missing")
+    try:
+        for name in contents:
+            _bundle_relative(name)
+    except ExperimentError as exc:
+        raise ExperimentError(f"Cannot sign run bundle: {exc}") from exc
+
+    with tempfile.TemporaryDirectory(prefix="maya-run-bundle-sign-") as staging_name:
+        staging = Path(staging_name)
+        for name, data in contents.items():
+            member = staging / name
+            member.parent.mkdir(parents=True, exist_ok=True)
+            member.write_bytes(data)
+        envelope = sign_bundle(staging, key=key)
+        if not isinstance(envelope, dict) or not isinstance(envelope.get("signature"), str):
+            raise ExperimentError("Cannot sign run bundle: attestation helper returned no signature")
+        # Read the exact bytes the helper wrote so the envelope is reproduced
+        # unchanged instead of being re-serialised by a different writer.
+        attestation_bytes = (staging / "attestation.json").read_bytes()
+
+    documents = dict(contents)
+    documents["attestation.json"] = attestation_bytes
+    handle, temporary = tempfile.mkstemp(
+        prefix=source.name + ".", suffix=".tmp", dir=source.parent
     )
+    os.close(handle)
+    temporary_path = Path(temporary)
+    try:
+        _write_run_archive(documents, temporary_path)
+        os.replace(temporary_path, source)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    return source
 
 
 def _read_run_archive(source: Path, errors: list[str]) -> tuple[dict[str, bytes], str]:
@@ -877,8 +951,17 @@ def _cross_check_run_bundle(
         warnings.append("bundle declares no executable commands")
 
 
-def verify_run_bundle(path: str | Path) -> RunBundleVerification:
-    """Recompute every hash and refuse unsafe, extra or missing archive members."""
+def verify_run_bundle(
+    path: str | Path, *, key: bytes | str | None = None
+) -> RunBundleVerification:
+    """Recompute every hash and refuse unsafe, extra or missing archive members.
+
+    Verification is always structural. When ``key`` is supplied *and* an
+    attestation envelope is present, the existing HMAC helper also verifies the
+    signature over the manifest root; a wrong key, a swapped envelope or a
+    malformed envelope becomes a typed verification error (``ok=False``). Without
+    a key the claimed level is reported but ``attestation_verified`` stays false.
+    """
     source = Path(path).expanduser().resolve()
     errors: list[str] = []
     warnings: list[str] = []
@@ -941,6 +1024,8 @@ def verify_run_bundle(path: str | Path) -> RunBundleVerification:
             errors.append(f"required bundle file is absent: {name}")
 
     attestation_present = "attestation.json" in contents
+    attestation_level = "UNATTESTED"
+    attestation_verified = False
     if attestation_present:
         envelope = _json_member(contents, "attestation.json", errors)
         if isinstance(envelope, dict):
@@ -948,6 +1033,30 @@ def verify_run_bundle(path: str | Path) -> RunBundleVerification:
                 errors.append("attestation refers to a different manifest root")
             if not isinstance(envelope.get("signature"), str):
                 errors.append("attestation has no signature")
+            claimed_level = envelope.get("level")
+            if isinstance(claimed_level, str):
+                attestation_level = claimed_level
+            if key is not None:
+                # Reuse the existing attestation helper rather than inventing a
+                # second HMAC implementation. It checks the same manifest root
+                # and never accepts a key from the archive itself.
+                from mayaworkbench.verification.attestation import verify_attestation
+
+                with tempfile.TemporaryDirectory(prefix="maya-run-bundle-verify-") as staging_name:
+                    staging = Path(staging_name)
+                    (staging / RUN_BUNDLE_MANIFEST).write_bytes(contents[RUN_BUNDLE_MANIFEST])
+                    (staging / "attestation.json").write_bytes(contents["attestation.json"])
+                    checked = verify_attestation(staging, key=key)
+                if isinstance(checked.get("level"), str):
+                    attestation_level = checked["level"]
+                attestation_verified = bool(checked.get("ok")) and bool(checked.get("verified"))
+                if not attestation_verified:
+                    errors.append(
+                        "attestation verification failed: "
+                        + str(checked.get("error") or "signature does not match the supplied key")
+                    )
+        else:
+            errors.append("attestation envelope is malformed")
 
     documents = _run_documents(contents, listed, errors)
     reproduce = documents.get("reproduce.json")
@@ -956,9 +1065,9 @@ def verify_run_bundle(path: str | Path) -> RunBundleVerification:
             errors.append(
                 f"unsupported reproduce schema version: {reproduce.get('schema_version')!r}"
             )
-        for key in _REPRODUCE_KEYS:
-            if key not in reproduce:
-                errors.append(f"reproduce.json is missing {key!r}")
+        for required_key in _REPRODUCE_KEYS:
+            if required_key not in reproduce:
+                errors.append(f"reproduce.json is missing {required_key!r}")
     _cross_check_run_bundle(documents, listed, errors, warnings)
     return RunBundleVerification(
         ok=not errors,
@@ -969,6 +1078,8 @@ def verify_run_bundle(path: str | Path) -> RunBundleVerification:
         documents=documents,
         archive_sha256=archive_sha,
         attestation_present=attestation_present,
+        attestation_level=attestation_level,
+        attestation_verified=attestation_verified,
     )
 
 
@@ -1087,7 +1198,11 @@ def import_run_bundle(
     from mayaworkbench.experiments.metrics import ExtractedMetrics, build_observations
     from mayaworkbench.verification.attestation import verify_attestation
 
-    verification = verify_run_bundle(path)
+    # A supplied key makes verification strict: a bad signature or a swapped
+    # envelope aborts the import here instead of silently producing UNATTESTED
+    # evidence. With no supplied key the legacy environment fallback below still
+    # applies, but never upgrades the label without a verified signature.
+    verification = verify_run_bundle(path, key=key)
     if not verification.ok:
         raise ExperimentError(
             "Run bundle failed verification; refusing to import",
@@ -1110,6 +1225,11 @@ def import_run_bundle(
             level = checked["level"]
         elif not checked.get("ok", True):
             notes.append(f"attestation error: {checked.get('error')}")
+    attestation_level = verification.attestation_level
+    attestation_verified = verification.attestation_verified or bool(
+        attestation_details.get("verified")
+    )
+    attestation_key_id = attestation_details.get("key_id")
     limitation = IMPORT_LIMITATION
     if level != "UNATTESTED":
         limitation += (
@@ -1131,6 +1251,8 @@ def import_run_bundle(
         details["imported_original_task_id"] = original_task
         details["imported_from_bundle_sha256"] = verification.archive_sha256
         details["attestation"] = level
+        details["attestation_level"] = attestation_level
+        details["attestation_verified"] = attestation_verified
         details["imported_limitation"] = limitation
         data["task_id"] = None  # FK: the importing home has no such task
         data["details"] = details
@@ -1181,6 +1303,8 @@ def import_run_bundle(
         details = dict(data.get("details") or {})
         details["execution"] = "IMPORTED"
         details["attestation"] = level
+        details["attestation_level"] = attestation_level
+        details["attestation_verified"] = attestation_verified
         details["imported_from_bundle_sha256"] = verification.archive_sha256
         details["imported_limitation"] = limitation
         details["imported_note"] = (
@@ -1239,6 +1363,9 @@ def import_run_bundle(
         created_run_ids=created_run_ids,
         observation_count=observation_count,
         notes=notes,
+        attestation_level=attestation_level,
+        attestation_verified=attestation_verified,
+        attestation_key_id=attestation_key_id,
     )
 
 
@@ -1257,6 +1384,7 @@ __all__ = [
     "sha256_file",
     "compute_dataset_fingerprint",
     "write_run_bundle",
+    "sign_run_bundle",
     "verify_run_bundle",
     "import_run_bundle",
 ]

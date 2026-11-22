@@ -73,11 +73,16 @@ class EdgeType(StrEnum):
 class RelationSource(StrEnum):
     """How a symbol/edge relation was discovered (WP5).
 
-    Currently only AST (Python) and HEURISTIC (JS/TS/Go/Rust) are produced;
-    the remaining values describe future adapters and language-server data.
+    Python AST and optional Tree-sitter CST adapters produce AST relations;
+    the regex fallback produces HEURISTIC relations. Remaining values describe
+    future adapters and language-server data.
     """
 
     AST_IMPORT = "AST_IMPORT"
+    #: A symbol/definition recovered from a real concrete syntax tree. Distinct
+    #: from AST_IMPORT so AST-backed non-Python symbols are not mislabelled as
+    #: import edges. Added 2026-11-22 for the optional Tree-sitter adapters.
+    AST_SYMBOL = "AST_SYMBOL"
     TYPE_REFERENCE = "TYPE_REFERENCE"
     CALL_SITE = "CALL_SITE"
     BUILD_DEPENDENCY = "BUILD_DEPENDENCY"
@@ -156,6 +161,9 @@ class ArtifactKind(StrEnum):
     EXPERIMENT_REPORT = "EXPERIMENT_REPORT"
     EXPERIMENT_BUNDLE = "EXPERIMENT_BUNDLE"
     PROJECT_MEMORY = "PROJECT_MEMORY"
+    # WP R2I — backend-computed, inspectable four-tier reproduction report.
+    # Additive only: no migration is required for an enum member.
+    REPRODUCIBILITY_REPORT = "REPRODUCIBILITY_REPORT"
     OTHER = "OTHER"
 
 
@@ -210,7 +218,12 @@ class EventType(StrEnum):
     CLAIM_MAPPING_CREATED = "CLAIM_MAPPING_CREATED"
     CLAIM_MAPPING_UPDATED = "CLAIM_MAPPING_UPDATED"
     CLAIM_MAPPING_REJECTED = "CLAIM_MAPPING_REJECTED"
+    # Research evidence quality — append-only citation/disagreement records.
+    CLAIM_CITATION_RECORDED = "CLAIM_CITATION_RECORDED"
+    CLAIM_DISAGREEMENT_RECORDED = "CLAIM_DISAGREEMENT_RECORDED"
+    CLAIM_DISAGREEMENT_RESOLVED = "CLAIM_DISAGREEMENT_RESOLVED"
     RESEARCH_MEMO_CREATED = "RESEARCH_MEMO_CREATED"
+    REPRODUCIBILITY_REPORT_CREATED = "REPRODUCIBILITY_REPORT_CREATED"
     # Phase 3 — controlled engineering agent
     TASK_CREATED = "TASK_CREATED"
     CONTRACT_CREATED = "CONTRACT_CREATED"
@@ -629,6 +642,55 @@ class MappingAuthor(StrEnum):
     USER = "USER"
 
 
+class PaperStatus(StrEnum):
+    """Editorial status of a discovered/source paper version.
+
+    ``ACTIVE`` is the ordinary state. The other values are recorded facts about
+    the source, not verdicts about any claim that cites it: they feed readiness
+    and reproduction *inputs* and never fabricate a claim decision.
+    """
+
+    ACTIVE = "ACTIVE"
+    CORRECTED = "CORRECTED"
+    RETRACTED = "RETRACTED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class DisagreementKind(StrEnum):
+    """Which two evidence axes disagree."""
+
+    PAPER_VS_CODE = "PAPER_VS_CODE"
+    PAPER_VS_EXPERIMENT = "PAPER_VS_EXPERIMENT"
+    CODE_VS_EXPERIMENT = "CODE_VS_EXPERIMENT"
+    SOURCE_VERSION_CONFLICT = "SOURCE_VERSION_CONFLICT"
+
+
+class DisagreementStatus(StrEnum):
+    """Resolution state of one evidence disagreement."""
+
+    OPEN = "OPEN"
+    RESOLVED = "RESOLVED"
+    DISMISSED = "DISMISSED"
+
+
+class CitationGranularity(StrEnum):
+    """Smallest textual unit a citation quote pins."""
+
+    PASSAGE = "PASSAGE"
+    SENTENCE = "SENTENCE"
+    SUBCLAUSE = "SUBCLAUSE"
+    EQUATION = "EQUATION"
+    TABLE_CELL = "TABLE_CELL"
+
+
+class CitationRelation(StrEnum):
+    """How the quoted text relates to the claim it supports."""
+
+    SUPPORTS = "SUPPORTS"
+    QUALIFIES = "QUALIFIES"
+    CONTRADICTS = "CONTRADICTS"
+
+
 class RiskCategory(StrEnum):
     """Reproduction risk dimensions from §9.6. Kept separate on purpose."""
 
@@ -938,6 +1000,11 @@ __all__ = [
     "ClaimConfidence",
     "ClaimReviewStatus",
     "ClaimMappingStatus",
+    "PaperStatus",
+    "DisagreementKind",
+    "DisagreementStatus",
+    "CitationGranularity",
+    "CitationRelation",
     "MappingEvidenceRelation",
     "EvidenceStrength",
     "MappingAuthor",

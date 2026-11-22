@@ -57,6 +57,27 @@ class RuntimeRef:
     image: str
     container_name: str
 
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "id": self.id,
+            "backend": self.backend,
+            "source": str(self.source),
+            "overlay": str(self.overlay),
+            "image": self.image,
+            "container_name": self.container_name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, str]) -> "RuntimeRef":
+        return cls(
+            id=data["id"],
+            backend=data["backend"],
+            source=Path(data["source"]),
+            overlay=Path(data["overlay"]),
+            image=data["image"],
+            container_name=data["container_name"],
+        )
+
 
 class ExecutionBackend(Protocol):
     def capabilities(self) -> RuntimeCapabilities: ...
@@ -72,7 +93,7 @@ class ExecutionBackend(Protocol):
         cancel_requested: Callable[[], bool] | None = None,
     ) -> CommandResult: ...
 
-    def stop(self, runtime: RuntimeRef, *, reason: str) -> None: ...
+    def stop(self, runtime: RuntimeRef, *, reason: str, keep_overlay: bool = False) -> None: ...
 
     def collect_artifacts(self, runtime: RuntimeRef) -> list[Path]: ...
 
@@ -142,8 +163,10 @@ class TrustedLocalBackend:
             argv, timeout_seconds=timeout, cancel_requested=cancel_requested
         )
 
-    def stop(self, runtime: RuntimeRef, *, reason: str) -> None:  # pragma: no cover - local runner self-cleans
-        del runtime, reason
+    def stop(  # pragma: no cover - local runner self-cleans
+        self, runtime: RuntimeRef, *, reason: str, keep_overlay: bool = False
+    ) -> None:
+        del runtime, reason, keep_overlay
 
     def collect_artifacts(self, runtime: RuntimeRef) -> list[Path]:
         return [path for path in runtime.overlay.rglob("*") if path.is_file()] if runtime.overlay.exists() else []
@@ -171,6 +194,7 @@ class RootlessContainerBackend:
         image: str = "python:3.12-slim",
         tool: str | None = None,
         allow_docker: bool = False,
+        verified: bool = False,
     ):
         self.workspace = Path(workspace).resolve()
         self.run_home = Path(run_home).resolve()
@@ -178,6 +202,9 @@ class RootlessContainerBackend:
         self.image = image
         self._tool_override = tool
         self._allow_docker = allow_docker
+        # A smoke test on a real rootless OCI host must set this. Controller
+        # presence alone is never converted into an "enforced" claim.
+        self._verified = verified
 
     # -------------------------------------------------------------- capability
     def _detect_tool(self) -> tuple[str | None, str | None]:
@@ -208,31 +235,53 @@ class RootlessContainerBackend:
         if missing:
             reasons.append(f"missing cgroup controllers: {', '.join(missing)}")
 
+        verified = self._verified and tool is not None and warning is None and not missing
+        if not self._verified:
+            reasons.append(
+                "rootless isolation has not been verified by a real OCI smoke test; "
+                "controller names are presence evidence only"
+            )
         limits: dict[str, LimitEnforcement] = {}
         limits["wall_time"] = LimitEnforcement("enforced", "supervisor")
         for name in ("cpu", "memory"):
-            limits[name] = (
-                LimitEnforcement("enforced", "cgroup-v2", "controller present")
-                if name in controllers
-                else LimitEnforcement("unsupported", None, "controller missing")
+            if name not in controllers:
+                limits[name] = LimitEnforcement("unsupported", None, "controller missing")
+            elif verified:
+                limits[name] = LimitEnforcement(
+                    "enforced", "cgroup-v2", "applied per container and smoke-verified"
+                )
+            else:
+                limits[name] = LimitEnforcement(
+                    "not_applied",
+                    None,
+                    "cgroup controller present; not verified by a real OCI smoke test",
+                )
+        if "pids" not in controllers:
+            limits["process_count"] = LimitEnforcement(
+                "unsupported", None, "pids controller missing"
             )
-        limits["process_count"] = (
-            LimitEnforcement("enforced", "cgroup-v2", "pids.max applied per container")
-            if "pids" in controllers
-            else LimitEnforcement("unsupported", None, "pids controller missing")
-        )
+        elif verified:
+            limits["process_count"] = LimitEnforcement(
+                "enforced", "cgroup-v2", "pids.max applied per container and smoke-verified"
+            )
+        else:
+            limits["process_count"] = LimitEnforcement(
+                "not_applied",
+                None,
+                "pids controller present; no applied/read-back evidence on a real runtime",
+            )
         limits["file_size"] = LimitEnforcement(
             "unsupported", None, "no verified per-container file-size controller"
         )
         limits["open_files"] = LimitEnforcement(
             "unsupported", None, "no verified per-container fd controller"
         )
-        available = tool is not None and not missing
+        available = verified
         return RuntimeCapabilities(
             available,
-            tuple(reasons) or ("rootless OCI runtime and cgroup v2 verified",),
+            tuple(reasons) or ("rootless OCI runtime and cgroup v2 verified by smoke test",),
             limits,
-            "none",
+            "none" if verified else "unverified",
         )
 
     # -------------------------------------------------------------- lifecycle
@@ -244,9 +293,20 @@ class RootlessContainerBackend:
                 hint="; ".join(capabilities.reasons)
                 + ". The task is blocked, not downgraded to host execution.",
             )
+        # Import here to keep the type-only dependency one-way.
+        from mayaworkbench.workspace.runtime_workspace import populate_overlay
+
         runtime_id = uuid.uuid4().hex
         overlay = self.run_home / "containers" / runtime_id / "work"
-        overlay.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Populate the exact tree the container will see at /work. An empty
+        # overlay would make commands test a different project than the one the
+        # file tools edited — the core MW-01 defect.
+        try:
+            populate_overlay(self.workspace, overlay)
+        except Exception as exc:
+            raise RuntimeUnavailable(
+                f"ROOTLESS_CONTAINER overlay could not be populated: {exc}"
+            ) from exc
         return RuntimeRef(
             id=runtime_id,
             backend=self.backend_id,
@@ -349,7 +409,9 @@ class RootlessContainerBackend:
             cwd=str(runtime.overlay),
         )
 
-    def stop(self, runtime: RuntimeRef, *, reason: str) -> None:
+    def stop(
+        self, runtime: RuntimeRef, *, reason: str, keep_overlay: bool = False
+    ) -> None:
         del reason
         tool, _ = self._detect_tool()
         if tool:
@@ -370,7 +432,7 @@ class RootlessContainerBackend:
             except Exception:  # noqa: BLE001 - cleanup must not mask the original failure
                 pass
         overlay_root = runtime.overlay.parent
-        if overlay_root.exists():
+        if overlay_root.exists() and not keep_overlay:
             shutil.rmtree(overlay_root, ignore_errors=True)
 
     def collect_artifacts(self, runtime: RuntimeRef) -> list[Path]:
@@ -388,9 +450,11 @@ class BackendCommandRunner:
     command never creates a container. ``stop`` is idempotent.
     """
 
-    def __init__(self, backend: ExecutionBackend):
+    def __init__(self, backend: ExecutionBackend, runtime: RuntimeRef | None = None):
         self.backend = backend
-        self._runtime: RuntimeRef | None = None
+        # A RuntimeWorkspace can provision once and hand the same RuntimeRef to
+        # every component; provisioning must not happen twice for one task.
+        self._runtime = runtime
 
     @property
     def policy(self) -> CommandPolicy:  # pragma: no cover - evidence consumers only
@@ -418,10 +482,11 @@ class BackendCommandRunner:
             cancel_requested=cancel_requested,
         )
 
-    def stop(self, *, reason: str) -> None:
+    def stop(self, *, reason: str, keep_overlay: bool = False) -> None:
         if self._runtime is not None:
-            self.backend.stop(self._runtime, reason=reason)
-            self._runtime = None
+            self.backend.stop(self._runtime, reason=reason, keep_overlay=keep_overlay)
+            if not keep_overlay:
+                self._runtime = None
 
 
 __all__ = [

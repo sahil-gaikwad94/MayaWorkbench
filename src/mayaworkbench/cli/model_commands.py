@@ -9,6 +9,7 @@ emit key material. Connector commands perform no network calls.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,13 @@ def register_model_commands(sub: argparse._SubParsersAction) -> None:  # type: i
     _add_action(connector_sub, "list", help="List registered connectors").set_defaults(
         func=cmd_connector_list
     )
+    link = _add_action(
+        connector_sub, "mlflow-link", help="Fetch an MLflow run and link it as advisory evidence"
+    )
+    link.add_argument("mlflow_run_id")
+    link.add_argument("--task", required=True)
+    link.add_argument("--maya-run", required=True)
+    link.set_defaults(func=cmd_connector_mlflow_link)
     approve = _add_action(
         connector_sub, "approve", help="Record a one-time, spec-hash-bound consent grant"
     )
@@ -128,12 +136,17 @@ def cmd_model_list(args: argparse.Namespace) -> int:
     console = args.console
     settings, _paths = _context(args)
     providers = provider_specs_from_settings(settings)
-    local_adapter = build_local_provider(settings).describe()
+    local_provider = build_local_provider(settings)
+    local_adapter = local_provider.describe()
+    chat_capabilities = local_provider.capabilities()
     payload: dict[str, Any] = {
         "interfaces": {
             "chat_model": {
-                "structured_output": True,
-                "streaming": "declared_by_adapter",
+                "structured_output": chat_capabilities.structured_output,
+                "streaming": chat_capabilities.streaming,
+                "tool_calling": chat_capabilities.tool_calling,
+                "parallel_tool_calls": chat_capabilities.parallel_tool_calls,
+                "provider_family": chat_capabilities.provider_family,
                 "note": "Extends ModelProvider; workbench owns prompts and validation.",
             },
             "embedding_model": HashingEmbeddingModel().describe(),
@@ -158,7 +171,7 @@ def cmd_model_list(args: argparse.Namespace) -> int:
     console.kv(
         [
             ("data policy", settings.data_policy),
-            ("chat", "structured output; streaming when adapter declares it"),
+            ("chat", "structured output; tool calls; SSE streaming via request.stream"),
             ("embedding", "local hashing fallback (lexical, deterministic)"),
             ("reranker", "local lexical overlap fallback (deterministic)"),
             ("vision", "unsupported — no provider adapter shipped"),
@@ -313,6 +326,70 @@ def cmd_connector_invoke(args: argparse.Namespace) -> int:
         console.json(result.model_dump(mode="json"))
     else:
         console.print(f"{result.connector}/{result.operation}: {result.target}")
+    return 0
+
+
+def cmd_connector_mlflow_link(args: argparse.Namespace) -> int:
+    """Link a fetched MLflow run to a Maya task/run as advisory evidence."""
+    console = args.console
+    from mayaworkbench.api.validation import ID_RE
+    from mayaworkbench.clock import utcnow
+    from mayaworkbench.cli.main import services
+    from mayaworkbench.domain.enums import ActorKind, ArtifactKind, EventType
+    from mayaworkbench.domain.models import WorkflowEvent
+    from mayaworkbench.ids import new_ulid
+
+    if not ID_RE.fullmatch(args.task) or not ID_RE.fullmatch(args.maya_run):
+        console.error("task and Maya run ids must be valid record ids", code="INVALID_ID")
+        return 2
+    svc = services(args)
+    run = svc.runs.get(args.maya_run)
+    task = svc.tasks.get(args.task)
+    if run.task_id != task.id:
+        console.error("the Maya run does not belong to the given task", code="SCOPE_MISMATCH")
+        return 2
+    registry = _advanced_registry()
+    try:
+        result = registry.invoke_with_consent(
+            "mlflow", "get_run", {"run_id": args.mlflow_run_id}
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.error(str(exc), code="CONNECTOR_ERROR")
+        return 1
+    payload = {
+        "mlflow": result.model_dump(mode="json"),
+        "maya": {"task_id": task.id, "run_id": run.id, "project_id": run.project_id},
+        "linked_at": utcnow().isoformat(),
+        "authority": "advisory_external_evidence",
+    }
+    artifact = svc.artifacts.put_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        kind=ArtifactKind.OTHER,
+        media_type="application/json",
+        created_by="connector:mlflow",
+    )
+    svc.events.append(
+        WorkflowEvent(
+            event_id="evt_" + new_ulid(),
+            event_type=EventType.ARTIFACT_CREATED,
+            project_id=run.project_id,
+            task_id=task.id,
+            run_id=run.id,
+            entity_type="mlflow_link",
+            entity_id=artifact.id,
+            actor_kind=ActorKind.SYSTEM,
+            actor_name="SYSTEM:connector-mlflow",
+            payload={
+                "mlflow_run_id": args.mlflow_run_id,
+                "artifact_id": artifact.id,
+                "response_hash": result.response_hash,
+            },
+        )
+    )
+    if console.json_mode:
+        console.json({"artifact_id": artifact.id, "result": result.model_dump(mode="json")})
+    else:
+        console.print(f"Linked MLflow run {args.mlflow_run_id} → artifact {artifact.id}")
     return 0
 
 

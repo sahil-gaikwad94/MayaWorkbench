@@ -175,6 +175,7 @@ class ControlledAgent:
         self._recent_failures: list[str] = []
         self._consecutive_failures = 0
         self._check_rounds = 0
+        self._finish_requested = False
         self._pending_repair: dict[str, Any] | None = None
         self._last_signature: str | None = None
         self._repeat_count = 0
@@ -313,6 +314,39 @@ class ControlledAgent:
                     correlation_id=self.run.id,
                 )
             except (ModelError, PolicyError) as exc:
+                # A provider that dies after the model already requested finish
+                # must not erase the candidate patch. Settle as REVIEWING with a
+                # typed limitation; the authoritative verifier decides the
+                # outcome from deterministic evidence.
+                if getattr(self, "_finish_requested", False):
+                    self.runs.update_progress(
+                        self.run.id,
+                        limitations=list(getattr(self.run, "limitations", ())) + [
+                            "IN_LOOP_FAILED: the model provider failed after finish was "
+                            "requested; in-loop checks are inconclusive."
+                        ],
+                        details={
+                            **self._details(),
+                            "in_loop_verdict": "ERROR",
+                            "provider_failure_after_finish": str(exc)[:400],
+                        },
+                    )
+                    return AgentOutcome(
+                        state=WorkflowState.REVIEWING,
+                        summary=(
+                            "Finish was requested, but the model provider failed before "
+                            "the in-loop check round completed."
+                        ),
+                        limitations=[
+                            "IN_LOOP_FAILED: in-loop verification is inconclusive; "
+                            "`maya verify run` is authoritative."
+                        ],
+                        error=str(exc),
+                        steps=steps,
+                        tool_calls=current.tool_call_count,
+                        tokens=tokens,
+                        cost_usd=cost,
+                    )
                 return AgentOutcome(
                     state=WorkflowState.FAILED,
                     summary="The model call failed; no further edits were attempted.",
@@ -534,6 +568,10 @@ class ControlledAgent:
         It never turns a failure into a pass: it either converts the failure into
         a bounded repair round or records it as an explicit limitation.
         """
+        # Remember that the model asked to finish: if the provider fails on a
+        # subsequent repair turn, the run must settle as REVIEWING with an
+        # explicit in-loop error, never as a silent FAILED with no evidence.
+        self._finish_requested = True
         runner = getattr(self.tools, "check_runner", None)
         specs = list(getattr(runner, "specs", []) or []) if runner is not None else []
         if runner is None or not specs:
@@ -614,7 +652,7 @@ class ControlledAgent:
         limitations.append(
             "In-loop verification did not pass; `maya verify run` is required and will report it."
         )
-        verdict = "FAILED" if round_result.failures else "NO_VERDICT"
+        verdict = round_result.verdict
         return FinishDecision(
             outcome=self._accept_finish(
                 finish,
@@ -671,9 +709,7 @@ class ControlledAgent:
             "in_loop": True,
             "round": round_number,
             "max_rounds": self.contract.constraints.max_repair_attempts + 1,
-            "verdict": "PASSED" if round_result.passed else (
-                "FAILED" if round_result.failures else "NO_VERDICT"
-            ),
+            "verdict": round_result.verdict,
             **round_result.to_payload(),
             "note": (
                 "Advisory in-loop feedback. `maya verify run` re-executes every declared "

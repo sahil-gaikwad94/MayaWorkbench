@@ -596,18 +596,32 @@ def provider_specs_from_settings(settings: Any) -> list[ProviderSpec]:
 
     base_url = settings.model.base_url
     primary_local = is_local_host(base_url)
+    kind = getattr(settings.model, "provider", "openai_compatible")
+    mode = {
+        "anthropic": "anthropic",
+        "gemini": "gemini",
+    }.get(kind, LOCAL_OPENAI_COMPATIBLE if primary_local else "openai_compatible")
+    from mayaworkbench.models.gateway import provider_key_env
+
+    key_env = provider_key_env(settings)
     specs = [
         ProviderSpec(
             name="primary",
             model=settings.model.model or "<unset>",
-            mode=LOCAL_OPENAI_COMPATIBLE if primary_local else "openai_compatible",
+            mode=mode,
             local=primary_local,
             priority=10,
             tier="reliable",
-            capabilities=ModelCapabilities(structured_output=True, streaming=False),
+            capabilities=ModelCapabilities(
+                structured_output=True,
+                streaming=kind == "openai_compatible",
+                tool_calling=True,
+                parallel_tool_calls=kind == "openai_compatible",
+                provider_family=mode,
+            ),
             cost_per_mtok=settings.model.output_cost_per_mtok,
-            key_env=settings.model.api_key_env,
-            key_present=api_key_from_env(settings) is not None,
+            key_env=key_env,
+            key_present=bool(os.environ.get(key_env)),
         )
     ]
     fallback_model = os.environ.get("MAYA_FALLBACK_MODEL_NAME")

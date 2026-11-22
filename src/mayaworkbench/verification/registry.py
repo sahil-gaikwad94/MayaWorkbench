@@ -132,6 +132,17 @@ BUILTIN_CHECKS: tuple[BuiltinCheck, ...] = (
         ),
     ),
     BuiltinCheck(
+        key="evaluation.integrity",
+        gate=VerificationGate.CHANGE,
+        title="Evaluation-critical files match the frozen pinned snapshot",
+        method=VerificationMethod.SOURCE_INSPECTION,
+        description=(
+            "Declared evaluation paths are hashed against the pinned snapshot. An "
+            "unapproved change is EVAL_TAMPERING; an approved treatment must name "
+            "the exact path and candidate hash."
+        ),
+    ),
+    BuiltinCheck(
         key="report.integrity",
         gate=VerificationGate.REPORT,
         title="Every reported success links to recorded evidence",
@@ -163,6 +174,10 @@ INVARIANT_NAMES: tuple[str, ...] = (
     "finite_difference_gradient",
     "normalization_moments",
     "conservation_of_sum",
+    "reduced_precision_stability",
+    "gradient_flow_contract",
+    "dataset_split_parity",
+    "seed_determinism",
 )
 
 INVARIANT_DESCRIPTIONS: dict[str, str] = {
@@ -174,6 +189,22 @@ INVARIANT_DESCRIPTIONS: dict[str, str] = {
     "deterministic_eval": "In eval mode, two identical forward passes must be numerically equal.",
     "parameter_update": "One optimisation step must change at least one parameter and keep parameters finite.",
     "dtype_device_consistency": "The output dtype and device must match the input.",
+    "reduced_precision_stability": (
+        "The same tiny target built in float32 and a declared reduced dtype stays "
+        "within a precision-aware tolerance; reports the maximum deviation."
+    ),
+    "gradient_flow_contract": (
+        "Every trainable parameter receives a finite gradient after a tiny backward "
+        "pass, except explicitly declared no-gradient parameter names."
+    ),
+    "dataset_split_parity": (
+        "Declared train/val index splits do not overlap by index hash and the "
+        "preprocessing callable is identical on a shared sample."
+    ),
+    "seed_determinism": (
+        "Two seeded forward passes on identical tiny inputs are bitwise equal, or "
+        "within an explicitly declared tolerance; declared nondeterministic ops skip."
+    ),
     **__import__(
         "mayaworkbench.verification.math_invariants", fromlist=["METHOD_DESCRIPTIONS"]
     ).METHOD_DESCRIPTIONS,

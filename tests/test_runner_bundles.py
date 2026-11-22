@@ -43,9 +43,9 @@ from mayaworkbench.experiments.bundle import (
     compute_dataset_fingerprint,
     import_run_bundle as import_bundle_records,
     sha256_file,
+    sign_run_bundle,
     verify_run_bundle,
 )
-from mayaworkbench.verification.attestation import sign_bundle
 
 from tests.conftest import git
 
@@ -332,36 +332,168 @@ def test_signature_uses_existing_attestation_helper(env, tmp_path, monkeypatch):
     service.export_run_bundle(arm.id, path)
     assert verify_run_bundle(path).attestation_present is False
 
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    for name, data in _members(path).items():
-        target = staging / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-    envelope = sign_bundle(staging, key="trusted-runner-key")
-    signed = _retar(
-        tmp_path / "signed.tar.gz",
-        {**_members(path), "attestation.json": json.dumps(envelope).encode()},
-    )
-    assert verify_run_bundle(signed).attestation_present is True
+    original = _members(path)
+    sign_run_bundle(path, key="trusted-runner-key")
+    assert verify_run_bundle(path).attestation_present is True
+    # The helper changed only the archive's envelope member.
+    signed_members = _members(path)
+    assert {name: data for name, data in signed_members.items() if name != "attestation.json"} == original
+
+    checked = verify_run_bundle(path, key="trusted-runner-key")
+    assert checked.ok, checked.errors
+    assert checked.attestation_level == "SIGNED_BY_USER"
+    assert checked.attestation_verified is True
+    wrong = verify_run_bundle(path, key="wrong-key")
+    assert wrong.ok is False
+    assert wrong.attestation_verified is False
 
     monkeypatch.setenv("MAYA_SIGNING_KEY", "trusted-runner-key")
     imported_home = _fresh_home(tmp_path, "fresh-signed")
     try:
-        result = imported_home.experiment_service.import_run_bundle(signed)
+        result = imported_home.experiment_service.import_run_bundle(path)
         assert result.attestation == "SIGNED_BY_USER"
+        assert result.attestation_level == "SIGNED_BY_USER"
+        assert result.attestation_verified is True
+        assert result.attestation_key_id
         assert "outside this workbench" in result.limitation
         assert "identifies the signing key" in result.limitation
+        for run in result.runs:
+            assert run.details["execution"] == "IMPORTED"
+            assert run.details["attestation"] == "SIGNED_BY_USER"
+            assert run.details["attestation_verified"] is True
     finally:
         imported_home.close()
 
     monkeypatch.setenv("MAYA_SIGNING_KEY", "wrong-key")
     second_home = _fresh_home(tmp_path, "fresh-wrong-key")
     try:
-        result = second_home.experiment_service.import_run_bundle(signed)
+        result = second_home.experiment_service.import_run_bundle(path)
         assert result.attestation == "UNATTESTED"
     finally:
         second_home.close()
+
+
+def test_explicit_wrong_key_aborts_import(env, tmp_path):
+    service = env.services.experiment_service
+    arm = _arm(env, name="strict arm", role=ExperimentRole.BASELINE, values={1: 1.0})
+    path = tmp_path / "strict.tar.gz"
+    service.export_run_bundle(arm.id, path, sign=True, signing_key="right-key")
+    assert verify_run_bundle(path, key="right-key").attestation_verified is True
+
+    imported_home = _fresh_home(tmp_path, "fresh-strict")
+    try:
+        with pytest.raises(ExperimentError, match="verification"):
+            imported_home.experiment_service.import_run_bundle(path, key="wrong-key")
+    finally:
+        imported_home.close()
+
+
+def test_service_export_sign_option_and_key_id(env, tmp_path):
+    service = env.services.experiment_service
+    arm = _arm(env, name="service signed arm", role=ExperimentRole.BASELINE, values={1: 1.0})
+    path = tmp_path / "service-signed.tar.gz"
+    result = service.export_run_bundle(arm.id, path, sign=True, signing_key="service-key")
+    assert result.path == path
+    assert result.archive_sha256 == sha256_file(path)
+    checked = verify_run_bundle(path, key="service-key")
+    assert checked.ok and checked.attestation_verified
+
+    # Default (no sign) remains byte-for-byte deterministic and unattested.
+    first = tmp_path / "plain-a.tar.gz"
+    second = tmp_path / "plain-b.tar.gz"
+    service.export_run_bundle(arm.id, first)
+    service.export_run_bundle(arm.id, second)
+    assert first.read_bytes() == second.read_bytes()
+    assert verify_run_bundle(first).attestation_present is False
+
+
+def test_cli_sign_and_import_use_named_environment_key_only(
+    env, tmp_path, monkeypatch, capsys, home
+):
+    from mayaworkbench.cli.main import main
+
+    arm = _arm(env, name="cli arm", role=ExperimentRole.BASELINE, values={1: 1.0, 2: 1.1})
+    key = "cli-only-secret-value"
+    monkeypatch.delenv("MAYA_SIGNING_KEY", raising=False)
+    monkeypatch.setenv("MAYA_TEST_SIGN_KEY", key)
+    out = tmp_path / "cli-signed.tar.gz"
+
+    code = main(
+        [
+            "--home", str(home), "--json", "runner", "export",
+            "--run", arm.id, "--out", str(out),
+            "--sign", "--signing-key-env", "MAYA_TEST_SIGN_KEY",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    export_payload = json.loads(captured.out)
+    assert export_payload["signed"] is True
+    assert export_payload["key_id"]
+    assert key not in captured.out
+    assert key not in captured.err
+    assert verify_run_bundle(out, key=key).attestation_verified is True
+
+    # A missing named variable fails closed and never echoes a key.
+    code = main(
+        [
+            "--home", str(home), "--json", "runner", "export",
+            "--run", arm.id, "--out", str(tmp_path / "never.tar.gz"),
+            "--sign", "--signing-key-env", "MAYA_MISSING_KEY",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code != 0
+    assert "MAYA_MISSING_KEY" in captured.err
+    assert key not in captured.out and key not in captured.err
+
+    fresh_path = tmp_path / "cli-fresh"
+    code = main(
+        [
+            "--home", str(fresh_path), "--json", "runner", "import", str(out),
+            "--verify-with", "MAYA_TEST_SIGN_KEY",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    import_payload = json.loads(captured.out)
+    assert import_payload["attestation"] == "SIGNED_BY_USER"
+    assert import_payload["attestation_level"] == "SIGNED_BY_USER"
+    assert import_payload["attestation_verified"] is True
+    assert import_payload["key_id"] == export_payload["key_id"]
+    assert key not in captured.out
+    assert key not in captured.err
+
+    imported_home = Services.open(str(fresh_path))
+    try:
+        for run in imported_home.experiment_store.list_runs(arm.id):
+            assert run.details["execution"] == "IMPORTED"
+            assert run.details["attestation"] == "SIGNED_BY_USER"
+            assert run.details["attestation_verified"] is True
+    finally:
+        imported_home.close()
+
+    # A wrong key supplied explicitly aborts the CLI import.
+    code = main(
+        [
+            "--home", str(tmp_path / "cli-wrong"), "--json", "runner", "import", str(out),
+            "--verify-with", "MAYA_WRONG_KEY_NAME",
+        ]
+    )
+    # The named variable does not exist, so this is a key-resolution failure;
+    # set it to a wrong value and confirm strict verification refuses the import.
+    assert code != 0
+    capsys.readouterr()
+    monkeypatch.setenv("MAYA_WRONG_KEY_NAME", "definitely-wrong")
+    code = main(
+        [
+            "--home", str(tmp_path / "cli-wrong-2"), "--json", "runner", "import", str(out),
+            "--verify-with", "MAYA_WRONG_KEY_NAME",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code != 0
+    assert key not in captured.out and key not in captured.err
 
 
 def test_runner_bundle_commands_register_export_and_import():
@@ -376,12 +508,31 @@ def test_runner_bundle_commands_register_export_and_import():
     assert export.func.__name__ == "cmd_runner_export"
     assert export.run_id == "xrun_1"
     assert export.out == "/tmp/out.tar.gz"
+    assert export.sign is False
+    assert export.signing_key_env == "MAYA_SIGNING_KEY"
     comparison = parser.parse_args(
         ["runner", "export", "--comparison", "xcmp_1", "--out", "/tmp/out.tar.gz"]
     )
     assert comparison.comparison_id == "xcmp_1"
+    signed = parser.parse_args(
+        [
+            "runner", "export", "--run", "xrun_1", "--out", "/tmp/out.tar.gz",
+            "--sign", "--signing-key-env", "CUSTOM_KEY",
+        ]
+    )
+    assert signed.sign is True
+    assert signed.signing_key_env == "CUSTOM_KEY"
     imported = parser.parse_args(["runner", "import", "/tmp/in.tar.gz"])
     assert imported.func.__name__ == "cmd_runner_import"
     assert imported.bundle == "/tmp/in.tar.gz"
+    assert imported.verify_with is None
+    verified = parser.parse_args(
+        ["runner", "import", "/tmp/in.tar.gz", "--verify-with", "CUSTOM_KEY"]
+    )
+    assert verified.verify_with == "CUSTOM_KEY"
+    default_verify = parser.parse_args(
+        ["runner", "import", "/tmp/in.tar.gz", "--verify-with"]
+    )
+    assert default_verify.verify_with == "MAYA_SIGNING_KEY"
     with pytest.raises(SystemExit):
         parser.parse_args(["runner", "export", "--out", "/tmp/out.tar.gz"])

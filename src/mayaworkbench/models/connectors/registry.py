@@ -43,6 +43,24 @@ class AdvancedConnectorRegistry:
     def add(self, connector: Any) -> None:
         self._registry.register(connector)
 
+    def register_mcp(
+        self, adapter: Any, *, read_only_allowlist: tuple[str, ...] = ()
+    ) -> Any:
+        """Discover an MCP adapter's tools and register them as operations.
+
+        Discovery is untrusted data: each tool is mapped to a local risk tier
+        by the adapter (unknown tools default to ``EXTERNAL_WRITE``). The
+        returned ``ToolConnector`` routes every call through this registry's
+        consent and one-time grant path; only explicitly allowlisted
+        ``READ_ONLY`` tools may be called without a grant.
+        """
+        from mayaworkbench.models.connectors.mcp import McpConnector
+
+        adapter.discover()
+        connector = McpConnector(adapter, read_only_allowlist=read_only_allowlist)
+        self.add(connector)
+        return connector
+
     def names(self) -> tuple[str, ...]:
         return self._registry.names()
 
@@ -146,6 +164,39 @@ class AdvancedConnectorRegistry:
         )
         return result
 
+    def invoke_allowlisted(
+        self, name: str, operation: str, params: dict[str, Any] | None = None
+    ) -> Any:
+        """Run an explicitly allowlisted READ_ONLY operation without a grant.
+
+        This is additive: it does not touch ``_grants`` and does not relax
+        ``invoke_with_consent``. Only operations a connector publishes through
+        ``allowlisted_operations()`` (the MCP adapter's READ_ONLY tools) qualify;
+        everything else still needs a one-time approval grant.
+        """
+        connector = self._registry.get(name)
+        published = getattr(connector, "allowlisted_operations", None)
+        allowed = set(published() if callable(published) else ())
+        if operation not in allowed:
+            raise ConnectorError(
+                f"Operation {operation!r} on connector {name!r} is not allowlisted for unapproved calls",
+                hint="Only declared READ_ONLY tools can be called without a grant.",
+            )
+        public = dict(params or {})
+        result = self._registry.invoke(name, operation, public)
+        self._events.append(
+            {
+                "type": "connector_allowlisted_invoked",
+                "connector": name,
+                "operation": operation,
+                "target": connector.describe_target(operation, public),
+                "request_hash": result.request_hash,
+                "response_hash": result.response_hash,
+                "read_only": result.read_only,
+            }
+        )
+        return result
+
     def events(self) -> list[dict[str, Any]]:
         return list(self._events)
 
@@ -178,6 +229,10 @@ def build_advanced_connector_registry(
         registry.add(ObservabilityConnector(allowed_dirs=tuple(log_paths)))
     if infra_paths:
         registry.add(InfrastructureConnector(allowed_dirs=tuple(infra_paths)))
+    if os.environ.get("MAYA_MLFLOW_TRACKING_URL"):
+        from mayaworkbench.models.connectors.mlflow import MlflowConnector
+
+        registry.add(MlflowConnector(opener=http))
     return registry
 
 

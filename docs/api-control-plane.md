@@ -27,6 +27,11 @@ All routes return JSON except `/events/stream`, which returns newline-delimited
 JSON (NDJSON). `GET` is the default for reads; `POST` bodies must be JSON
 objects. Successful responses are the serialised service/view results.
 
+`GET /` serves the browser truth-surface UI (inline HTML/JS, no dependencies).
+`GET /ui` is a stable alias that returns a `302` with `Location: /`; following it
+serves the same UI. The UI is read by the same-origin browser client described
+below, so it inherits the loopback-only, no-auth posture of the API.
+
 | Method | Path | Query / body | Purpose |
 | --- | --- | --- | --- |
 | GET | `/health` | — | Liveness; project and event counts. No paths or secrets. |
@@ -39,14 +44,20 @@ objects. Successful responses are the serialised service/view results.
 | GET | `/symbols` | `q=` (required), `snapshot=`, `project=`, `limit=` | Symbol search over the pinned index. |
 | GET | `/research/documents` | `project=`, `limit=` | Registered research documents. |
 | GET | `/research/claims` | `project=`, `document=`, `limit=` | Extracted claims, optionally by document. |
+| GET | `/research/reproduction/{run_id}` | — | Backend-computed four-tier reproducibility report plus its artifact id. |
 | GET | `/tasks` | `project=`, `limit=` | Tasks in a project. |
 | GET | `/tasks/{id}` | — | Task, immutable contract and its runs (`TaskService.task_view`). |
 | GET | `/runs/{id}` | — | Run, plan, approvals, diff, review, verification, tool calls (`TaskService.run_view`). |
 | GET | `/runs/{id}/events` | `limit=` | Durable events filtered to a run. |
+| GET | `/runs/{id}/timeline` | — | Ordered read-only stream of run events and tool calls with `{seq, at, kind, label, detail, ref}` items and a `truncated` flag. |
+| GET | `/runs/{id}/plan` | — | Contract projection, latest plan with steps, scoped approvals (no nonce/HMAC) and the task workspace. |
+| GET | `/runs/{id}/evidence` | — | Verification report, checks, evidence links, claim mappings, reproducibility tiers and experiment comparison with `warnings` for degraded sources. |
+| GET | `/runs/{id}/diff` | — | The captured candidate patch text, its SHA-256, base commit and changed-file list; 404 when no patch was captured. |
 | GET | `/workspaces` | — | Engineering workspaces. |
 | GET | `/workspaces/{id}/graph` | — | Workspace resources, environments and evidence graph. |
 | GET | `/verification/{run_id}/report` | — | Latest verification report and its checks. |
 | GET | `/experiments` | `project=`, `limit=` | Experiment definitions (all projects when `project` is omitted). |
+| GET | `/experiments/{identifier}/comparison` | — | Latest comparison by comparison id or experiment definition id, plus best-effort Markdown report; 404 when unknown or absent. |
 | POST | `/tasks/{id}/approve` | `{"approval_id": "..."}` | Grant a scoped approval via `TaskService.approve`. |
 | POST | `/tasks/{id}/run` | `{}` | Start/resume execution via `TaskService.run_task(..., detached=True)`. |
 | POST | `/tasks/{id}/pause` | `{}` | Request pause via `TaskService.pause_run`. |
@@ -80,6 +91,25 @@ reconnects with `?after=<next_cursor>` and receives only strictly newer rows.
 idle and ends after `seconds` (1–30), so connections are bounded and reconnect is
 always safe. A narrow read-only projection in `api/eventlog.py` exposes the
 existing `seq` column; appends remain in `storage.stores.EventStore`.
+
+The browser client reads `/events/stream` as **NDJSON over `fetch()`, not as
+Server-Sent Events (SSE)**. The stream is `application/x-ndjson` with
+`Connection: close` and bare JSON lines terminated by `\n` — there is no
+`text/event-stream` content type and no `data: ...\n\n` SSE framing, so
+`EventSource`/`onmessage` cannot consume it. The inline client opens the stream
+with `fetch()`, reads `response.body.getReader()` through a `TextDecoder`,
+buffers partial lines, `JSON.parse`s each complete line, skips and logs malformed
+lines, advances the durable cursor from each line's `seq`, handles `heartbeat`
+and `end` explicitly, and reconnects with a fresh cursor using an
+`AbortController` on disconnect/reconnect. The Approvals panel renders the task
+view from `GET /tasks/{id}` (required approvals, requested capabilities and
+scope) plus the latest run's approval requests, and grants a pending approval by
+POSTing its `approval_id` to `/tasks/{id}/approve`. The Verification / evidence
+panel shows the report from `/verification/{run_id}/report` and the manifest and
+file hashes from `/evidence/{run_id}/bundle` (with a clear message on 404). A
+separate Source diff panel loads the exact stored patch from
+`GET /runs/{run_id}/diff` and renders it as literal text with its SHA-256 and
+file list; it never injects server data into HTML.
 
 ## Intentional limits
 

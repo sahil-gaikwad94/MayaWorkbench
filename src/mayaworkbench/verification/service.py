@@ -26,6 +26,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+def _rootless_backend_for_verification(ref: Any, contract: Any) -> Any:
+    """Rebuild the backend adapter over an already-provisioned runtime ref."""
+    from dataclasses import replace
+
+    from mayaworkbench.workspace.backends import CommandPolicy, RootlessContainerBackend
+
+    policy = CommandPolicy.from_constraints(contract.constraints)
+    return RootlessContainerBackend(
+        ref.source,
+        ref.overlay.parent.parent,
+        replace(policy, trust_profile="LOCAL_TRUSTED"),
+        image=ref.image,
+        verified=True,
+    )
+
+
 from mayaworkbench.clock import to_iso, utcnow
 from mayaworkbench.config import Settings
 from mayaworkbench.domain.enums import (
@@ -193,6 +209,7 @@ class VerificationService:
         extra_checks: list[CheckSpec] | None = None,
         include_review: bool = True,
         actor: str = "local-user",
+        candidate_runtime: Any | None = None,
     ) -> tuple[VerificationReport, list[VerificationCheck]]:
         run = self.runs.get(run_id)
         if run.state.value not in VERIFICATION_STATES:
@@ -203,6 +220,14 @@ class VerificationService:
         task = self.tasks.get(run.task_id)
         contract = self.contracts.get(run.contract_id)
         plan = self.plans.get(run.plan_id) if run.plan_id else None
+        if candidate_runtime is None:
+            candidate_runtime = self._candidate_runtime(run, contract)
+        if candidate_runtime is not None:
+            if candidate_runtime.trust_profile != contract.constraints.execution_trust:
+                raise VerificationError(
+                    "the supplied execution runtime does not match the contract trust profile; "
+                    "verification refuses a silent downgrade"
+                )
         diff = self.diffs.get_by_run(run.id)
         if diff is None:
             raise VerificationError(
@@ -246,6 +271,11 @@ class VerificationService:
                 "include_review": include_review,
                 "actor": actor,
                 "critical_test_baseline": critical_baseline,
+                "candidate_runtime": (
+                    candidate_runtime.workspace.describe()
+                    if candidate_runtime is not None
+                    else None
+                ),
             },
         )
         self.store.create_attempt(attempt)
@@ -264,7 +294,9 @@ class VerificationService:
         checks: list[VerificationCheck] = []
         baseline: execution.BaselineWorkspace | None = None
         try:
-            checks.extend(self._builtin_scope(run, task, contract, plan, diff, attempt))
+            checks.extend(
+                self._builtin_scope(run, task, contract, plan, diff, attempt, workspace)
+            )
             patch_text = self._patch_text(diff)
 
             if declared:
@@ -285,6 +317,7 @@ class VerificationService:
                         workspace=workspace,
                         baseline=baseline,
                         baseline_error=baseline_error,
+                        candidate_runtime=candidate_runtime,
                     )
                 )
 
@@ -541,6 +574,7 @@ class VerificationService:
         plan: TaskPlan | None,
         diff: TaskDiff,
         attempt: VerificationRun,
+        workspace: Any = None,
     ) -> list[VerificationCheck]:
         out: list[VerificationCheck] = []
 
@@ -895,6 +929,180 @@ class VerificationService:
                 },
             )
         )
+        # WP-R2I-2 — Gate B: freeze evaluation-critical files. Paths and
+        # hash-bound treatments live in the immutable contract's check details.
+        # Only checks that actually declare them contribute, and an approval is
+        # honoured only when it binds the exact path to the exact sha256.
+        declared_paths: list[str] = []
+        approval_candidates: dict[str, str | None] = {}
+        for spec in contract.verification_checks:
+            spec_details = spec.details or {}
+            raw_paths = spec_details.get("evaluation_paths")
+            if raw_paths is None:
+                continue
+            if not isinstance(raw_paths, list) or any(
+                not isinstance(item, str) or not item for item in raw_paths
+            ):
+                raise VerificationError(
+                    f"Check {spec.key} declares invalid evaluation_paths; expected a "
+                    "list of repo-relative strings.",
+                    hint="evaluation_paths is part of the immutable contract.",
+                )
+            for item in raw_paths:
+                if item not in declared_paths:
+                    declared_paths.append(item)
+            raw_approvals = spec_details.get("approved_evaluation_changes")
+            if raw_approvals is None:
+                continue
+            if not isinstance(raw_approvals, dict) or any(
+                not isinstance(path, str)
+                or not path
+                or not isinstance(digest, str)
+                or not digest
+                for path, digest in raw_approvals.items()
+            ):
+                raise VerificationError(
+                    f"Check {spec.key} declares invalid approved_evaluation_changes; "
+                    "expected a mapping of repo-relative path to exact sha256.",
+                    hint="A generic permission to edit evaluation code is never accepted.",
+                )
+            for path, digest in raw_approvals.items():
+                if path in approval_candidates and approval_candidates[path] != digest:
+                    # Conflicting approvals cannot authorise anything: fail closed.
+                    approval_candidates[path] = None
+                else:
+                    approval_candidates.setdefault(path, digest)
+        approved_changes = {
+            path: digest
+            for path, digest in approval_candidates.items()
+            if digest is not None
+        }
+
+        from mayaworkbench.verification import evaluation_integrity as eval_integrity
+
+        eval_base = dict(
+            run=run,
+            task=task,
+            attempt=attempt,
+            key="evaluation.integrity",
+            gate=VerificationGate.CHANGE,
+            kind=CheckKind.DETERMINISTIC,
+            title="Evaluation-critical files match the frozen pinned snapshot",
+            method=VerificationMethod.SOURCE_INSPECTION,
+            required=bool(declared_paths),
+        )
+        if not declared_paths:
+            out.append(
+                self._record(
+                    **eval_base,
+                    outcome=CheckOutcome.NOT_APPLICABLE,
+                    summary="no evaluation-critical paths were declared in the contract",
+                    details={
+                        "status": "NOT_APPLICABLE",
+                        "counts": {
+                            eval_integrity.UNCHANGED: 0,
+                            eval_integrity.APPROVED_TREATMENT: 0,
+                            eval_integrity.TAMPERING: 0,
+                        },
+                        "changes": [],
+                        "declared_paths": [],
+                        "tampering_paths": [],
+                        "frozen_harness_manifest": {},
+                    },
+                )
+            )
+        else:
+            workspace_path = (
+                Path(workspace.path)
+                if workspace is not None
+                and getattr(workspace, "status", None) is not None
+                and workspace.status.value != "REMOVED"
+                else None
+            )
+            if workspace_path is None:
+                out.append(
+                    self._record(
+                        **eval_base,
+                        outcome=CheckOutcome.BLOCKED,
+                        summary=(
+                            "the candidate workspace is missing or removed, so the "
+                            "frozen evaluation harness cannot be checked"
+                        ),
+                        findings=[
+                            VerificationFinding(
+                                severity=FindingSeverity.ERROR,
+                                code="EVALUATION_UNVERIFIABLE",
+                                message=(
+                                    "Evaluation-critical paths were declared but no "
+                                    "candidate tree is available for comparison."
+                                ),
+                                source="deterministic",
+                            )
+                        ],
+                        details={
+                            "status": "BLOCKED",
+                            "counts": {
+                                eval_integrity.UNCHANGED: 0,
+                                eval_integrity.APPROVED_TREATMENT: 0,
+                                eval_integrity.TAMPERING: 0,
+                            },
+                            "changes": [],
+                            "declared_paths": sorted(declared_paths),
+                            "frozen_harness_manifest": {},
+                        },
+                    )
+                )
+            else:
+
+                def base_reader(path: str) -> bytes | None:
+                    indexed = self.files.get_by_path(run.snapshot_id, path)
+                    if indexed is None:
+                        return None
+                    if indexed.content_artifact_id is None:
+                        raise VerificationError(
+                            f"The pinned snapshot has no stored bytes for evaluation-critical "
+                            f"path {path!r}; refusing to guess the base content.",
+                            hint="Re-index the snapshot with file-content storage enabled.",
+                        )
+                    return self.artifacts.read_bytes(indexed.content_artifact_id)
+
+                changes = eval_integrity.evaluate_harness_integrity(
+                    declared_paths=declared_paths,
+                    approved_changes=approved_changes,
+                    base_reader=base_reader,
+                    candidate_root=workspace_path,
+                )
+                details = eval_integrity.as_check_details(changes)
+                tampered = [
+                    item
+                    for item in changes
+                    if item.status == eval_integrity.TAMPERING
+                ]
+                findings = [
+                    VerificationFinding(
+                        severity=FindingSeverity.ERROR,
+                        code="EVAL_TAMPERING",
+                        message=f"Evaluation-critical path {item.path!r}: {item.reason}.",
+                        path=item.path,
+                        source="deterministic",
+                        details={
+                            "base_sha256": item.base_sha256,
+                            "candidate_sha256": item.candidate_sha256,
+                        },
+                    )
+                    for item in tampered
+                ]
+                out.append(
+                    self._record(
+                        **eval_base,
+                        outcome=(
+                            CheckOutcome.FAILED if tampered else CheckOutcome.PASSED
+                        ),
+                        summary=eval_integrity.render_summary(changes),
+                        findings=findings,
+                        details=details,
+                    )
+                )
         return out
 
     # -------------------------------------------------------------- declarations
@@ -941,6 +1149,7 @@ class VerificationService:
         workspace: Any,
         baseline: execution.BaselineWorkspace | None,
         baseline_error: str | None,
+        candidate_runtime: Any | None = None,
     ) -> list[VerificationCheck]:
         out: list[VerificationCheck] = []
         workspace_path = Path(workspace.path) if workspace is not None else None
@@ -1023,6 +1232,7 @@ class VerificationService:
                     argv=list(spec.argv or []) if script is None else None,
                     script=script,
                     timeout_seconds=spec.timeout_seconds,
+                    runtime=candidate_runtime,
                 )
             except (MayaError, OSError) as exc:
                 out.append(
@@ -1160,6 +1370,61 @@ class VerificationService:
                 and item.spec_sha256 == expected
             ),
             None,
+        )
+
+    def _candidate_runtime(
+        self, run: WorkflowRun, contract: TaskContract
+    ) -> Any | None:
+        """Resume the worker's single runtime for the candidate tree.
+
+        Returns ``None`` for ordinary host runs, which keep the existing
+        host-local check path. For an isolated profile the retained overlay is
+        the *exact* tree the agent edited, and the trust profile must match the
+        contract — otherwise verification refuses to run rather than downgrade.
+        """
+        binding = (run.details or {}).get("runtime_binding")
+        if not binding or binding.get("kind") != "container":
+            return None
+        from mayaworkbench.domain.enums import ExecutionTrust
+        from mayaworkbench.workspace.backends import (
+            BackendCommandRunner,
+            RootlessContainerBackend,
+            RuntimeRef,
+        )
+        from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace, manifest
+        from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
+
+        trust = binding.get("trust_profile")
+        if trust != contract.constraints.execution_trust:
+            raise VerificationError(
+                f"runtime trust profile {trust!r} does not match the contract's "
+                f"{contract.constraints.execution_trust!r}; refusing to downgrade"
+            )
+        if trust != ExecutionTrust.ROOTLESS_CONTAINER.value:
+            return None
+        ref_data = binding.get("runtime_ref")
+        if not ref_data:
+            raise VerificationError("the retained runtime has no RuntimeRef")
+        ref = RuntimeRef.from_dict(ref_data)
+        if not ref.overlay.exists():
+            raise VerificationError(
+                "the retained candidate overlay is gone; re-run the task before verification"
+            )
+        source = Path(binding["base_path"]).resolve()
+        worktree = self.workspaces.get_by_run(run.id)
+        if worktree is None or Path(worktree.path).resolve() != source:
+            raise VerificationError(
+                "the retained runtime does not belong to this run's pinned workspace"
+            )
+        if not ref.overlay.is_absolute() or not ref.source.resolve() == source:
+            raise VerificationError("the retained runtime ref is inconsistent with this run")
+        ws = RuntimeWorkspace.resume(
+            _rootless_backend_for_verification(ref, contract), ref, source,
+            source_manifest=manifest(source),
+        )
+        runner = BackendCommandRunner(ws.backend, runtime=ws.runtime)
+        return CommandRunnerTaskRuntime(
+            workspace=ws, runner=runner, trust_profile=trust
         )
 
     # ----------------------------------------------------------- patch integrity

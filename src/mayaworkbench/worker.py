@@ -175,12 +175,6 @@ class Worker:
             )
             return
 
-        policy = PathPolicy(
-            workspace.path,
-            allowed_paths=contract.scope.allowed_paths,
-            excluded_paths=contract.scope.excluded_paths,
-            allow_file_deletion=contract.constraints.allow_file_deletion,
-        )
         lease_seconds = max(600, min(7200, contract.constraints.max_runtime_seconds + 300))
         last_beat = [0.0]
         last_cancel_check = [0.0]
@@ -209,35 +203,85 @@ class Worker:
             BackendCommandRunner,
             RootlessContainerBackend,
         )
+        from mayaworkbench.workspace.capabilities import probe_execution_capability_report
+        from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace
+        from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
 
         contract_policy = CommandPolicy.from_constraints(contract.constraints)
         trust = contract.constraints.execution_trust
+        run_home = Path(workspace.path).parent / "home"
+        container_backend = None
         if trust == ExecutionTrust.ROOTLESS_CONTAINER.value:
-            # The OCI client itself is a trusted local process; the isolation
-            # boundary is the container, not this host policy.
-            runner = BackendCommandRunner(
-                RootlessContainerBackend(
-                    Path(workspace.path),
-                    Path(workspace.path).parent / "home",
-                    replace(contract_policy, trust_profile=ExecutionTrust.LOCAL_TRUSTED.value),
+            # One canonical capability report decides availability. A runtime
+            # that has not passed a real OCI smoke test is never silently
+            # downgraded to host execution.
+            capability = probe_execution_capability_report().trust_profiles[trust]
+            if not capability["available"]:
+                raise PolicyError(
+                    f"ROOTLESS_CONTAINER cannot be established: {capability['reason']}"
                 )
-            )
-        elif trust == ExecutionTrust.LOCAL_TRUSTED.value:
-            runner = CommandRunner(
+            container_backend = RootlessContainerBackend(
                 Path(workspace.path),
+                run_home,
+                replace(contract_policy, trust_profile=ExecutionTrust.LOCAL_TRUSTED.value),
+                verified=True,
+            )
+            # Provision once. The overlay is the single file view used by all
+            # tools, commands, in-loop checks and artifact collection.
+            runtime_workspace = RuntimeWorkspace.for_container(
+                container_backend, Path(workspace.path), snapshot_id=run.snapshot_id
+            )
+            runner = BackendCommandRunner(container_backend, runtime=runtime_workspace.runtime)
+        elif trust in {
+            ExecutionTrust.LOCAL_TRUSTED.value,
+            ExecutionTrust.READ_ONLY_ANALYSIS.value,
+        }:
+            runtime_workspace = RuntimeWorkspace.for_host(Path(workspace.path))
+            runner = CommandRunner(
+                runtime_workspace.path,
                 policy=contract_policy,
-                run_home=Path(workspace.path).parent / "home",
+                run_home=run_home,
+                # Opt into a verified cgroup v2 pids scope when this host
+                # delegates one; otherwise process_count stays unsupported.
+                use_cgroup_scope=trust == ExecutionTrust.LOCAL_TRUSTED.value,
             )
         else:
             raise PolicyError(  # fail closed; never downgrade an isolated request
                 f"execution trust profile {trust!r} is not available to the worker"
             )
+
+        # Every component receives the SAME runtime: no hidden runners.
+        task_runtime = CommandRunnerTaskRuntime(
+            workspace=runtime_workspace, runner=runner, trust_profile=trust
+        )
+        active_path = runtime_workspace.path
+        policy = PathPolicy(
+            active_path,
+            allowed_paths=contract.scope.allowed_paths,
+            excluded_paths=contract.scope.excluded_paths,
+            allow_file_deletion=contract.constraints.allow_file_deletion,
+        )
+        try:
+            binding = {
+                **run.details,
+                "runtime_binding": {
+                    **runtime_workspace.describe(),
+                    "runtime_ref": runtime_workspace.runtime.as_dict()
+                    if runtime_workspace.runtime
+                    else None,
+                    "trust_profile": trust,
+                },
+            }
+            self.services.runs.update_progress(run.id, details=binding)
+        except Exception as exc:  # noqa: BLE001 - evidence must not break execution
+            log.warning("runtime binding could not be persisted", extra={"error": str(exc)})
+
         # In-loop checks are declared in the contract, not proposed by the model.
         # They may run only when the same COMMAND_EXECUTION approval that governs
         # the gateway is present; otherwise the gate records BLOCKED, honestly.
         checks = DeclaredCheckRunner(
             contract=contract,
-            workspace=Path(workspace.path),
+            workspace=active_path,
             run_home=Path(workspace.path).parent / "check-home",
             authorized=(
                 command_approval is not None
@@ -262,6 +306,21 @@ class Worker:
                 "available": False,
                 "error": f"{type(exc).__name__}: {exc}"[:400],
             }
+        # Closed-loop experience: confirmed, non-expired prior negative results
+        # are ADVISORY hints during planning/repair, never prohibitions. This
+        # connects memory/experience.py to the live task loop (audit FIX-05).
+        try:
+            from mayaworkbench.memory.experience import suggest_prior_attempts
+
+            orientation["advisory_prior_failures"] = suggest_prior_attempts(
+                self.services.memory,
+                project_id=run.project_id,
+                goal=task.goal,
+                limit=5,
+            )
+        except Exception as exc:  # noqa: BLE001 - memory is advisory, never a gate
+            log.warning("prior-attempt recall unavailable", extra={"error": str(exc)})
+            orientation["advisory_prior_failures"] = []
 
         def symbol_lookup(query: str, limit: int) -> list[dict[str, Any]]:
             hits = self.services.search.search_symbols(run.snapshot_id, query, limit=limit)
@@ -271,7 +330,7 @@ class Worker:
         from mayaworkbench.workspace.tools import redact as redact_tool_output
 
         sessions = SessionManager(
-            Path(workspace.path),
+            active_path,
             runner,
             redactor=redact_tool_output,
         )
@@ -280,7 +339,7 @@ class Worker:
             run=run,
             task=task,
             contract=contract,
-            workspace=Path(workspace.path),
+            workspace=active_path,
             policy=policy,
             runner=runner,
             calls=self.services.calls,
@@ -293,6 +352,7 @@ class Worker:
             cancel_requested=cancel_requested,
             check_runner=checks,
             session_manager=sessions,
+            read_only_profile=(trust == ExecutionTrust.READ_ONLY_ANALYSIS.value),
             allowed_api_hosts=tuple(
                 host.strip()
                 for host in os.environ.get("MAYA_API_HOSTS", "").split(",")
@@ -354,9 +414,46 @@ class Worker:
             # No session may outlive the run: stop every process group this
             # worker created before capturing the patch or settling state.
             sessions.stop_all(reason="run finished")
-            if hasattr(runner, "stop"):
-                runner.stop(reason="run finished")
+            # A container overlay is retained until verification has compared
+            # the exact candidate tree; only the container/process is stopped.
+            task_runtime.stop(
+                reason="run finished",
+                keep_overlay=(trust == ExecutionTrust.ROOTLESS_CONTAINER.value),
+            )
         self._settle(job, outcome)
+
+    def _import_container_diff(self, run: Any) -> list[dict[str, str]]:
+        """Bring the exact container overlay contents into the Git worktree.
+
+        A container overlay is not a Git repository, so the durable patch is
+        captured after importing the content-aware diff through a path-checked
+        boundary. This is what makes "the patch Maya produced" the same tree
+        that checks were run against.
+        """
+        binding = (run.details or {}).get("runtime_binding")
+        if not binding or binding.get("kind") != "container":
+            return []
+        from mayaworkbench.workspace.runtime_workspace import (
+            RuntimeWorkspace,
+            import_diff_to_worktree,
+            manifest,
+        )
+
+        base = Path(binding["base_path"])
+        workspace = RuntimeWorkspace(
+            "container",
+            base,
+            Path(binding["active_path"]),
+            manifest(base),
+        )
+        worktree = self.services.workspaces.get_by_run(run.id)
+        if worktree is None:
+            raise MayaError("the Git worktree is gone; the candidate patch cannot be captured")
+        changes = import_diff_to_worktree(workspace, Path(worktree.path))
+        self.services.runs.update_progress(
+            run.id, details={**run.details, "runtime_content_diff": changes}
+        )
+        return changes
 
     def _settle(self, job: WorkerJob, outcome: AgentOutcome) -> None:
         # A stalled worker may resume after its lease expired and another worker
@@ -379,6 +476,7 @@ class Worker:
         )
         if outcome.state == WorkflowState.REVIEWING:
             try:
+                self._import_container_diff(run)
                 self.services.task_service.capture_diff(run.id)
             except Exception as exc:  # noqa: BLE001
                 self.services.runs.update_progress(
@@ -405,6 +503,7 @@ class Worker:
             return
         if outcome.state == WorkflowState.CANCELLED:
             try:
+                self._import_container_diff(run)
                 self.services.task_service.capture_diff(run.id)
             except Exception as exc:  # noqa: BLE001 - partial evidence is best effort
                 self.services.runs.update_progress(
@@ -422,12 +521,14 @@ class Worker:
             else WorkflowState.FAILED
         )
         try:
+            self._import_container_diff(run)
             self.services.task_service.capture_diff(run.id)
-        except Exception as exc:  # noqa: BLE001 - preser
+        except Exception as exc:  # noqa: BLE001 - preserve partial evidence
             self.services.runs.update_progress(
                 run.id,
                 details={**self.services.runs.get(run.id).details, "diff_error": str(exc)},
             )
+        self._record_failed_attempt(run, outcome, target)
         self._transition_or_fail(run.id, target, outcome.error or outcome.summary)
         self.services.jobs.finish(
             job.id,
@@ -435,6 +536,34 @@ class Worker:
             error=outcome.error,
         )
         self._event(job, EventType.WORKER_FINISHED, {"status": target.value})
+
+    def _record_failed_attempt(self, run: Any, outcome: Any, target: Any) -> None:
+        """Record an unconfirmed negative-result memory for a failed hypothesis."""
+        if target.value not in {"FAILED", "BLOCKED"}:
+            return
+        try:
+            from mayaworkbench.memory.experience import record_attempt
+
+            task = self.services.tasks.get(run.task_id)
+            contract = self.services.contracts.get(run.contract_id)
+            workspace = self.services.workspaces.get_by_run(run.id)
+            diff = self.services.diffs.get_by_run(run.id)
+            base_commit = workspace.base_commit_sha if workspace else None
+            if base_commit is not None and len(base_commit) != 40:
+                base_commit = None
+            record_attempt(
+                self.services.memory,
+                project_id=run.project_id,
+                goal=task.goal,
+                hypothesis=outcome.summary or "implement the stated objective",
+                outcome=outcome.error or target.value,
+                failure_signature=outcome.error or outcome.summary or target.value,
+                base_commit=base_commit,
+                patch_hash=getattr(diff, "patch_sha256", None),
+                environment=(contract.constraints.execution_trust if contract else ""),
+            )
+        except Exception as exc:  # noqa: BLE001 - memory recording is advisory
+            log.warning("failed attempt was not recorded", extra={"error": str(exc)})
 
     # ----------------------------------------------------------------- helpers
     def _transition_or_fail(self, run_id: str, target: WorkflowState, reason: str) -> None:

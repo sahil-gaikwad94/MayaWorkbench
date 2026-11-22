@@ -66,6 +66,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/":
                 self._send_html(UI_HTML)
                 return
+            if method == "GET" and path == "/ui":
+                # Stable, user-friendly alias for the truth-surface UI. The
+                # target is a fixed literal, so no request data reaches a header.
+                self._send_redirect("/")
+                return
             query = parse_qs(parsed.query, keep_blank_values=True)
             body = self._read_body() if method == "POST" else {}
             result = self.app.route(method, path, query, body)
@@ -118,6 +123,16 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_redirect(self, location: str) -> None:
+        data = b""
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 

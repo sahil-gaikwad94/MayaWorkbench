@@ -81,6 +81,22 @@ export MAYA_MODEL_API_KEY=...      # never stored in the config file
 maya model status                  # shows whether calls are permitted
 ```
 
+Native tool calling and streamed responses are available on the OpenAI-compatible
+adapter. Two additional selectable adapters use their providers' native APIs:
+`model.provider=anthropic` (with `MAYA_ANTHROPIC_API_KEY`) and
+`model.provider=gemini` (with `MAYA_GEMINI_API_KEY`). Keys are always read from the
+environment and are never stored, logged or sent to another provider. Model output
+remains a proposal: the tool gateway, runner and evidence system are the authority.
+
+Attach a four-tier reproducibility report to a run (method code found,
+implemented, validated, result reproduced) with `maya research reproduction <run>
+--json`; the report is computed from recorded evidence, not from a model's
+self-assessment. `maya eval r2i` scores exported claim/matrix artifacts against
+the bundled labelled seed corpus; its results are measurements, not a benchmark
+claim about model quality. `maya release evidence --pytest-report …` assembles a
+release record from real inputs (never guessed counts); see `docs/release-gates.md`
+for what each gate licenses and what a skip means.
+
 Turn a paper into reviewed, mapped claims:
 
 ```bash
@@ -249,11 +265,16 @@ result, and the final status:
 
 ## Execution trust and reported limits
 
-Command execution uses an explicit trust profile. Only `LOCAL_TRUSTED` is
-implemented: it runs project code with the user's OS privileges and is **not a
-sandbox**. `READ_ONLY_ANALYSIS` refuses execution, and the isolated profiles
-(`ROOTLESS_CONTAINER`, `REMOTE_MICROVM`, `GPU_RUNNER`) are **blocked** rather
-than silently downgraded to host privileges. Inspect the host with
+Command execution uses an explicit trust profile. `LOCAL_TRUSTED` runs project
+code with the user's OS privileges and is **not a sandbox**. `READ_ONLY_ANALYSIS`
+is implemented in code: the tool gateway is masked to read-only tools and the
+runner refuses every command before spawn — no OS sandbox is needed. The worker
+routes `ROOTLESS_CONTAINER` through a populated task overlay shared by file
+tools, commands, checks and artifact capture, but **only** when one canonical
+capability report proves a rootless OCI runtime, writable cgroup delegation and
+a passing smoke test; otherwise the task is blocked before the first write or
+process spawn. `REMOTE_MICROVM` and `GPU_RUNNER` require user-provided
+infrastructure and remain blocked. Inspect the single report with
 `maya runner doctor` and list profiles with `maya runner profiles` (both support
 `--json`).
 
@@ -261,12 +282,14 @@ Limit enforcement is reported per limit with the mechanism observed at runtime
 (`wall_time`, `cpu`, `memory`, `process_count`, `file_size`, `open_files`). Each
 rlimit is applied inside the child and read back with `getrlimit`; the aggregate
 `limits_enforcement` is derived from those results
-(`all_enforced`/`partially_enforced`/`not_enforced`). `process_count` is
-reported `unsupported`: `RLIMIT_NPROC` is a per-UID ceiling that Linux does not
-enforce for privileged processes and whose headroom calculation can also block
-legitimate child forks. The wall-clock supervisor kills the whole process group,
-but no per-task PID cap is claimed until a verified cgroup/container backend
-exists.
+(`all_enforced`/`partially_enforced`/`not_enforced`). `RLIMIT_NPROC` is not used:
+it is a per-UID ceiling Linux does not enforce for privileged processes and its
+headroom calculation can block legitimate forks. The base runner therefore
+reports `process_count: unsupported` unless a writable cgroup v2 scope is
+discovered, created and read back (then `enforced`, mechanism `cgroup-v2`), or a
+smoke-verified rootless container applies `pids.max`. Controller names alone are
+never reported as enforcement. The wall-clock supervisor kills the whole
+process group in every profile.
 
 See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the feature→code→test
 truth table and [docs/test-matrix.md](docs/test-matrix.md) for the declared test
@@ -296,10 +319,14 @@ features:
 - **Secret handling is best-effort.** Filename patterns and content scans catch
   common cases; they are not a substitute for proper secret management. Skipped
   files are reported, never silently dropped.
-- **Single-user, local-only.** There is no authentication, multi-tenancy or
-  network service; the database is a local file.
+- **Single-user, local-only.** There is no hosted, multi-tenant or remotely
+  exposed service and no authentication. A loopback-only JSON control plane and
+  thin local UI are available on `127.0.0.1` (`maya api serve`); do not expose
+  them to a network. The database is a local file.
 - **PDF text depends on a text layer.** The builtin extractor handles classic and
-  Flate content streams; scanned pages are reported as missing, never OCR'd.
+  Flate content streams; scanned pages are reported as missing. An explicit
+  opt-in Tesseract adapter can OCR them with separate `SOURCE_OCR` provenance;
+  OCR text is never treated as an exact quotation without human confirmation.
   Install `pypdf` for better font/`ToUnicode` handling.
 - **Mapping is scoped to one snapshot.** `ABSENT` means "not found in the
   inspected scope" and is downgraded to `UNCERTAIN` when parser coverage or

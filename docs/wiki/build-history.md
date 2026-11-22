@@ -55,3 +55,44 @@ Outstanding at this date: WP6 (typed claim graph / research discovery), WP7 (mod
 interfaces + routing + connectors), WP8 (role DAG), WP9 (mutation-based verification),
 WP10 (runner bundles), WP11 (web/API control plane), WP12 (advanced connectors).
 These are **not** claimed as shipped in `IMPLEMENTATION_STATUS.md`.
+
+- **2026-11-22:** Two independent audits of the 2026-11-21 ZIP were reconciled and their
+  actionable P0/P1 findings implemented: one canonical capability report with fail-closed
+  rootless routing; verified cgroup `pids.max` and clean `rmdir`; a single
+  `RuntimeWorkspace` shared by tools, commands, checks and artifacts; broken-checker
+  classification; `READ_ONLY_ANALYSIS` tool mask; lockfile-aware environment plans;
+  NDJSON `fetch()` UI with real approvals/diff; experience memory wired into the loop.
+  Later the same day: native tool calls/SSE/Anthropic+Gemini adapters, pluggable embeddings
+  with RRF, optional Tree-sitter, and real MCP stdio transport. First verified checkpoint:
+  **568 collected, 566 passed, 2 skipped**; adversarial harnesses still **82/82**.
+  Final count for the day is recorded in `docs/test-matrix.md`. No live OCI runtime or
+  provider key was available; those integrations remain explicitly unverified.
+- **2026-11-22 (later):** R2I evidence package shipped: a backend-computed four-tier
+  reproducibility report (`research/reproduction.py`, artifact + event, CLI/API) and
+  an offline evaluator (`evaluation/r2i.py`) with an internal seed corpus. Decision:
+  a report is a derived view, not a new truth store; a gold corpus is versioned input
+  data, not a domain record. An adversarial fresh-context review of the result tier
+  surfaced 24 issues; fixes and a second review cycle are tracked in
+  `docs/wiki/audit-2026-11-22-remediation.md`.
+- **2026-11-22 (later):** launch-readiness package shipped: `maya release evidence`
+  from real inputs only (no guessed counts, redaction guard, canonical hash) and two
+  opt-in live harnesses (`@pytest.mark.oci`, `@pytest.mark.live_model`) that SKIP with
+  explicit reasons and never claim a pass from a skip. Normative gates:
+  `docs/release-gates.md`.
+- **2026-11-22 final verification of the whole day's work:** `compileall` clean;
+  `pytest -q --junitxml` → **729 collected, 721 passed, 0 failed, 8 skipped** (six
+  opt-in live harnesses + two pre-existing optional cases); adversarial harnesses
+  **82/82**; `maya release evidence` produced a canonical record from that JUnit
+  report and those harness results (no guessed counts, redaction guard, explicit
+  `unverified` list). No live OCI runtime or provider key was available, so those
+  gates are SKIPPED and no isolation or provider-quality claim is licensed.
+- **2026-11-22 final goal pass:** six further end-to-end packages landed after that
+  checkpoint — workbench UI trust surfaces (four read endpoints + seven panels),
+  research evidence quality (version-bound citations, typed cross-source
+  disagreements, paper status alerts, migration 0011), signed portable run bundles
+  (CLI sign/verify/import with named key and verify-time HMAC), the 25-task internal
+  real-model eval harness (offline dry-run default, hard spend cap), and opt-in
+  parallel read-only role discovery with ordered sequential publication. Final gate:
+  **768 collected, 759 passed, 9 skipped, 0 failed**; adversarial harnesses **82/82**;
+  release evidence regenerated from those real inputs. Live OCI and live provider
+  gates remain SKIPPED by design; no isolation or provider-quality claim is made.

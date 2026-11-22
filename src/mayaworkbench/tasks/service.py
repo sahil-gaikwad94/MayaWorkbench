@@ -870,13 +870,17 @@ class TaskService:
         *,
         extra_checks: list[CheckSpec] | None = None,
         include_review: bool = True,
+        candidate_runtime: Any | None = None,
     ) -> tuple[VerificationReport, list[Any]]:
         """Capture the patch if needed and create a new verification attempt."""
         run = self.runs.get(run_id)
         if self.diffs.get_by_run(run.id) is None:
             self.capture_diff(run.id)
         return self.verification.verify(
-            run.id, extra_checks=extra_checks, include_review=include_review
+            run.id,
+            extra_checks=extra_checks,
+            include_review=include_review,
+            candidate_runtime=candidate_runtime,
         )
 
     def finish_run(

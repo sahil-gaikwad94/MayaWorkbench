@@ -32,6 +32,12 @@ dev = ["pytest>=8.0"]
 # Better PDF text extraction (font encodings and ToUnicode maps). The builtin
 # parser remains the fallback when this extra is not installed.
 pdf = ["pypdf>=4.0,<6"]
+# Real concrete-syntax-tree parsing for non-Python languages. The indexer keeps
+# the bounded regex adapter (LOW / HEURISTIC) when these are not installed.
+treesitter = ["tree-sitter>=0.23", "tree-sitter-language-pack>=0.6"]
+# Optional numerical acceleration for dense-vector providers. The core install
+# and the deterministic hashing adapter do not need numpy.
+embeddings = ["numpy>=1.26"]
 
 [project.scripts]
 maya = "mayaworkbench.cli.main:main"
@@ -45,11 +51,16 @@ where = ["src"]
 [tool.setuptools.package-data]
 mayaworkbench = ["py.typed", "api/ui/index.html"]
 "mayaworkbench.storage.migrations" = ["*.sql"]
+"mayaworkbench.evaluation" = ["gold/causal_attention_seed.json", "gold/eval_tasks_seed.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "oci: real rootless-OCI escape harness; runs only with MAYA_OCI_LIVE=1 and a verified runtime",
+  "live_model: real provider harness; runs only with MAYA_LIVE_MODEL=1, an API key and a hard spend cap",
+]
 
 [tool.ruff]
 line-length = 100

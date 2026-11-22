@@ -11,21 +11,28 @@ import argparse
 import hashlib
 import io
 import json
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from mayaworkbench.cli.model_commands import register_model_commands
 from mayaworkbench.cli.output import Console
 from mayaworkbench.config import Settings
 from mayaworkbench.errors import ModelError, PolicyError
+from mayaworkbench.models.anthropic_adapter import AnthropicProvider
 from mayaworkbench.models.base import (
+    ChatMessage,
     ModelCapabilities,
     ModelRequest,
     ModelResponse,
     ModelUsage,
+    ToolCall,
+    ToolDefinition,
 )
+from mayaworkbench.models.gemini_adapter import GeminiProvider
 from mayaworkbench.models.capabilities import (
     ChatModel,
     ConnectorError,
@@ -177,7 +184,10 @@ def test_chat_model_extends_provider_contract() -> None:
     )
     assert isinstance(provider, ChatModel)
     assert provider.capabilities().structured_output is True
-    assert supports_streaming(provider) is False
+    # SSE is genuinely consumed (buffered in generate(stream=True)), so the
+    # truthful contract is "streaming supported" — not the old blanket False.
+    assert supports_streaming(provider) is True
+    assert provider.capabilities().streaming is True
     fake = _CallableChatModel()
     assert isinstance(fake, ChatModel)
     assert fake.generate(ModelRequest(purpose="test", messages=[])).provider == "fake_chat"
@@ -580,3 +590,484 @@ def test_register_model_commands_reuses_existing_model_parser() -> None:
     assert setattr(args, "console", Console(json_mode=True)) is None
     assert args.func(args) == 0
     assert "connector" in sub.choices
+
+
+# --------------------------------------------------------------------------- #
+# 8. P1 model platform: tools, streaming and native adapters                   #
+# --------------------------------------------------------------------------- #
+class _FakeResponse:
+    """Minimal urllib response: no sockets, no credentials, no side effects."""
+
+    def __init__(
+        self,
+        *,
+        body: bytes | None = None,
+        lines: list[bytes] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self._body = body or b""
+        self._lines = lines
+        self._position = 0
+        self.headers = headers or {}
+
+    def read(self, size: int = -1) -> bytes:
+        if self._lines is not None:
+            return b"".join(self._lines)
+        return self._body if size < 0 else self._body[:size]
+
+    def readline(self, size: int = -1) -> bytes:
+        if self._lines is None or self._position >= len(self._lines):
+            return b""
+        line = self._lines[self._position]
+        self._position += 1
+        return line if size < 0 else line[:size]
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        return False
+
+
+def _fake_urlopen(monkeypatch, *, body: bytes | None = None, lines: list[bytes] | None = None, headers: dict[str, str] | None = None) -> list[Any]:
+    """Replace urllib's opener with a deterministic, in-memory one."""
+    calls: list[Any] = []
+
+    def fake(request: Any, timeout: int | None = None) -> _FakeResponse:
+        calls.append(request)
+        return _FakeResponse(body=body, lines=lines, headers=headers)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    return calls
+
+
+def _json_body(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload).encode("utf-8")
+
+
+def _sse(*payloads: Any) -> list[bytes]:
+    lines: list[bytes] = []
+    for payload in payloads:
+        lines.append(b"data: " + json.dumps(payload).encode("utf-8") + b"\n")
+        lines.append(b"\n")
+    return lines
+
+
+def _openai_request(**kwargs: Any) -> ModelRequest:
+    return ModelRequest(
+        purpose="test",
+        messages=[ChatMessage(role="user", content="hello")],
+        **kwargs,
+    )
+
+
+def _openai_provider() -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(
+        base_url="http://127.0.0.1:9/v1", model="test-model", api_key="fake-openai-key"
+    )
+
+
+def test_model_contract_extensions_are_additive_and_strict() -> None:
+    request = ModelRequest(purpose="test", messages=[])
+    assert request.tools is None
+    assert request.tool_choice == "auto"
+    assert request.stream is False
+    assert request.cache_breakpoints == []
+    assert _response("p").tool_calls == []
+    assert ModelCapabilities(structured_output=True).provider_family == ""
+    assert ModelCapabilities(structured_output=True).tool_calling is False
+    assert ChatMessage(role="tool", content="result", tool_call_id="c1").role == "tool"
+    with pytest.raises(ValidationError):
+        ToolDefinition(name="x", description="x", parameters={}, unexpected=True)
+    with pytest.raises(ValidationError):
+        ToolCall(id="c1", name="x", arguments={}, unexpected=True)
+
+
+def test_openai_payload_includes_tools_choice_parallel_and_stream() -> None:
+    provider = _openai_provider()
+    tool = ToolDefinition(
+        name="read",
+        description="read a file",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+    request = ModelRequest(
+        purpose="tools",
+        messages=[
+            ChatMessage(role="system", content="system"),
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="c1", name="read", arguments={"path": "/etc/hosts"})],
+            ),
+            ChatMessage(role="tool", content="contents", tool_call_id="c1"),
+        ],
+        tools=[tool],
+        tool_choice="read",
+        stream=True,
+    )
+    payload = provider._build_payload(request, repair_notice=None)
+    assert payload["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "read a file",
+                "parameters": tool.parameters,
+            },
+        }
+    ]
+    assert payload["tool_choice"] == {"type": "function", "function": {"name": "read"}}
+    assert payload["parallel_tool_calls"] is True
+    assert payload["stream"] is True
+    assert payload["messages"][1]["tool_calls"][0]["function"]["arguments"] == json.dumps(
+        {"path": "/etc/hosts"}
+    )
+    assert payload["messages"][2] == {
+        "role": "tool",
+        "content": "contents",
+        "tool_call_id": "c1",
+    }
+    plain = provider._build_payload(_openai_request(), repair_notice=None)
+    for key in ("tools", "tool_choice", "parallel_tool_calls", "stream"):
+        assert key not in plain
+    assert "response_format" not in plain
+
+
+def test_openai_payload_keeps_strict_json_schema_with_tools() -> None:
+    provider = _openai_provider()
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    payload = provider._build_payload(
+        _openai_request(json_schema=schema, schema_name="answer", tools=[ToolDefinition(name="x")]),
+        repair_notice=None,
+    )
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "answer", "strict": True, "schema": schema},
+    }
+
+
+def test_openai_parse_tool_calls_with_null_content_and_bad_arguments() -> None:
+    provider = _openai_provider()
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"q": "x"}'},
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "bad", "arguments": "not json"},
+                        },
+                    ],
+                }
+            }
+        ]
+    }
+    text, structured, calls = provider._parse_response(data, _openai_request())
+    assert text == ""
+    assert structured is None
+    assert calls == [
+        ToolCall(id="call_1", name="lookup", arguments={"q": "x"}),
+        ToolCall(id="call_2", name="bad", arguments={"_raw": "not json"}),
+    ]
+
+
+def test_openai_generate_parses_tool_calls_usage_and_request_id(monkeypatch) -> None:
+    body = _json_body(
+        {
+            "id": "chatcmpl-1",
+            "model": "test-model",
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_7",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+        }
+    )
+    calls = _fake_urlopen(monkeypatch, body=body, headers={"x-request-id": "req-1"})
+    response = _openai_provider().generate(_openai_request())
+    assert response.tool_calls == [ToolCall(id="call_7", name="lookup", arguments={"q": "x"})]
+    assert response.provider_request_id == "req-1"
+    assert response.usage.prompt_tokens == 10
+    assert response.usage.completion_tokens == 4
+    assert response.usage.total_tokens == 14
+    assert calls[0].full_url.endswith("/chat/completions")
+    assert calls[0].get_header("Accept") == "application/json"
+    assert "fake-openai-key" not in json.dumps(response.model_dump(mode="json"))
+
+
+def test_openai_sse_stream_assembles_text_tools_usage_and_stops_at_done(monkeypatch) -> None:
+    lines = _sse(
+        {"id": "chatcmpl-sse", "model": "test-model", "choices": [{"delta": {"content": "Hel"}}]},
+        {"choices": [{"delta": {"content": "lo"}}]},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_9",
+                                "type": "function",
+                                "function": {"name": "get_", "arguments": ""},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"name": "weather", "arguments": '{"city":'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": '"Paris"}'}}
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            "choices": [],
+        },
+    )
+    lines.append(b"data: [DONE]\n\n")
+    lines.extend(_sse({"choices": [{"delta": {"content": "AFTER_DONE"}}]}))
+    calls = _fake_urlopen(monkeypatch, lines=lines, headers={"x-request-id": "req-sse"})
+    response = _openai_provider().generate(_openai_request(stream=True))
+    assert response.text == "Hello"
+    assert "AFTER_DONE" not in response.text
+    assert response.tool_calls == [
+        ToolCall(id="call_9", name="get_weather", arguments={"city": "Paris"})
+    ]
+    assert response.usage.prompt_tokens == 7
+    assert response.usage.completion_tokens == 3
+    assert response.provider_request_id == "req-sse"
+    sent = json.loads(calls[0].data.decode("utf-8"))
+    assert sent["stream"] is True
+    assert calls[0].get_header("Accept") == "text/event-stream"
+
+
+def test_openai_sse_stream_is_bounded(monkeypatch) -> None:
+    huge = b"data: " + b"x" * 70_000 + b"\n\n"
+    _fake_urlopen(monkeypatch, lines=[huge])
+    with pytest.raises(ModelError) as raised:
+        _openai_provider().generate(_openai_request(stream=True))
+    assert raised.value.error_class == "protocol"
+    assert raised.value.retryable is False
+
+
+def test_capability_manifests_report_only_implemented_features() -> None:
+    openai = _openai_provider()
+    caps = openai.capabilities()
+    assert caps.streaming is True
+    assert caps.tool_calling is True
+    assert caps.parallel_tool_calls is True
+    assert caps.provider_family == "openai_compatible"
+    # Buffered SSE via generate(stream=True) is not the incremental-chunk protocol.
+    assert not hasattr(openai, "stream")
+
+    anthropic = AnthropicProvider(model="claude-test", api_key="fake-anthropic-key")
+    anthropic_caps = anthropic.capabilities()
+    assert anthropic_caps.tool_calling is True
+    assert anthropic_caps.prompt_caching is True
+    assert anthropic_caps.streaming is False
+    assert anthropic_caps.parallel_tool_calls is False
+    assert anthropic_caps.provider_family == "anthropic"
+
+    gemini = GeminiProvider(model="gemini-test", api_key="fake-gemini-key")
+    gemini_caps = gemini.capabilities()
+    assert gemini_caps.tool_calling is True
+    assert gemini_caps.streaming is False
+    assert gemini_caps.prompt_caching is False
+    assert gemini_caps.provider_family == "gemini"
+
+
+def test_anthropic_tool_use_and_cache_control(monkeypatch) -> None:
+    body = _json_body(
+        {
+            "id": "msg_1",
+            "model": "claude-test",
+            "stop_reason": "tool_use",
+            "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "/etc/hosts"}},
+            ],
+            "usage": {"input_tokens": 11, "output_tokens": 5},
+        }
+    )
+    calls = _fake_urlopen(monkeypatch, body=body)
+    provider = AnthropicProvider(model="claude-test", api_key="anthropic-fake-secret")
+    request = ModelRequest(
+        purpose="tools",
+        messages=[
+            ChatMessage(role="system", content="You are helpful."),
+            ChatMessage(role="user", content="check"),
+        ],
+        tools=[
+            ToolDefinition(
+                name="read", description="read a file", parameters={"type": "object"}
+            )
+        ],
+        cache_breakpoints=[0],
+    )
+    response = provider.generate(request)
+    assert response.text == "Let me check."
+    assert response.tool_calls == [
+        ToolCall(id="toolu_1", name="read", arguments={"path": "/etc/hosts"})
+    ]
+    assert response.usage.prompt_tokens == 11
+    assert response.usage.completion_tokens == 5
+    assert response.usage.total_tokens == 16
+    assert response.provider_request_id == "msg_1"
+    assert calls[0].full_url.endswith("/v1/messages")
+    assert calls[0].get_header("X-api-key") == "anthropic-fake-secret"
+    assert calls[0].get_header("Anthropic-version") == "2023-06-01"
+    sent = json.loads(calls[0].data.decode("utf-8"))
+    assert sent["system"] == [
+        {
+            "type": "text",
+            "text": "You are helpful.",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    assert sent["tools"] == [
+        {
+            "name": "read",
+            "description": "read a file",
+            "input_schema": {"type": "object"},
+        }
+    ]
+    assert "anthropic-fake-secret" not in json.dumps(response.model_dump(mode="json"))
+
+    # Without requested breakpoints there is no cache_control block.
+    plain = provider._build_payload(
+        ModelRequest(
+            purpose="plain",
+            messages=[ChatMessage(role="system", content="sys"), ChatMessage(role="user", content="hi")],
+        ),
+        repair_notice=None,
+    )
+    assert plain["system"] == "sys"
+
+
+def test_anthropic_stream_request_is_refused_not_downgraded(monkeypatch) -> None:
+    provider = AnthropicProvider(model="claude-test", api_key="fake")
+    calls = _fake_urlopen(monkeypatch, body=_json_body({"content": []}))
+    with pytest.raises(ModelError) as raised:
+        provider.generate(_openai_request(stream=True))
+    assert raised.value.error_class == "unsupported"
+    assert calls == []
+
+
+def test_gemini_function_call_parsing(monkeypatch) -> None:
+    body = _json_body(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "Here:"},
+                            {"functionCall": {"name": "lookup", "args": {"q": "x"}}},
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7,
+            },
+            "modelVersion": "gemini-test",
+        }
+    )
+    calls = _fake_urlopen(monkeypatch, body=body)
+    provider = GeminiProvider(model="models/gemini-test", api_key="gemini-fake-secret")
+    request = ModelRequest(
+        purpose="tools",
+        messages=[
+            ChatMessage(role="system", content="system"),
+            ChatMessage(role="user", content="find x"),
+        ],
+        tools=[ToolDefinition(name="lookup", description="look up", parameters={"type": "object"})],
+    )
+    response = provider.generate(request)
+    assert response.text == "Here:"
+    assert response.tool_calls == [
+        ToolCall(id="gemini_call_1", name="lookup", arguments={"q": "x"})
+    ]
+    assert response.usage.prompt_tokens == 5
+    assert response.usage.completion_tokens == 2
+    assert response.usage.total_tokens == 7
+    assert calls[0].full_url.endswith("/models/gemini-test:generateContent")
+    assert calls[0].get_header("X-goog-api-key") == "gemini-fake-secret"
+    sent = json.loads(calls[0].data.decode("utf-8"))
+    assert sent["tools"] == [
+        {
+            "functionDeclarations": [
+                {
+                    "name": "lookup",
+                    "description": "look up",
+                    "parameters": {"type": "object"},
+                }
+            ]
+        }
+    ]
+    assert sent["systemInstruction"] == {"parts": [{"text": "system"}]}
+    assert "gemini-fake-secret" not in json.dumps(response.model_dump(mode="json"))
+
+
+def test_gemini_unimplemented_options_are_refused(monkeypatch) -> None:
+    provider = GeminiProvider(model="gemini-test", api_key="fake")
+    calls = _fake_urlopen(monkeypatch, body=_json_body({"candidates": []}))
+    with pytest.raises(ModelError) as streamed:
+        provider.generate(_openai_request(stream=True))
+    assert streamed.value.error_class == "unsupported"
+    with pytest.raises(ModelError) as cached:
+        provider.generate(_openai_request(cache_breakpoints=[0]))
+    assert cached.value.error_class == "unsupported"
+    assert calls == []
+
+
+def test_cli_manifest_reports_capability_values_not_placeholders(tmp_path: Path, monkeypatch) -> None:
+    code, payload, _ = _cli(["model", "list"], tmp_path, monkeypatch)
+    assert code == 0
+    chat = payload["interfaces"]["chat_model"]
+    assert chat["streaming"] is True
+    assert chat["tool_calling"] is True
+    assert chat["parallel_tool_calls"] is True
+    assert chat["provider_family"] == "openai_compatible"
+    assert "declared_by_adapter" not in json.dumps(payload)

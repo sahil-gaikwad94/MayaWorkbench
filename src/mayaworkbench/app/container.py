@@ -142,6 +142,7 @@ class Services:
     workspace_service: "WorkspaceService"
     skills: SkillsService
     task_service: TaskService
+    reproduction_service: "ReproductionService"
 
     @classmethod
     def open(
@@ -408,6 +409,20 @@ class Services:
             claims=claims,
             verification=verification_service,
         )
+        from mayaworkbench.research.reproduction_service import ReproductionService
+
+        reproduction_service = ReproductionService(
+            artifacts=artifacts,
+            events=events,
+            runs=workflow_runs,
+            tasks=task_store,
+            claims=claims,
+            mappings=mappings,
+            diffs=task_diffs,
+            verification=verification_service,
+            experiments=experiment_service,
+            workspaces=execution_workspaces,
+        )
         return cls(
             paths=paths,
             settings=settings,
@@ -467,6 +482,7 @@ class Services:
             workspace_service=workspace_service,
             skills=skills,
             task_service=task_service,
+            reproduction_service=reproduction_service,
         )
 
     # Short aliases used by the worker/agent layer; the dataclass fields keep
@@ -514,6 +530,10 @@ class Services:
     @property
     def memory(self) -> MemoryService:
         return self.memory_service
+
+    @property
+    def reproduction(self) -> "ReproductionService":
+        return self.reproduction_service
 
     @property
     def skill_service(self) -> SkillsService:

@@ -1,0 +1,102 @@
+{
+  "case_id": "causal_attention_seed",
+  "title": "Causal attention: method, requirement, result and unknown",
+  "paper_excerpt": "# Abstract\n\nWe introduce a causal self-attention mask that must prevent a position from attending to future positions.\n\n# 2 Method\n\n## 2.1 Masking\n\nFor a sequence of length n we compute scaled scores and we apply a triangular mask with torch.triu before the softmax. Blocked positions receive negative infinity.\n\nThis constraint is enforced with masked_fill on the scaled dot-product scores.\n\n## 2.2 Complexity\n\nThe method keeps the O(n^2) score matrix and therefore does not change asymptotic complexity.\n\n# 3 Experiments\n\nWe use the WikiText-103 dataset with 4 NVIDIA A100 GPUs for 40 epochs and we evaluate top-1 accuracy.\n\n# 4 Limitations\n\nThe paper does not state how padding interacts with the causal mask.",
+  "claims": [
+    {
+      "id": "seed-triangular-mask",
+      "statement_fragments": [
+        "For a sequence of length n we compute scaled scores and we apply a triangular mask with torch.triu before the softmax.",
+        "Blocked positions receive negative infinity."
+      ],
+      "kind": "PAPER_METHOD",
+      "source_quote": "For a sequence of length n we compute scaled scores and we apply a triangular mask with torch.triu before the softmax.",
+      "required": true
+    },
+    {
+      "id": "seed-masked-fill",
+      "statement_fragments": [
+        "This constraint is enforced with masked_fill on the scaled dot-product scores."
+      ],
+      "kind": "PAPER_METHOD",
+      "source_quote": "This constraint is enforced with masked_fill on the scaled dot-product scores.",
+      "required": true
+    },
+    {
+      "id": "seed-no-future-positions",
+      "statement_fragments": [
+        "We introduce a causal self-attention mask that must prevent a position from attending to future positions."
+      ],
+      "kind": "REPRODUCTION_REQUIREMENT",
+      "source_quote": "We introduce a causal self-attention mask that must prevent a position from attending to future positions.",
+      "required": true
+    },
+    {
+      "id": "seed-complexity-unchanged",
+      "statement_fragments": [
+        "The method keeps the O(n^2) score matrix and therefore does not change asymptotic complexity."
+      ],
+      "kind": "REPRODUCTION_REQUIREMENT",
+      "source_quote": "The method keeps the O(n^2) score matrix and therefore does not change asymptotic complexity.",
+      "required": true
+    },
+    {
+      "id": "seed-top1-result",
+      "statement_fragments": [
+        "We use the WikiText-103 dataset with 4 NVIDIA A100 GPUs for 40 epochs and we evaluate top-1 accuracy."
+      ],
+      "kind": "PAPER_RESULT",
+      "source_quote": "We use the WikiText-103 dataset with 4 NVIDIA A100 GPUs for 40 epochs and we evaluate top-1 accuracy.",
+      "required": true
+    },
+    {
+      "id": "seed-padding-unknown",
+      "statement_fragments": [
+        "The paper does not state how padding interacts with the causal mask."
+      ],
+      "kind": "VALIDATION_CLAIM",
+      "source_quote": "The paper does not state how padding interacts with the causal mask.",
+      "required": true
+    }
+  ],
+  "mappings": [
+    {
+      "claim_id": "seed-triangular-mask",
+      "expected_status": "PRESENT",
+      "relevant_paths": ["attention.py"],
+      "uncertain": false
+    },
+    {
+      "claim_id": "seed-masked-fill",
+      "expected_status": "PRESENT",
+      "relevant_paths": ["attention.py"],
+      "uncertain": false
+    },
+    {
+      "claim_id": "seed-no-future-positions",
+      "expected_status": "PRESENT",
+      "relevant_paths": ["attention.py"],
+      "uncertain": false
+    },
+    {
+      "claim_id": "seed-complexity-unchanged",
+      "expected_status": "PARTIAL",
+      "relevant_paths": ["attention.py"],
+      "uncertain": false
+    },
+    {
+      "claim_id": "seed-top1-result",
+      "expected_status": "ABSENT",
+      "relevant_paths": [],
+      "uncertain": false
+    },
+    {
+      "claim_id": "seed-padding-unknown",
+      "expected_status": "UNCERTAIN",
+      "relevant_paths": ["attention.py"],
+      "uncertain": true
+    }
+  ],
+  "provenance": "Internal seed corpus for the offline R2I evaluator, hand-labelled from this repository's own fixtures: tests/conftest.py::PAPER_MD (verbatim paper quotes) and tests/conftest.py::ATTENTION_PY (torch.triu, masked_fill and the causal-mask docstring). It is NOT an external benchmark and its scores are not a claim about model or system quality.",
+  "is_seed_corpus": true
+}

@@ -58,6 +58,7 @@ def oci_env(tmp_path, monkeypatch):
         tmp_path / "workspace",
         tmp_path / "run-home",
         policy,
+        verified=True,  # the fake OCI client stands in for a smoke-verified host
         tool="podman",
         image="python:3.12-slim",
     )
@@ -72,11 +73,44 @@ def test_rootless_backend_capabilities_are_verified(oci_env):
     assert capabilities.limits["file_size"].status == "unsupported"
 
 
-def test_rootless_backend_provision_creates_a_writable_overlay(oci_env):
+def test_unverified_backend_never_claims_enforcement_or_provisions(tmp_path, monkeypatch):
+    _fake_podman(tmp_path)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(
+        backends, "_cgroup_controllers", lambda: ({"pids", "memory", "cpu"}, None)
+    )
+    policy = CommandPolicy(
+        profile="CPU_SMOKE",
+        network_policy="DENY_BY_DEFAULT",
+        dependency_policy="DENY",
+        max_processes=8,
+    )
+    backend = RootlessContainerBackend(tmp_path, tmp_path / "home", policy)
+    caps = backend.capabilities()
+    assert caps.available is False
+    assert "not been verified" in " ".join(caps.reasons)
+    for name in ("cpu", "memory", "process_count"):
+        assert caps.limits[name].status != "enforced"
+        assert caps.limits[name].mechanism is None
+    with pytest.raises(RuntimeUnavailable):
+        backend.provision()
+
+
+def test_rootless_backend_provision_creates_a_populated_writable_overlay(oci_env):
+    source = oci_env.workspace
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    (source / "secret.env").write_text("MAYA_MODEL_API_KEY=sk-canary\n", encoding="utf-8")
+    (source / ".git").mkdir()
+    (source / ".git" / "config").write_text("git metadata", encoding="utf-8")
     runtime = oci_env.provision()
     assert runtime.backend == "rootless-container"
     assert runtime.overlay.is_dir()
     assert runtime.overlay.name == "work"
+    # The file tools and the container command see the same populated tree.
+    assert (runtime.overlay / "app.py").read_text(encoding="utf-8") == "print('hello')\n"
+    assert not (runtime.overlay / "secret.env").exists()
+    assert not (runtime.overlay / ".git").exists()
 
 
 def test_rootless_exec_uses_isolated_oci_flags(oci_env):

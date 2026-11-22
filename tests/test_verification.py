@@ -368,7 +368,12 @@ def test_ml_invariant_that_cannot_run_is_skipped_not_passed(
     report, checks = services.task_service.verify_run(run.run.id, include_review=False)
     invariant = next(item for item in checks if item.key.startswith("invariant."))
     assert invariant.outcome == CheckOutcome.SKIPPED, (invariant.summary, invariant.details)
-    assert "torch" in invariant.summary.lower()
+    # Assert the stable contract, not a host-dependent message substring. Whether
+    # torch is installed changes *why* this cannot run ("torch is not importable"
+    # vs. "factory could not be called"), but never the verdict: a check that
+    # cannot produce a verdict is SKIPPED, verification is INCONCLUSIVE and the
+    # acceptance criterion stays UNVERIFIED.
+    assert invariant.summary.strip()
     assert report.decision == TaskDecision.INCONCLUSIVE
     assert report.criteria[0].status.value == "UNVERIFIED"
 

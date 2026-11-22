@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from mayaworkbench.errors import ConfigError
 
 DataPolicy = Literal["LOCAL_ONLY", "BYOK_REMOTE_MODEL"]
-ModelProviderKind = Literal["none", "openai_compatible"]
+ModelProviderKind = Literal["none", "openai_compatible", "anthropic", "gemini"]
 
 SETTINGS_SCHEMA_VERSION = "1"
 

@@ -41,6 +41,7 @@ from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.stores import EventStore, RunStore
 from mayaworkbench.tasks.agent import AgentOutcome
 from mayaworkbench.tasks.inloop import FeedbackRound, repair_payload
+from mayaworkbench.tasks.parallel import parallel_payloads
 from mayaworkbench.tasks.roles import (
     REVIEWER_CONTEXT,
     AgentRole,
@@ -173,6 +174,18 @@ class RepairGuard:
         self.entries.append(attempt.model_dump(mode="json"))
 
 
+#: Roles that may never be computed in a worker thread. The implementer has
+#: side effects; the reviewer and release coordinator need sequential patch
+#: capture and the ordered artifact manifest.
+_SEQUENTIAL_ROLES = frozenset(
+    {
+        AgentRole.IMPLEMENTER,
+        AgentRole.INDEPENDENT_REVIEWER,
+        AgentRole.RELEASE_COORDINATOR,
+    }
+)
+
+
 def role_plan_enabled(run: WorkflowRun) -> bool:
     """Read the contract flag from run details (default off: old path unchanged)."""
     return bool(run.details.get("use_role_plan", False))
@@ -242,6 +255,11 @@ class RoleOrchestrator:
 
         completed = list(current.details.get("role_plan_completed") or [])
         artifacts_meta = list(current.details.get("role_artifacts") or [])
+
+        # Opt-in only: the default path stays byte-for-byte the sequential walk.
+        if current.details.get("role_plan_parallel") is True:
+            return self._run_parallel(current, completed, artifacts_meta)
+
         implementation_outcome: AgentOutcome | None = None
 
         for step in self.plan.steps:
@@ -281,6 +299,133 @@ class RoleOrchestrator:
             self._event(step, artifact)
             if self.step_observer is not None:
                 self.step_observer(step.step_id)
+
+        if implementation_outcome is not None:
+            return implementation_outcome
+        return AgentOutcome(
+            state=WorkflowState.REVIEWING,
+            summary=(
+                "All deterministic role steps completed; this task template has no "
+                "model-driven implementer step."
+            ),
+            limitations=[
+                "No model-driven implementation was requested for this task type; "
+                "verification remains authoritative."
+            ],
+            steps=current.step_count,
+            tool_calls=current.tool_call_count,
+            tokens=current.model_tokens,
+            cost_usd=current.model_cost_usd,
+        )
+
+    # ------------------------------------------------------- parallel walk
+    def _parallel_group(
+        self,
+        steps: list[RoleInvocation],
+        start: int,
+        completed: list[str],
+    ) -> list[RoleInvocation]:
+        """Maximal contiguous run of pending, dependency-free read-only steps."""
+        group: list[RoleInvocation] = []
+        for step in steps[start:]:
+            if step.step_id in completed:
+                break
+            if step.role in _SEQUENTIAL_ROLES:
+                break
+            if any(dep not in completed for dep in step.dependencies):
+                break
+            group.append(step)
+        return group
+
+    def _run_parallel(
+        self,
+        current: WorkflowRun,
+        completed: list[str],
+        artifacts_meta: list[dict[str, Any]],
+    ) -> AgentOutcome:
+        """Opt-in walk: compute read-only payloads in parallel, publish in order.
+
+        Only payload computation happens off-thread. Every write (artifacts,
+        details, events, observer) is performed here on the main thread, in the
+        original plan order, so idempotency and ledger ordering are unchanged.
+        """
+        implementation_outcome: AgentOutcome | None = None
+        steps = self.plan.steps
+        index = 0
+        while index < len(steps):
+            live = self.runs.get(self.run_id)
+            if live.cancel_requested:
+                return self._control_outcome(WorkflowState.CANCELLED, "cancelled")
+            if live.pause_requested:
+                return self._control_outcome(WorkflowState.PAUSED, "paused")
+            step = steps[index]
+            if step.step_id in completed:
+                # Idempotency: a resumed run never re-emits a finished handoff.
+                index += 1
+                continue
+
+            group = self._parallel_group(steps, index, completed)
+            if len(group) >= 2:
+                # Workers receive a frozen manifest snapshot, never a mutable
+                # shared object, and never touch SQLite/artifacts/events.
+                manifest_snapshot = tuple(dict(item) for item in artifacts_meta)
+
+                def compute(candidate: RoleInvocation) -> dict[str, Any]:
+                    return self._deterministic_payload(candidate, list(manifest_snapshot))
+
+                results = parallel_payloads(group, compute)
+                for (_position, payload, error), candidate in zip(results, group):
+                    if error is not None:
+                        artifact = RoleArtifact(
+                            step_id=candidate.step_id,
+                            role=candidate.role,
+                            output_artifact=candidate.output_artifact,
+                            produced_by="orchestrator",
+                            state=StepState.FAILED,
+                            terminal_reason=f"parallel_payload_error: {error}",
+                            input_hashes=dict(candidate.input_hashes),
+                            evidence={"payload_error": error},
+                            context_sources=list(candidate.context_sources),
+                            model_label=candidate.model_label,
+                            authority=candidate.authority,
+                        )
+                    else:
+                        artifact = self._deterministic_artifact(candidate, payload)
+                    artifacts_meta.append(artifact.model_dump(mode="json"))
+                    completed.append(candidate.step_id)
+                    self._write_details(live, completed, artifacts_meta)
+                    self._event(candidate, artifact)
+                    if self.step_observer is not None:
+                        self.step_observer(candidate.step_id)
+                index += len(group)
+                continue
+
+            unmet = [dep for dep in step.dependencies if dep not in completed]
+            if unmet:
+                return AgentOutcome(
+                    state=WorkflowState.BLOCKED,
+                    summary="Role plan dependency was not satisfied.",
+                    limitations=[f"Step {step.step_id} waits for: {', '.join(unmet)}."],
+                    error="role_plan_dependency_unmet",
+                    steps=live.step_count,
+                    tool_calls=live.tool_call_count,
+                    tokens=live.model_tokens,
+                    cost_usd=live.model_cost_usd,
+                )
+
+            artifact, agent_outcome = self._execute_step(step, artifacts_meta)
+            if agent_outcome is not None:
+                implementation_outcome = agent_outcome
+                if agent_outcome.state != WorkflowState.REVIEWING:
+                    return agent_outcome
+
+            artifacts_meta.append(artifact.model_dump(mode="json"))
+            completed.append(step.step_id)
+            self._write_details(live, completed, artifacts_meta)
+            self._event(step, artifact)
+            if self.step_observer is not None:
+                self.step_observer(step.step_id)
+            index += 1
 
         if implementation_outcome is not None:
             return implementation_outcome
@@ -371,6 +516,14 @@ class RoleOrchestrator:
         if step.role in {AgentRole.INDEPENDENT_REVIEWER, AgentRole.RELEASE_COORDINATOR}:
             self._ensure_patch_captured()
         payload = self._deterministic_payload(step, artifacts_meta)
+        return self._deterministic_artifact(step, payload), None
+
+    def _deterministic_artifact(
+        self,
+        step: RoleInvocation,
+        payload: dict[str, Any],
+    ) -> RoleArtifact:
+        """Build and store the handoff for one computed deterministic payload."""
         text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
         stored = self.artifacts.put_text(
             text,
@@ -379,7 +532,7 @@ class RoleOrchestrator:
             created_by=f"orchestrator:{step.role.value}",
         )
         output_hashes = {"artifact": stored.sha256}
-        artifact = RoleArtifact(
+        return RoleArtifact(
             step_id=step.step_id,
             role=step.role,
             output_artifact=step.output_artifact,
@@ -394,7 +547,6 @@ class RoleOrchestrator:
             model_label=step.model_label,
             authority=step.authority,
         )
-        return artifact, None
 
     # -------------------------------------------------------- deterministic
     def _deterministic_payload(

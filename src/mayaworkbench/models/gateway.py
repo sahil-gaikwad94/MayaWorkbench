@@ -11,6 +11,7 @@ The gateway is the only path from workbench code to a model provider. It:
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 
@@ -43,7 +44,49 @@ class ModelStatus(BaseModel):
     timeout_seconds: int
 
 
+#: Provider-specific key variables. A user-set ``api_key_env`` always wins.
+_PROVIDER_KEY_ENV = {
+    "anthropic": "MAYA_ANTHROPIC_API_KEY",
+    "gemini": "MAYA_GEMINI_API_KEY",
+}
+_PROVIDER_BASE_URL = {
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+}
+_OPENAI_DEFAULT_URL = "https://api.openai.com/v1"
+
+
+def provider_key_env(settings: Settings) -> str:
+    """Resolve the key variable for the configured provider (never the value)."""
+    kind = settings.model.provider
+    default = _PROVIDER_KEY_ENV.get(kind, settings.model.api_key_env)
+    if settings.model.api_key_env != "MAYA_MODEL_API_KEY":
+        return settings.model.api_key_env
+    return default
+
+
 def _default_factory(settings: Settings) -> ModelProvider:
+    kind = settings.model.provider
+    if kind in _PROVIDER_KEY_ENV:
+        from mayaworkbench.models.anthropic_adapter import AnthropicProvider
+        from mayaworkbench.models.gemini_adapter import GeminiProvider
+
+        adapter = AnthropicProvider if kind == "anthropic" else GeminiProvider
+        key_env = provider_key_env(settings)
+        base_url = settings.model.base_url
+        if base_url == _OPENAI_DEFAULT_URL:
+            base_url = _PROVIDER_BASE_URL[kind]
+        return adapter(
+            model=settings.model.model,
+            base_url=base_url,
+            api_key_env=key_env,
+            timeout_seconds=settings.model.timeout_seconds,
+            max_output_tokens=settings.model.max_output_tokens,
+            temperature=settings.model.temperature,
+            max_retries=settings.model.max_retries,
+            input_cost_per_mtok=settings.model.input_cost_per_mtok,
+            output_cost_per_mtok=settings.model.output_cost_per_mtok,
+        )
     api_key = api_key_from_env(settings)
     if api_key is None:
         raise ModelError(
@@ -80,7 +123,10 @@ class ModelGateway:
     # -------------------------------------------------------------------- state
     def status(self) -> ModelStatus:
         model = self.settings.model
-        key_present = api_key_from_env(self.settings) is not None
+        key_env = provider_key_env(self.settings)
+        key_present = bool(os.environ.get(key_env)) if key_env != model.api_key_env else (
+            api_key_from_env(self.settings) is not None
+        )
         reason: str | None = None
         callable_ = True
         if model.provider == "none":
@@ -97,7 +143,7 @@ class ModelGateway:
             reason = "no model name configured"
         elif not key_present:
             callable_ = False
-            reason = f"no API key in ${model.api_key_env}"
+            reason = f"no API key in ${key_env}"
         return ModelStatus(
             provider=model.provider,
             model=model.model,

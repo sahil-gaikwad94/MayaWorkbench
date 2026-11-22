@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import json
+import tarfile
 
 import pytest
 
+from mayaworkbench.experiments.bundle import (
+    sign_run_bundle,
+    verify_run_bundle,
+    write_run_bundle,
+)
+from mayaworkbench.experiments.protocol import canonical_sha256
 from mayaworkbench.verification.attestation import (
     sign_bundle,
     verify_attestation,
@@ -106,3 +115,117 @@ def test_tampered_manifest_root_is_detected(tmp_path):
     assert result["ok"] is False
     assert "different manifest root" in result["error"]
     assert verify_bundle(target).ok is False
+
+
+# --------------------------------------------------- portable runner bundles
+#
+# Runner bundles use the same attestation helpers through the bundle module.
+# These tests stay at the bundle layer (no service fixtures) so the signing,
+# keyed verification and fail-closed behaviour are deterministic.
+
+
+def _run_bundle(tmp_path, name: str, marker: str):
+    payload = {"marker": marker, "seeds": [1]}
+    definition = {
+        "content_payload": payload,
+        "content_sha256": canonical_sha256(payload),
+        "kind": "SINGLE",
+    }
+    target = tmp_path / f"{name}.tar.gz"
+    return write_run_bundle(
+        target, definition, [], [], {}, {}, {}, "", {}
+    ).path
+
+
+def _run_members(path):
+    out: dict[str, bytes] = {}
+    with tarfile.open(path, "r:gz") as archive:
+        for member in archive.getmembers():
+            if member.isfile():
+                handle = archive.extractfile(member)
+                assert handle is not None
+                out[member.name] = handle.read()
+    return out
+
+
+def _run_retar(path, members):
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, data in sorted(members.items()):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(data)
+            info.mtime = 0
+            info.mode = 0o644
+            archive.addfile(info, io.BytesIO(data))
+    path.write_bytes(gzip.compress(raw.getvalue(), compresslevel=9, mtime=0))
+    return path
+
+
+def test_run_bundle_sign_then_keyed_verify(tmp_path):
+    bundle = _run_bundle(tmp_path, "runner", "alpha")
+    assert verify_run_bundle(bundle).ok
+    assert "attestation.json" not in _run_members(bundle)
+
+    before = _run_members(bundle)
+    assert sign_run_bundle(bundle, key="runner-key") == bundle
+    after = _run_members(bundle)
+    assert {name: data for name, data in after.items() if name != "attestation.json"} == before
+    envelope_text = after["attestation.json"].decode("utf-8")
+    assert "runner-key" not in envelope_text
+    assert "key_id" in envelope_text
+
+    verified = verify_run_bundle(bundle, key="runner-key")
+    assert verified.ok, verified.errors
+    assert verified.attestation_present is True
+    assert verified.attestation_level == "SIGNED_BY_USER"
+    assert verified.attestation_verified is True
+
+    # Without a key the envelope level is reported structurally, but no
+    # verification is ever claimed.
+    unchecked = verify_run_bundle(bundle)
+    assert unchecked.ok, unchecked.errors
+    assert unchecked.attestation_level == "SIGNED_BY_USER"
+    assert unchecked.attestation_verified is False
+
+
+def test_run_bundle_wrong_key_fails_verification(tmp_path):
+    bundle = _run_bundle(tmp_path, "runner", "alpha")
+    sign_run_bundle(bundle, key="runner-key")
+    result = verify_run_bundle(bundle, key="wrong-key")
+    assert result.ok is False
+    assert result.attestation_verified is False
+    assert any("attestation verification failed" in item for item in result.errors)
+
+
+def test_run_bundle_swapped_envelope_and_tampered_manifest_fail(tmp_path):
+    first = _run_bundle(tmp_path, "first", "alpha")
+    second = _run_bundle(tmp_path, "second", "beta")
+    sign_run_bundle(first, key="runner-key")
+    envelope = _run_members(first)["attestation.json"]
+
+    swapped_members = _run_members(second)
+    swapped_members["attestation.json"] = envelope
+    swapped = _run_retar(tmp_path / "swapped.tar.gz", swapped_members)
+    swapped_result = verify_run_bundle(swapped, key="runner-key")
+    assert swapped_result.ok is False
+    assert swapped_result.attestation_verified is False
+    assert any("different manifest root" in item for item in swapped_result.errors)
+
+    # The genuine bundle remains verifiable; only the swapped copy failed.
+    assert verify_run_bundle(first, key="runner-key").attestation_verified is True
+
+    tampered_members = _run_members(first)
+    manifest = json.loads(tampered_members["manifest.json"])
+    manifest["root_sha256"] = "f" * 64
+    tampered_members["manifest.json"] = json.dumps(manifest, indent=2, sort_keys=True).encode()
+    tampered = _run_retar(tmp_path / "tampered.tar.gz", tampered_members)
+    tampered_result = verify_run_bundle(tampered, key="runner-key")
+    assert tampered_result.ok is False
+    assert any("root_sha256" in item for item in tampered_result.errors)
+
+
+def test_sign_run_bundle_fails_closed_on_malformed_archive(tmp_path):
+    broken = tmp_path / "broken.tar.gz"
+    broken.write_bytes(b"not a gzip archive")
+    with pytest.raises(Exception, match="Cannot sign run bundle"):
+        sign_run_bundle(broken, key="runner-key")

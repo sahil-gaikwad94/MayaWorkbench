@@ -99,10 +99,17 @@ class StreamingChatModel(ChatModel, Protocol):
 
 
 def supports_streaming(model: ChatModel) -> bool:
-    """Report streaming only when the flag *and* the method are present."""
-    return bool(model.capabilities().streaming) and callable(
-        getattr(model, "stream", None)
-    )
+    """True when the adapter can actually return a streamed response.
+
+    Both an incremental ``stream()`` method and a bounded buffered SSE mode inside
+    ``generate(stream=True)`` count: the latter still consumes a
+    ``text/event-stream`` response, it just assembles it before returning.
+    """
+    if not model.capabilities().streaming:
+        return False
+    if callable(getattr(model, "stream", None)):
+        return True
+    return bool(getattr(model, "supports_buffered_streaming", False))
 
 
 # --------------------------------------------------------------------------- #

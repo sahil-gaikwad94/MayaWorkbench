@@ -22,13 +22,23 @@ def test_capability_report_never_claims_process_count_enforcement():
         assert container["reasons"]
 
 
-def test_only_local_trusted_profile_is_available():
+def test_available_profiles_reflect_real_enforced_boundaries():
     profiles = probe_execution_capabilities()["trust_profiles"]
     available = {name for name, item in profiles.items() if item["available"]}
-    assert available == {"LOCAL_TRUSTED"}
+    # READ_ONLY_ANALYSIS needs no OS sandbox: the gateway masks tools to a
+    # read-only allowlist and the runner refuses every command before spawn.
+    assert available == {"LOCAL_TRUSTED", "READ_ONLY_ANALYSIS"}
+    assert "read-only capability mask" in profiles["READ_ONLY_ANALYSIS"]["reason"]
     for name, item in profiles.items():
-        if name != "LOCAL_TRUSTED":
-            assert "blocked" in item["reason"]
+        if name not in available:
+            assert (
+                "blocked" in item["reason"]
+                or "user-provided" in item["reason"]
+                or "verified" in item["reason"]
+            )
+    container = profiles["ROOTLESS_CONTAINER"]
+    assert container["available"] is False  # no verified OCI smoke test by default
+    assert "smoke" in container["reason"]
 
 
 def test_runner_doctor_cli_is_machine_readable(tmp_path, capsys):

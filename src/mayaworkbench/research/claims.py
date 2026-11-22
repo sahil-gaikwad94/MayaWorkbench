@@ -30,12 +30,16 @@ from mayaworkbench.config import Settings
 from mayaworkbench.domain.enums import (
     ActorKind,
     ArtifactKind,
+    CitationGranularity,
+    CitationRelation,
     ClaimAuthor,
     ClaimConfidence,
     ClaimExplicitness,
     ClaimKind,
     ClaimReviewStatus,
     ClaimType,
+    DisagreementKind,
+    DisagreementStatus,
     KIND_FOR_LEGACY_CLAIM_TYPE,
     LEGACY_CLAIM_TYPE_FOR_KIND,
     EventType,
@@ -44,10 +48,13 @@ from mayaworkbench.domain.enums import (
     RiskSeverity,
 )
 from mayaworkbench.domain.models import (
+    ClaimCitation,
     ClaimDependency,
+    ClaimMapping,
     ClaimRevision,
     ClaimRiskFactor,
     ClaimTarget,
+    EvidenceDisagreement,
     Project,
     ResearchClaim,
     ResearchDocument,
@@ -84,11 +91,15 @@ from mayaworkbench.research.prompts import build_claim_extraction_messages
 from mayaworkbench.storage.artifacts import ArtifactStore
 from mayaworkbench.storage.db import Database
 from mayaworkbench.storage.stores import (
+    ClaimCitationStore,
+    ClaimMappingStore,
     EventStore,
+    EvidenceDisagreementStore,
     ProjectStore,
     ResearchClaimStore,
     ResearchDocumentStore,
     ResearchExtractionStore,
+    SourceMetadataStore,
     SourcePassageStore,
 )
 from mayaworkbench.version import (
@@ -360,6 +371,8 @@ class ClaimService:
         events: EventStore,
         gateway: ModelGateway,
         settings: Settings,
+        citations: ClaimCitationStore | None = None,
+        disagreements: EvidenceDisagreementStore | None = None,
     ):
         self.db = db
         self.projects = projects
@@ -371,6 +384,12 @@ class ClaimService:
         self.events = events
         self.gateway = gateway
         self.settings = settings
+        # Optional so existing constructors and the composition root stay valid.
+        # The stores are pure views over ``db`` and are built lazily on first use.
+        self._citations = citations
+        self._disagreements = disagreements
+        self._mappings: ClaimMappingStore | None = None
+        self._sources: SourceMetadataStore | None = None
 
     # ------------------------------------------------------------------ queries
     def get(self, claim_id: str) -> ResearchClaim:
@@ -407,6 +426,337 @@ class ClaimService:
             ok, reason = verify_source_location(passage, location)
             results.append((location, ok, reason))
         return results
+
+    # ------------------------------------------------ evidence quality stores
+    @property
+    def citations(self) -> ClaimCitationStore:
+        """Lazy citation store built from the database this service already has."""
+        if self._citations is None:
+            self._citations = ClaimCitationStore(self.db)
+        return self._citations
+
+    @property
+    def disagreements(self) -> EvidenceDisagreementStore:
+        """Lazy disagreement store (append-only resolutions)."""
+        if self._disagreements is None:
+            self._disagreements = EvidenceDisagreementStore(self.db)
+        return self._disagreements
+
+    @property
+    def _mapping_store(self) -> ClaimMappingStore:
+        if self._mappings is None:
+            self._mappings = ClaimMappingStore(self.db)
+        return self._mappings
+
+    @property
+    def _source_store(self) -> SourceMetadataStore:
+        if self._sources is None:
+            self._sources = SourceMetadataStore(self.db)
+        return self._sources
+
+    def _resolve_passage(self, passage: SourcePassage | str) -> SourcePassage:
+        if isinstance(passage, SourcePassage):
+            return passage
+        return self.passages.get(passage)
+
+    # --------------------------------------------------------------- citations
+    def cite(
+        self,
+        claim: ResearchClaim,
+        passage: SourcePassage | str,
+        quote: str,
+        *,
+        granularity: CitationGranularity = CitationGranularity.PASSAGE,
+        relation: CitationRelation = CitationRelation.SUPPORTS,
+        document_version: int | None = None,
+        source_metadata_id: str | None = None,
+        char_start: int | None = None,
+        char_end: int | None = None,
+        supersedes_citation_id: str | None = None,
+        actor: str = "local-user",
+    ) -> ClaimCitation:
+        """Record a citation after verifying its quote verbatim.
+
+        The same ``_verified_location``/``verify_source_location`` authority used
+        for claim source locations decides whether the quote may be stored. A
+        paraphrase is rejected with :class:`CitationError` and never persisted as
+        an "unverified citation".
+        """
+        if claim.document_id is None:
+            raise UsageError(
+                "This claim has no document to cite",
+                hint="Citations pin a quote to an immutable document version.",
+            )
+        document = self.documents.get(claim.document_id)
+        cited_passage = self._resolve_passage(passage)
+        location = self._verified_location(document, cited_passage.id, quote)
+        verified, reason = verify_source_location(cited_passage, location)
+        if not verified:
+            raise CitationError(reason)
+        if source_metadata_id:
+            self._source_store.get(source_metadata_id)
+        if supersedes_citation_id:
+            self.citations.get(supersedes_citation_id)
+        version = document_version if document_version is not None else document.version
+        stored_quote = location.quote
+        if char_start is None or char_end is None:
+            offset = cited_passage.text.find(stored_quote)
+            if offset >= 0:
+                char_start = cited_passage.char_start + offset
+                char_end = char_start + len(stored_quote)
+        if char_start is not None and char_end is not None and char_end < char_start:
+            raise UsageError("char_end must be >= char_start")
+        now = utcnow()
+        citation = ClaimCitation(
+            id="cit_" + new_ulid(),
+            project_id=claim.project_id,
+            claim_id=claim.id,
+            document_id=document.id,
+            document_version=version,
+            source_metadata_id=source_metadata_id,
+            passage_id=cited_passage.id,
+            quote=stored_quote,
+            quote_hash=location.quote_hash,
+            page=cited_passage.page,
+            page_end=cited_passage.page_end,
+            section=location.section or cited_passage.section_path,
+            equation=location.equation or cited_passage.equation_label,
+            char_start=char_start,
+            char_end=char_end,
+            granularity=granularity,
+            relation=relation,
+            confidence=ClaimConfidence.HIGH,
+            verified_at=now,
+            verified_by=actor,
+            supersedes_citation_id=supersedes_citation_id,
+            created_at=now,
+        )
+        with self.db.transaction():
+            self.citations.create(citation)
+            self.events.append(
+                WorkflowEvent(
+                    event_id="evt_" + new_ulid(),
+                    event_type=EventType.CLAIM_CITATION_RECORDED,
+                    project_id=claim.project_id,
+                    entity_type="claim_citation",
+                    entity_id=citation.id,
+                    actor_kind=ActorKind.USER,
+                    actor_name=actor,
+                    payload={
+                        "claim_id": claim.id,
+                        "document_id": citation.document_id,
+                        "document_version": citation.document_version,
+                        "passage_id": citation.passage_id,
+                        "quote_hash": citation.quote_hash,
+                        "granularity": citation.granularity.value,
+                        "relation": citation.relation.value,
+                        "source_metadata_id": source_metadata_id,
+                    },
+                )
+            )
+        return citation
+
+    def list_citations(self, claim_id: str) -> list[ClaimCitation]:
+        return self.citations.list_by_claim(claim_id)
+
+    def verify_citations(self, claim_id: str) -> list[dict[str, Any]]:
+        """Re-check every stored citation quote against the pinned passage."""
+        results: list[dict[str, Any]] = []
+        for citation in self.citations.list_by_claim(claim_id):
+            passage = self.passages.find(citation.passage_id)
+            location = SourceLocation(
+                passage_id=citation.passage_id,
+                quote_hash=citation.quote_hash,
+                page=citation.page,
+                page_end=citation.page_end,
+                section=citation.section,
+                equation=citation.equation,
+                quote=citation.quote,
+            )
+            verified, reason = verify_source_location(passage, location)
+            if verified and passage is not None and passage.document_id != citation.document_id:
+                verified, reason = False, "the passage belongs to another document"
+            if verified:
+                document = self.documents.find(citation.document_id)
+                if document is not None and document.version != citation.document_version:
+                    verified, reason = False, "the document version does not match the citation"
+            results.append(
+                {
+                    "citation_id": citation.id,
+                    "claim_id": citation.claim_id,
+                    "passage_id": citation.passage_id,
+                    "document_id": citation.document_id,
+                    "document_version": citation.document_version,
+                    "quote_hash": citation.quote_hash,
+                    "granularity": citation.granularity.value,
+                    "relation": citation.relation.value,
+                    "verified": verified,
+                    "reason": reason,
+                }
+            )
+        return results
+
+    # ----------------------------------------------------------- disagreements
+    def record_disagreement(
+        self,
+        claim: ResearchClaim,
+        *,
+        kind: DisagreementKind | str,
+        detail: str,
+        paper_quote: str | None = None,
+        passage: SourcePassage | str | None = None,
+        mapping: ClaimMapping | str | None = None,
+        run_id: str | None = None,
+        created_by: str = "local-user",
+    ) -> EvidenceDisagreement:
+        """Record a typed disagreement with at least two evidence anchors.
+
+        Free text alone is refused: a disagreement must be grounded in at least
+        two of a verified paper quote, mapping evidence (id/span) and an
+        experiment run id.
+        """
+        disagreement_kind = DisagreementKind(kind)
+        cleaned_detail = normalize_quote(detail)
+        if not cleaned_detail:
+            raise UsageError("A disagreement needs a non-empty --detail")
+        anchors = 0
+        document_id = claim.document_id
+        passage_id: str | None = None
+        mapping_id: str | None = None
+        if paper_quote is not None:
+            if passage is None:
+                raise UsageError(
+                    "A paper quote needs a --passage-id to verify it",
+                    hint="A free-text-only disagreement is not evidence.",
+                )
+            if claim.document_id is None:
+                raise UsageError("This claim has no document to verify the quote against")
+            document = self.documents.get(claim.document_id)
+            cited_passage = self._resolve_passage(passage)
+            # Raises CitationError on a paraphrase; never stored unverified.
+            self._verified_location(document, cited_passage.id, paper_quote)
+            anchors += 1
+            passage_id = cited_passage.id
+            document_id = document.id
+        if mapping is not None:
+            mapping_id = mapping.id if isinstance(mapping, ClaimMapping) else str(mapping)
+            self._mapping_store.get(mapping_id)
+            anchors += 1
+        if run_id is not None:
+            run_id = str(run_id).strip() or None
+            if run_id is not None:
+                anchors += 1
+        if anchors < 2:
+            raise UsageError(
+                "A disagreement needs at least two evidence anchors",
+                hint="Provide a verified quote + passage, a mapping id, or a run id.",
+            )
+        now = utcnow()
+        disagreement = EvidenceDisagreement(
+            id="dis_" + new_ulid(),
+            project_id=claim.project_id,
+            claim_id=claim.id,
+            document_id=document_id,
+            passage_id=passage_id,
+            mapping_id=mapping_id,
+            run_id=run_id,
+            kind=disagreement_kind,
+            detail=cleaned_detail[:4000],
+            status=DisagreementStatus.OPEN,
+            created_by=created_by,
+            created_at=now,
+        )
+        with self.db.transaction():
+            self.disagreements.create(disagreement)
+            self.events.append(
+                WorkflowEvent(
+                    event_id="evt_" + new_ulid(),
+                    event_type=EventType.CLAIM_DISAGREEMENT_RECORDED,
+                    project_id=claim.project_id,
+                    entity_type="evidence_disagreement",
+                    entity_id=disagreement.id,
+                    actor_kind=ActorKind.USER,
+                    actor_name=created_by,
+                    payload={
+                        "claim_id": claim.id,
+                        "kind": disagreement_kind.value,
+                        "document_id": document_id,
+                        "passage_id": passage_id,
+                        "mapping_id": mapping_id,
+                        "run_id": run_id,
+                        "anchors": anchors,
+                    },
+                )
+            )
+        return disagreement
+
+    def list_disagreements(self, claim_id: str) -> list[EvidenceDisagreement]:
+        return self.disagreements.list_by_claim(claim_id)
+
+    def resolve_disagreement(
+        self,
+        disagreement_id: str,
+        *,
+        status: DisagreementStatus | str,
+        resolution: str,
+        actor: str = "local-user",
+    ) -> EvidenceDisagreement:
+        """Append a resolved/dismissed record; never rewrite the original."""
+        resolved_status = DisagreementStatus(status)
+        if resolved_status not in (
+            DisagreementStatus.RESOLVED,
+            DisagreementStatus.DISMISSED,
+        ):
+            raise UsageError(
+                "A disagreement can only be resolved as RESOLVED or DISMISSED",
+                hint=f"{resolved_status.value} is not a terminal resolution state.",
+            )
+        original = self.disagreements.get(disagreement_id)
+        if original.status is not DisagreementStatus.OPEN:
+            raise ConflictError(
+                f"Disagreement {disagreement_id} is already {original.status.value}"
+            )
+        reason = normalize_quote(resolution)
+        if not reason:
+            raise UsageError("A resolution needs a non-empty --resolution")
+        now = utcnow()
+        record = EvidenceDisagreement(
+            id="dis_" + new_ulid(),
+            project_id=original.project_id,
+            claim_id=original.claim_id,
+            document_id=original.document_id,
+            passage_id=original.passage_id,
+            mapping_id=original.mapping_id,
+            run_id=original.run_id,
+            kind=original.kind,
+            detail=original.detail,
+            status=resolved_status,
+            resolution=reason[:4000],
+            created_by=actor,
+            created_at=now,
+            resolved_at=now,
+            resolved_by=actor,
+        )
+        with self.db.transaction():
+            self.disagreements.append_resolution(record)
+            self.events.append(
+                WorkflowEvent(
+                    event_id="evt_" + new_ulid(),
+                    event_type=EventType.CLAIM_DISAGREEMENT_RESOLVED,
+                    project_id=original.project_id,
+                    entity_type="evidence_disagreement",
+                    entity_id=record.id,
+                    actor_kind=ActorKind.USER,
+                    actor_name=actor,
+                    payload={
+                        "claim_id": original.claim_id,
+                        "supersedes_disagreement_id": original.id,
+                        "status": resolved_status.value,
+                        "resolution": reason[:500],
+                    },
+                )
+            )
+        return record
 
     # --------------------------------------------------------------- extraction
     def extract(

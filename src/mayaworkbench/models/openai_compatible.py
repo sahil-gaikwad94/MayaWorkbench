@@ -9,6 +9,10 @@ Failure handling:
 * 401/403 -> non-retryable ``auth`` error, with no key material in the message;
 * 429/5xx/network -> bounded exponential backoff;
 * malformed structured output -> one repair attempt, then a typed error.
+
+Streaming is opt-in per request (``request.stream=True``). The adapter reads a
+bounded ``text/event-stream`` body and returns one assembled ``ModelResponse``;
+it does not implement the incremental ``StreamingModelProvider`` protocol.
 """
 
 from __future__ import annotations
@@ -21,10 +25,12 @@ from typing import Any
 
 from mayaworkbench.errors import ModelError
 from mayaworkbench.models.base import (
+    ChatMessage,
     ModelCapabilities,
     ModelRequest,
     ModelResponse,
     ModelUsage,
+    ToolCall,
 )
 from mayaworkbench.observability.logging import get_logger
 
@@ -32,9 +38,18 @@ log = get_logger("models.openai_compatible")
 
 RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
 
+#: Hard bounds for server-sent events: a hostile or broken upstream can never
+#: make the adapter buffer an unbounded response.
+_MAX_SSE_BYTES = 4_000_000
+_MAX_SSE_EVENTS = 10_000
+_MAX_SSE_LINE = 65_536
+
 
 class OpenAICompatibleProvider:
     name = "openai_compatible"
+    #: SSE is consumed in ``generate(stream=True)`` and assembled before return;
+    #: there is no incremental ``stream()`` iterator on this adapter.
+    supports_buffered_streaming = True
 
     def __init__(
         self,
@@ -74,7 +89,10 @@ class OpenAICompatibleProvider:
     def capabilities(self) -> ModelCapabilities:
         return ModelCapabilities(
             structured_output=self._structured_supported,
-            streaming=False,
+            streaming=True,
+            tool_calling=True,
+            parallel_tool_calls=True,
+            provider_family="openai_compatible",
             max_context_tokens=None,
         )
 
@@ -89,8 +107,11 @@ class OpenAICompatibleProvider:
             attempts += 1
             try:
                 payload = self._build_payload(request, repair_notice=repair_notice)
-                data, request_id = self._post(payload)
-                text, structured = self._parse_response(data, request)
+                if request.stream:
+                    data, request_id = self._post_stream(payload)
+                else:
+                    data, request_id = self._post(payload)
+                text, structured, tool_calls = self._parse_response(data, request)
                 usage = self._usage(data)
                 return ModelResponse(
                     text=text,
@@ -98,10 +119,11 @@ class OpenAICompatibleProvider:
                     usage=usage,
                     provider=self.name,
                     model=str(data.get("model") or self.model),
-                    provider_request_id=request_id,
+                    provider_request_id=request_id or _as_str(data.get("id")),
                     latency_ms=int((time.monotonic() - started) * 1000),
                     retry_count=attempts - 1,
                     used_structured_output=bool(request.json_schema) and self._structured_supported,
+                    tool_calls=tool_calls,
                 )
             except ModelError as exc:
                 last_error = exc
@@ -125,9 +147,7 @@ class OpenAICompatibleProvider:
 
     # ------------------------------------------------------------------ payload
     def _build_payload(self, request: ModelRequest, *, repair_notice: str | None) -> dict[str, Any]:
-        messages = [
-            {"role": message.role, "content": message.content} for message in request.messages
-        ]
+        messages = [_message_payload(message) for message in request.messages]
         if repair_notice:
             messages.append({"role": "user", "content": repair_notice})
         payload: dict[str, Any] = {
@@ -147,9 +167,26 @@ class OpenAICompatibleProvider:
                     "schema": request.json_schema,
                 },
             }
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                }
+                for tool in request.tools
+            ]
+            payload["tool_choice"] = _tool_choice(request.tool_choice, request.tools)
+            payload["parallel_tool_calls"] = True
+        if request.stream:
+            payload["stream"] = True
         return payload
 
-    def _post(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    # ---------------------------------------------------------------- transport
+    def _open(self, payload: dict[str, Any], *, stream: bool = False):  # type: ignore[no-untyped-def]
         body = json.dumps(payload).encode("utf-8")
         http_request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -158,13 +195,11 @@ class OpenAICompatibleProvider:
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self._api_key}",
-                "Accept": "application/json",
+                "Accept": "text/event-stream" if stream else "application/json",
             },
         )
         try:
-            with urllib.request.urlopen(http_request, timeout=self.timeout_seconds) as response:
-                raw = response.read()
-                request_id = response.headers.get("x-request-id")
+            response = urllib.request.urlopen(http_request, timeout=self.timeout_seconds)
         except urllib.error.HTTPError as exc:
             detail = _safe_error_detail(exc)
             error_class, retryable = _classify_status(exc.code)
@@ -199,6 +234,12 @@ class OpenAICompatibleProvider:
                 error_class="timeout",
                 retryable=True,
             ) from exc
+        return response, response.headers.get("x-request-id")
+
+    def _post(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+        response, request_id = self._open(payload)
+        with response:
+            raw = response.read()
         try:
             parsed = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -215,10 +256,165 @@ class OpenAICompatibleProvider:
             )
         return parsed, request_id
 
+    # -------------------------------------------------------------- SSE parsing
+    def _post_stream(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+        response, request_id = self._open(payload, stream=True)
+        with response:
+            try:
+                data = self._consume_sse(response)
+            except (urllib.error.URLError, TimeoutError) as exc:
+                raise _stream_transport_error(exc, self.timeout_seconds) from exc
+        return data, request_id
+
+    def _consume_sse(self, response: Any) -> dict[str, Any]:
+        """Read a bounded SSE body and assemble it into one completion-shaped object."""
+        state: dict[str, Any] = {
+            "text": [],
+            "calls": {},
+            "call_ids": {},
+            "usage": {},
+            "model": None,
+            "id": None,
+        }
+        data_lines: list[str] = []
+        event_count = 0
+        byte_count = 0
+        finished = False
+
+        def emit() -> None:
+            nonlocal data_lines, event_count, finished
+            if not data_lines:
+                return
+            frame = "\n".join(data_lines)
+            data_lines = []
+            event_count += 1
+            if event_count > _MAX_SSE_EVENTS:
+                raise ModelError(
+                    "SSE stream exceeded the event limit",
+                    error_class="protocol",
+                    retryable=False,
+                )
+            if frame.strip() == "[DONE]":
+                finished = True
+                return
+            try:
+                chunk = json.loads(frame)
+            except json.JSONDecodeError:
+                return  # tolerate malformed keepalive frames
+            if not isinstance(chunk, dict):
+                return
+            if chunk.get("model"):
+                state["model"] = chunk["model"]
+            if chunk.get("id"):
+                state["id"] = chunk["id"]
+            usage = chunk.get("usage")
+            if isinstance(usage, dict) and any(
+                key in usage for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            ):
+                state["usage"] = usage
+            choices = chunk.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                return
+            choice = choices[0]
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            piece = delta.get("content")
+            if isinstance(piece, str) and piece:
+                state["text"].append(piece)
+            elif isinstance(piece, list):
+                for part in piece:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        state["text"].append(part["text"])
+            raw_calls = delta.get("tool_calls")
+            if not isinstance(raw_calls, list):
+                return
+            for position, raw in enumerate(raw_calls):
+                if not isinstance(raw, dict):
+                    continue
+                call_id = str(raw["id"]) if raw.get("id") else None
+                if raw.get("index") is not None:
+                    key = str(raw["index"])
+                    if call_id:
+                        state["call_ids"][call_id] = key
+                elif call_id and call_id in state["call_ids"]:
+                    key = state["call_ids"][call_id]
+                else:
+                    key = call_id or str(position)
+                    if call_id:
+                        state["call_ids"][call_id] = key
+                function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+                entry = state["calls"].get(key)
+                if entry is None:
+                    entry = {
+                        "id": str(raw.get("id") or f"call_{key}"),
+                        "name": "",
+                        "arguments": "",
+                    }
+                    state["calls"][key] = entry
+                if raw.get("id"):
+                    entry["id"] = str(raw["id"])
+                if isinstance(function.get("name"), str):
+                    entry["name"] += function["name"]
+                if isinstance(function.get("arguments"), str):
+                    entry["arguments"] += function["arguments"]
+
+        while not finished:
+            line = response.readline(_MAX_SSE_LINE + 1)
+            if not line:
+                break
+            byte_count += len(line)
+            if byte_count > _MAX_SSE_BYTES:
+                raise ModelError(
+                    "SSE stream exceeded the byte limit",
+                    error_class="protocol",
+                    retryable=False,
+                )
+            if len(line) > _MAX_SSE_LINE:
+                raise ModelError(
+                    "SSE line exceeded the length limit",
+                    error_class="protocol",
+                    retryable=False,
+                )
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not text:
+                emit()
+            elif text.startswith("data:"):
+                data_lines.append(text[5:].lstrip(" "))
+            # event:, id:, retry: and comment (:) frames carry no completion data.
+        emit()
+
+        assembled_calls = [
+            {
+                "id": entry["id"],
+                "type": "function",
+                "function": {
+                    "name": entry["name"],
+                    "arguments": entry["arguments"] or "{}",
+                },
+            }
+            for entry in state["calls"].values()
+            if entry["name"]
+        ]
+        return {
+            "id": state["id"],
+            "model": state["model"],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "".join(state["text"]),
+                        "tool_calls": assembled_calls,
+                    }
+                }
+            ],
+            "usage": state["usage"],
+        }
+
     # ------------------------------------------------------------------ parsing
     def _parse_response(
         self, data: dict[str, Any], request: ModelRequest
-    ) -> tuple[str, dict[str, Any] | None]:
+    ) -> tuple[str, dict[str, Any] | None, list[ToolCall]]:
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ModelError(
@@ -240,14 +436,17 @@ class OpenAICompatibleProvider:
                 for part in content
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
             )
+        if content is None:
+            content = ""  # tool-only completions legitimately omit content
         if not isinstance(content, str):
             raise ModelError(
                 "Provider response content was not text",
                 error_class="protocol",
                 retryable=False,
             )
-        if request.json_schema is None:
-            return content, None
+        tool_calls = _parse_tool_calls(message)
+        if request.json_schema is None or (not content.strip() and tool_calls):
+            return content, None, tool_calls
         try:
             structured = _extract_json_object(content)
         except ValueError as exc:
@@ -256,10 +455,12 @@ class OpenAICompatibleProvider:
                 error_class="structured_output",
                 retryable=True,
             ) from exc
-        return content, structured
+        return content, structured, tool_calls
 
     def _usage(self, data: dict[str, Any]) -> ModelUsage:
         usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
         prompt_tokens = _as_int(usage.get("prompt_tokens"))
         completion_tokens = _as_int(usage.get("completion_tokens"))
         total_tokens = _as_int(usage.get("total_tokens"))
@@ -283,6 +484,95 @@ class OpenAICompatibleProvider:
             cost_usd=cost,
             cost_basis=basis,
         )
+
+
+# ---------------------------------------------------------------- helpers
+def _message_payload(message: ChatMessage) -> dict[str, Any]:
+    item: dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.role == "tool" and message.tool_call_id:
+        item["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        item["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            }
+            for call in message.tool_calls
+        ]
+    return item
+
+
+def _tool_choice(choice: str, tools: list[Any]) -> Any:
+    if choice in ("auto", "none", "required"):
+        return choice
+    if any(tool.name == choice for tool in tools):
+        return {"type": "function", "function": {"name": choice}}
+    return "auto"
+
+
+def _parse_tool_calls(message: dict[str, Any]) -> list[ToolCall]:
+    raw_calls = message.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        return []
+    calls: list[ToolCall] = []
+    for index, raw in enumerate(raw_calls):
+        if not isinstance(raw, dict):
+            continue
+        function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+        name = function.get("name") or raw.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        arguments = _parse_tool_arguments(
+            function.get("arguments", raw.get("arguments", "{}"))
+        )
+        call_id = raw.get("id")
+        calls.append(
+            ToolCall(
+                id=str(call_id) if call_id is not None else f"call_{index}",
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return calls
+
+
+def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if raw is None or raw == "":
+        return {}
+    if not isinstance(raw, str):
+        return {"_raw": str(raw)}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            parsed = _extract_json_object(raw)
+        except ValueError:
+            return {"_raw": raw}
+    if isinstance(parsed, dict):
+        return parsed
+    return {"_raw": raw}
+
+
+def _stream_transport_error(exc: BaseException, timeout_seconds: int) -> ModelError:
+    if isinstance(exc, TimeoutError):
+        return ModelError(
+            f"Model provider timed out after {timeout_seconds}s",
+            error_class="timeout",
+            retryable=True,
+        )
+    reason = getattr(exc, "reason", exc)
+    return ModelError(
+        f"Cannot reach the model provider: {reason}",
+        error_class="network",
+        retryable=True,
+        hint="Check the base URL and network access.",
+    )
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -342,6 +632,10 @@ def _as_int(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _as_str(value: Any) -> str | None:
+    return str(value) if value else None
 
 
 __all__ = ["OpenAICompatibleProvider"]
