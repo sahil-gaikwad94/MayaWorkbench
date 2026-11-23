@@ -123,10 +123,21 @@ class ModelError(MayaError):
         error_class: str = "unknown",
         retryable: bool = False,
         hint: str | None = None,
+        attempts: int = 0,
+        http_status: int | None = None,
+        provider_code: str | None = None,
+        retry_after_seconds: float | None = None,
     ):
         super().__init__(message, hint=hint)
         self.error_class = error_class
         self.retryable = retryable
+        #: Requests actually issued for this operation (1 means no retry was
+        #: attempted). The gateway records this instead of the configured
+        #: ceiling, so invocation history never overstates retries.
+        self.attempts = int(attempts)
+        self.http_status = http_status
+        self.provider_code = provider_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class CitationError(MayaError):

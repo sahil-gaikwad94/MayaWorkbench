@@ -724,6 +724,31 @@ class SymbolStore:
             params.append(edge_type)
         return [dict(row) for row in self.db.fetchall(sql + " ORDER BY e.line", params)]
 
+    def list_by_snapshot(self, snapshot_id: str) -> list[Symbol]:
+        """Return every symbol indexed for a snapshot, in file/line order."""
+        rows = self.db.fetchall(
+            "SELECT * FROM symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+            (snapshot_id,),
+        )
+        return [_row_to_model(Symbol, row, json_fields=self.JSON) for row in rows]
+
+    def list_edges(self, snapshot_id: str) -> list[dict[str, Any]]:
+        """Return every resolved symbol edge recorded for a snapshot.
+
+        Unlike ``pending_edges`` (which is used by the resolver and omits the
+        resolved target columns), this returns ``target_symbol_id`` and
+        ``target_file_id`` so callers can traverse the dependency graph.
+        """
+        rows = self.db.fetchall(
+            """
+            SELECT id, source_symbol_id, source_file_id, edge_type, target_name, line,
+                   provenance, confidence, target_symbol_id, target_file_id
+            FROM symbol_edges WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
+        )
+        return [dict(row) for row in rows]
+
     def top_level_symbols(self, snapshot_id: str, limit: int = 200) -> list[Symbol]:
         rows = self.db.fetchall(
             "SELECT * FROM symbols WHERE snapshot_id = ? AND parent_symbol_id IS NULL "

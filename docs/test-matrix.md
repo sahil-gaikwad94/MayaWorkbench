@@ -4,12 +4,12 @@
 
 | Item | Value |
 |---|---|
-| Date | 2026-11-22 (reconciled after the audit-remediation package) |
-| Commit | `git rev-parse HEAD` at test time (work started at `47c78e3`) |
-| Python | 3.12.3 (CPython, Linux aarch64) |
+| Date | 2026-11-23 (Trustworthy Runtime + Verification release) |
+| Commit | Work tree on top of `f57fad1` (`git rev-parse HEAD` is recorded in `docs/reports/test-run-2026-11-23.json`) |
+| Python | 3.12.3 (CPython, Linux x86_64, glibc 2.39) |
 | pytest | 9.2.0 |
 | pydantic | 2.14.4 |
-| pypdf (optional PDF extra) | 5.9.0 |
+| pypdf (optional PDF extra) | 7.1.1 |
 | Git | available on PATH; real temporary repositories in tests |
 | SQLite | interpreter build with WAL + FTS5 |
 | Install command | `python -m pip install -e ".[dev]" "pypdf>=4,<6"` |
@@ -23,23 +23,52 @@ fail with `ModuleNotFoundError`, which is a setup error, not a product defect.
 ## Latest full-suite result
 
 ```
-782 collected, 773 passed, 9 skipped, 0 failed, 0 errors
-(python -m pytest -q --junitxml=..., exit 0)
+844 collected, 837 passed, 7 skipped, 0 failed, 0 errors, 84.5 s
+(python -m pytest -q --junitxml=docs/reports/pytest-2026-11-23.xml, exit 0)
 ```
 
-The nine skips are explicit: six opt-in live harnesses (`tests/integration/`),
-one Playwright-dependent browser test, and two pre-existing optional-dependency
-cases. A skip never counts as a pass. A machine-readable release record built from this
-JUnit report and the four adversarial harness results is produced by
+The canonical record for this run is
+[`docs/reports/test-run-2026-11-23.json`](reports/test-run-2026-11-23.json); the
+raw report is [`docs/reports/pytest-2026-11-23.xml`](reports/pytest-2026-11-23.xml).
+Both are generated from the run, not hand-written. `python -m compileall -q src`
+also passes.
+
+The seven skips are explicit and enumerated from the JUnit report: three opt-in
+OCI live-harness tests (`MAYA_OCI_LIVE` unset), three opt-in live-model tests
+(`MAYA_LIVE_MODEL` unset) and one Playwright-dependent browser-render test
+(Playwright not installed). There are **no** optional-dependency skips any more:
+the method-invariant "torch is absent" cases are hermetic (a `sitecustomize`
+import blocker) and pass even on a host with PyTorch installed (MW-NEW-P1-03).
+A skip never counts as a pass.
+
+Build the release record from the real JUnit report and the adversarial harness
+results with
 `maya release evidence --pytest-report <junit.xml> --adversarial-dir <dir> --out <dir>`.
 
-The two skips are the existing optional-dependency cases; a skipped check never
-counts as a pass. `python -m compileall -q src` also passes.
+The slowest tests in this run were
+`test_explicit_snapshot_disambiguates_multiple_repositories` (2.21 s),
+`test_cli_full_flow_uses_a_separate_worker_process` (2.17 s) and
+`test_child_environment_is_sanitized` (2.02 s); the full suite is well inside a
+ten-minute CI budget.
 
-Test collection grew from 328 to 635. The 2026-11-22 packages added runtime-workspace,
-cgroup, lockfile-environment, API-diff, broken-checker, provider-wiring, native
-tool-call/SSE, MCP transport, pluggable-embedding, optional Tree-sitter, four-tier
-reproduction-report and offline R2I-evaluation regressions.
+Test collection grew from 782 (2026-11-22) to 834 after the provider hardening
+pass. The 2026-11-23 package added
+sanitized-snapshot and mount-policy tests, evidence-based probe tests (including
+a runtime that silently ignores a flag), an injected-runtime in-loop check test,
+baseline-parity tests, an unavailable-session-backend test, a local API security
+contract suite, and the hermetic optional-dependency cases. Earlier growth:
+runtime-workspace, cgroup, lockfile-environment, API-diff, broken-checker,
+provider-wiring, native tool-call/SSE, MCP transport, pluggable-embedding, optional
+Tree-sitter, four-tier reproduction-report and offline R2I-evaluation regressions.
+The second 2026-11-23 pass added container-session lifecycle tests
+(`tests/test_container_sessions.py`, 7), environment spec/provisioning tests
+(`tests/test_environment_provisioning.py`, 9) and a shared fake OCI client
+(`tests/fake_oci.py`) used by both backend suites. The model/provider hardening
+pass added `tests/test_provider_adapters.py`: wire-shape assertions for OpenAI
+strict schemas and parameter adaptation, Anthropic cache breakpoints and
+`tool_result` merging, Gemini schema projection and function-response names,
+bounded SSE, refusal/block/quota typing, incremental streaming, and gateway
+attempt/key/input accounting.
 Earlier growth included: 6 PDF fallback/parser-policy tests, 8
 runner limit/trust-profile tests, 4 execution-capability CLI tests, 8
 execution-backend/isolation tests, 5 task-capability grant tests, 6
@@ -83,6 +112,7 @@ and no child outlives the command. A test that merely asserted a claimed
 | Signed run bundles | `pytest -q tests/test_runner_bundles.py tests/test_attestation.py` | sign/verify/import with named key, verify-time HMAC, swapped-envelope rejection | `unit` |
 | Live-model benchmark | `pytest -q tests/test_eval_live.py` | 25-task internal seed corpus, offline dry-run, hard spend cap, evidence-based rates | `unit` |
 | Parallel discovery | `pytest -q tests/test_role_orchestrator.py` | opt-in bounded parallel payloads with ordered sequential publication | `unit` |
+| Model providers | `pytest -q tests/test_provider_adapters.py tests/test_model_platform.py tests/test_provider_wiring.py` | request/response wire shapes for all three adapters, structured-output degradation, cache and tool-result correctness, bounded SSE, typed refusals/blocks/quotas, streaming deltas, gateway accounting | `unit` (fake transports) |
 | Real-model smoke | opt-in, protected job with low-privilege key and cost cap | real structured output and tool-call quality | `model-smoke` (manual approval) |
 | Platform | Linux non-root first; Windows/macOS only if advertised | cross-platform behavior | `platform` (future) |
 
@@ -109,7 +139,8 @@ penetration test.
 - Real host-canary/secret isolation and limit read-back inside an actual rootless
   container. A bounded `MAYA_OCI_SMOKE=1` probe exists and the profile stays unavailable
   until it passes; it has not been run here.
-- Native provider adapters (OpenAI SSE + tool calls, Anthropic tool_use, Gemini function
-  calls), pluggable embeddings/RRF, optional Tree-sitter parsing and MCP stdio transport
-  are implemented and covered with fake transports; no live provider, OCI runtime or
+- Native provider adapters (OpenAI strict schema + SSE + tool calls, Anthropic
+  `output_config` + cache breakpoints + SSE, Gemini `responseSchema` + function
+  responses + SSE), pluggable embeddings/RRF, optional Tree-sitter parsing and MCP stdio
+  transport are implemented and covered with fake transports; no live provider, OCI runtime or
   third-party MCP server was exercised. See `IMPLEMENTATION_STATUS.md`.

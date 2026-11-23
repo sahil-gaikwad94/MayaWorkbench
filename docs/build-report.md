@@ -31,3 +31,32 @@ Truth table: IMPLEMENTATION_STATUS.md. Test matrix: docs/test-matrix.md.
 - Docs reconciled from one status registry; see `docs/wiki/audit-2026-11-22-remediation.md`.
 
 Verification numbers for this package are recorded in `docs/test-matrix.md`.
+
+## 2026-11-23 — Trustworthy Runtime + Verification (second pass)
+
+- Sanitized immutable snapshot; the worktree is never mounted (`maya-sanitize-v3`).
+- Evidence-based in-container capability probe with per-limit requested/observed.
+- One runtime for file tools, commands, in-loop checks and sessions; baseline parity.
+- Container-owned sessions in a retained container with per-session termination.
+- Immutable environment spec plus an isolated, network-gated provisioner with
+  truthful inventory (`maya env spec`, `maya env provision`).
+- CPU time vs CPU quota split; local API request contract; hermetic tests.
+- Details: `docs/wiki/audit-2026-11-23-remediation.md`, ADR 0015, ADR 0016.
+
+Verification numbers for this package are recorded in `docs/test-matrix.md` and
+`docs/reports/test-run-2026-11-23.json`.
+
+## 2026-11-23 — model/provider hardening (follow-up)
+
+- OpenAI-compatible: strict-schema projection with three-step degradation, reasoning
+  model parameter adaptation, `stream_options.include_usage`, bounded `Retry-After`,
+  typed context-length/quota failures and incremental streaming.
+- Anthropic: GA `output_config.format`, message-level cache breakpoints, merged
+  `tool_result` turns, refusal stop reason and SSE streaming.
+- Gemini: projected `responseSchema`, function-response name resolution, safety blocks,
+  thought/cached token accounting and SSE streaming.
+- Gateway: provider-specific key resolution, keyless loopback endpoints, tool-schema-aware
+  input bound and actual-attempt accounting.
+- Details and evidence: ADR 0017, `docs/wiki/audit-2026-11-23-remediation.md`
+  (834 collected, 827 passed, 7 skipped, 0 failed) and `tests/test_provider_adapters.py`.
+  The live provider gate remains unrun without a key.

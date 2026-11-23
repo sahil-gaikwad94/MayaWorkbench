@@ -203,7 +203,6 @@ class Worker:
             BackendCommandRunner,
             RootlessContainerBackend,
         )
-        from mayaworkbench.workspace.capabilities import probe_execution_capability_report
         from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace
         from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
 
@@ -211,23 +210,27 @@ class Worker:
         trust = contract.constraints.execution_trust
         run_home = Path(workspace.path).parent / "home"
         container_backend = None
+        capability_evidence = None
         if trust == ExecutionTrust.ROOTLESS_CONTAINER.value:
-            # One canonical capability report decides availability. A runtime
-            # that has not passed a real OCI smoke test is never silently
-            # downgraded to host execution.
-            capability = probe_execution_capability_report().trust_profiles[trust]
-            if not capability["available"]:
-                raise PolicyError(
-                    f"ROOTLESS_CONTAINER cannot be established: {capability['reason']}"
-                )
             container_backend = RootlessContainerBackend(
                 Path(workspace.path),
                 run_home,
                 replace(contract_policy, trust_profile=ExecutionTrust.LOCAL_TRUSTED.value),
-                verified=True,
             )
-            # Provision once. The overlay is the single file view used by all
-            # tools, commands, in-loop checks and artifact collection.
+            # Verify THIS task's limits in a task-equivalent container before
+            # anything runs. A smoke test that only proves "a container starts"
+            # is not evidence for pids/memory/cpu, so the probe reads the
+            # effective values back from inside the container. Failure blocks
+            # the run; it never downgrades to host execution.
+            capability_evidence = container_backend.verify_capabilities()
+            if not capability_evidence.available:
+                raise PolicyError(
+                    "ROOTLESS_CONTAINER cannot be established: "
+                    + "; ".join(capability_evidence.mandatory_failures)
+                )
+            # Provision once. The sanitized snapshot and its overlay are the
+            # single file view used by all tools, commands, in-loop checks and
+            # artifact collection.
             runtime_workspace = RuntimeWorkspace.for_container(
                 container_backend, Path(workspace.path), snapshot_id=run.snapshot_id
             )
@@ -270,6 +273,9 @@ class Worker:
                     if runtime_workspace.runtime
                     else None,
                     "trust_profile": trust,
+                    "capability_evidence": capability_evidence.as_dict()
+                    if capability_evidence is not None
+                    else None,
                 },
             }
             self.services.runs.update_progress(run.id, details=binding)
@@ -287,6 +293,10 @@ class Worker:
                 command_approval is not None
                 and ApprovalAction.COMMAND_EXECUTION in contract.required_approvals
             ),
+            # The same runtime the implementer used. A rootless task therefore
+            # runs its declared checks inside its own container; there is no
+            # hidden host runner and no silent trust downgrade.
+            runtime=task_runtime,
         )
         try:
             orientation = build_orientation(
@@ -326,14 +336,51 @@ class Worker:
             hits = self.services.search.search_symbols(run.snapshot_id, query, limit=limit)
             return [hit.model_dump(mode="json") for hit in hits]
 
-        from mayaworkbench.workspace.sessions import SessionManager
+        from mayaworkbench.workspace.sessions import (
+            SessionManager,
+            UnavailableSessionBackend,
+        )
         from mayaworkbench.workspace.tools import redact as redact_tool_output
 
-        sessions = SessionManager(
-            active_path,
-            runner,
-            redactor=redact_tool_output,
-        )
+        if trust == ExecutionTrust.ROOTLESS_CONTAINER.value and container_backend is not None:
+            # The session process lives inside the task container: the host runs
+            # only the OCI client. If the retained container cannot start, the
+            # backend reports the capability unavailable; there is no host
+            # fallback either way.
+            from mayaworkbench.workspace.container_sessions import ContainerSessionBackend
+
+            container_runtime = runtime_workspace.runtime
+            if container_runtime is None:  # pragma: no cover - provision() guarantees it
+                raise PolicyError(
+                    "ROOTLESS_CONTAINER has no provisioned runtime to own a session"
+                )
+            sessions = SessionManager(
+                active_path,
+                runner,
+                redactor=redact_tool_output,
+                backend=ContainerSessionBackend(
+                    container_backend,
+                    container_runtime,
+                    workspace=active_path,
+                    policy=contract_policy,
+                ),
+            )
+        elif trust == ExecutionTrust.ROOTLESS_CONTAINER.value:  # pragma: no cover - defensive
+            sessions = SessionManager(
+                active_path,
+                runner,
+                redactor=redact_tool_output,
+                backend=UnavailableSessionBackend(
+                    "no container backend was provisioned for this isolated task; "
+                    "no session was started on the host"
+                ),
+            )
+        else:
+            sessions = SessionManager(
+                active_path,
+                runner,
+                redactor=redact_tool_output,
+            )
 
         gateway = ToolGateway(
             run=run,

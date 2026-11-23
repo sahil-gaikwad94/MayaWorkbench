@@ -4,8 +4,10 @@ Collected by the ordinary suite but never runs at collection time. All gates
 are checked at test time:
 
 * ``MAYA_LIVE_MODEL=1`` — deliberate opt-in;
-* ``MAYA_MODEL_API_KEY`` — a key supplied by the operator (never logged or
-  written by this harness);
+* the key variable the configured adapter resolves (``MAYA_ANTHROPIC_API_KEY``,
+  ``MAYA_GEMINI_API_KEY``, ``MAYA_MODEL_API_KEY`` or the user's
+  ``model.api_key_env``), or a keyless loopback endpoint — supplied by the
+  operator and never logged or written by this harness;
 * ``MAYA_LIVE_SPEND_CAP_USD`` — a parseable, finite number > 0.
 
 If any gate is absent the tests ``pytest.skip("reason: ...")`` with the concrete
@@ -94,11 +96,6 @@ def live_model(tmp_path_factory):
     if not _flag_enabled("MAYA_LIVE_MODEL"):
         raw = os.environ.get("MAYA_LIVE_MODEL")
         pytest.skip(f"reason: MAYA_LIVE_MODEL must be set to 1 (current value: {raw!r})")
-    if not os.environ.get("MAYA_MODEL_API_KEY"):
-        pytest.skip(
-            "reason: MAYA_MODEL_API_KEY is not set; export a low-privilege key "
-            f"({_cap_msg(cap)})"
-        )
     if error:
         pytest.skip(f"reason: {error}. {_cap_msg(None)}")
 
@@ -141,12 +138,19 @@ def live_model(tmp_path_factory):
             )
         # The provider is constructed by the gateway's own configured factory;
         # capabilities() is a local declaration and performs no network call.
-        provider = gateway._factory(settings)
+        try:
+            provider = gateway._factory(settings)
+        except Exception as exc:  # noqa: BLE001 - report the concrete blocker
+            pytest.skip(
+                f"reason: the configured provider could not be constructed: {exc} "
+                f"({_cap_msg(cap)})"
+            )
         yield SimpleNamespace(
             gateway=gateway,
             settings=settings,
             cap=cap,
             project_id=project.id,
+            status=status,
             provider_caps=provider.capabilities(),
         )
     finally:
@@ -179,9 +183,15 @@ def test_live_structured_output_is_schema_valid(live_model):
         json_schema=_TINY_SCHEMA,
         schema_name="LiveEcho",
         max_output_tokens=_MAX_OUTPUT_TOKENS,
+        # Exercise the streaming transport when the adapter declares it. Each
+        # adapter assembles the stream into one schema-validated response.
+        stream=bool(live_model.provider_caps.streaming),
     )
-    response, _invocation = _call(live_model, request, "live-gate-structured")
+    response, invocation = _call(live_model, request, "live-gate-structured")
 
+    assert response.provider, _cap_msg(cap)
+    assert response.model, _cap_msg(cap)
+    assert invocation.provider == response.provider, _cap_msg(cap)
     payload = response.structured
     if payload is None:
         try:
@@ -235,3 +245,4 @@ def test_live_tool_calls_are_declared_and_parseable(live_model):
         assert set(call.arguments) <= {"text"}, _cap_msg(cap)
         assert isinstance(call.arguments.get("text"), str), _cap_msg(cap)
     assert response.provider, _cap_msg(cap)
+    assert response.model, _cap_msg(cap)

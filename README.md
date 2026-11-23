@@ -81,12 +81,25 @@ export MAYA_MODEL_API_KEY=...      # never stored in the config file
 maya model status                  # shows whether calls are permitted
 ```
 
-Native tool calling and streamed responses are available on the OpenAI-compatible
-adapter. Two additional selectable adapters use their providers' native APIs:
+For a local OpenAI-compatible server (optionally keyless):
+
+```bash
+maya config set model.provider=local_openai_compatible
+maya config set model.base_url=http://127.0.0.1:11434/v1
+maya config set model.model=llama3.2
+```
+
+All three adapters support native tool calling, structured output and streaming
+(buffered via `generate(stream=True)` and incrementally via `provider.stream`):
+`model.provider=openai_compatible` (also vLLM, llama.cpp, Ollama and LM Studio),
 `model.provider=anthropic` (with `MAYA_ANTHROPIC_API_KEY`) and
-`model.provider=gemini` (with `MAYA_GEMINI_API_KEY`). Keys are always read from the
-environment and are never stored, logged or sent to another provider. Model output
-remains a proposal: the tool gateway, runner and evidence system are the authority.
+`model.provider=gemini` (with `MAYA_GEMINI_API_KEY`). A loopback endpoint may be
+keyless under `LOCAL_ONLY`; a remote endpoint requires opt-in and its key. The
+adapters degrade structured output one step at a time when a model rejects a
+schema, honour a bounded `Retry-After`, and never treat a refusal, a quota error
+or blocked content as an answer. Keys are always read from the environment and are
+never stored, logged or sent to another provider. Model output remains a proposal:
+the tool gateway, runner and evidence system are the authority.
 
 Attach a four-tier reproducibility report to a run (method code found,
 implemented, validated, result reproduced) with `maya research reproduction <run>
@@ -268,28 +281,54 @@ result, and the final status:
 Command execution uses an explicit trust profile. `LOCAL_TRUSTED` runs project
 code with the user's OS privileges and is **not a sandbox**. `READ_ONLY_ANALYSIS`
 is implemented in code: the tool gateway is masked to read-only tools and the
-runner refuses every command before spawn — no OS sandbox is needed. The worker
-routes `ROOTLESS_CONTAINER` through a populated task overlay shared by file
-tools, commands, checks and artifact capture, but **only** when one canonical
-capability report proves a rootless OCI runtime, writable cgroup delegation and
-a passing smoke test; otherwise the task is blocked before the first write or
-process spawn. `REMOTE_MICROVM` and `GPU_RUNNER` require user-provided
-infrastructure and remain blocked. Inspect the single report with
+runner refuses every command before spawn — no OS sandbox is needed.
+
+`ROOTLESS_CONTAINER` is **experimental** and stays unavailable until a live probe
+passes on the host. The worker then builds the task view from an immutable
+sanitized snapshot plus a writable overlay (never the user's worktree), verifies
+this task's own `pids.max`, `memory.max`, `cpu.max` and rlimits by reading them
+back inside a task-equivalent container, and only then routes file tools,
+commands, in-loop checks and artifact capture through that single runtime. If any
+control cannot be observed, the task is blocked before the first write or process
+spawn — never downgraded to host execution. Persistent sessions are
+container-owned: a retained container started with the same flags and the same
+single `/work` mount owns every session process, the host runs only the OCI
+client, and termination signals only that session's processes. PTY sessions are
+refused inside the container rather than simulated. `REMOTE_MICROVM` and
+`GPU_RUNNER` require user-provided infrastructure and remain blocked. Inspect the single report with
 `maya runner doctor` and list profiles with `maya runner profiles` (both support
 `--json`).
 
-Limit enforcement is reported per limit with the mechanism observed at runtime
-(`wall_time`, `cpu`, `memory`, `process_count`, `file_size`, `open_files`). Each
-rlimit is applied inside the child and read back with `getrlimit`; the aggregate
-`limits_enforcement` is derived from those results
-(`all_enforced`/`partially_enforced`/`not_enforced`). `RLIMIT_NPROC` is not used:
-it is a per-UID ceiling Linux does not enforce for privileged processes and its
+Limit enforcement is reported per limit with the mechanism and the
+requested/observed values (`wall_time`, `cpu_time`, `cpu_quota`, `memory`,
+`process_count`, `file_size`, `open_files`). Each host rlimit is applied inside
+the child and read back with `getrlimit`; the container backend reads the
+effective cgroup values and rlimits back from inside the task container. The
+aggregate `limits_enforcement` is derived from those results
+(`all_enforced`/`partially_enforced`/`not_enforced`). `cpu_time` (cumulative CPU
+seconds, RLIMIT_CPU) and `cpu_quota` (cores, cgroup `cpu.max`) are separate
+controls and are never reported as each other. `RLIMIT_NPROC` is not used: it is
+a per-UID ceiling Linux does not enforce for privileged processes and its
 headroom calculation can block legitimate forks. The base runner therefore
 reports `process_count: unsupported` unless a writable cgroup v2 scope is
 discovered, created and read back (then `enforced`, mechanism `cgroup-v2`), or a
-smoke-verified rootless container applies `pids.max`. Controller names alone are
+probe-verified rootless container applies `pids.max`. Controller names alone are
 never reported as enforcement. The wall-clock supervisor kills the whole
 process group in every profile.
+
+## Environments
+
+`maya env detect` and `maya env plan` are pure. `maya env spec` resolves an
+immutable specification: detected ecosystems and package managers, hashes of the
+lockfiles that exist, an explicit `lockfile_absent` list, ordered argv steps, the
+pinned image and optional digest, declared services, secret **references** (never
+values) and a deterministic digest. `maya env provision --execute` runs that spec
+only inside a verified rootless runtime: it refuses `LOCAL_TRUSTED`, blocks
+download steps unless `--allow-network` is given, stops at the first failure, and
+records per-step logs, a package inventory read back from inside the runtime, and
+runtime ownership of cleanup. Image builds, a package cache with SBOM/licence
+metadata and service lifecycle are not implemented; a run reports services as
+`not_started` instead of implying they ran.
 
 See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for the feature→code→test
 truth table and [docs/test-matrix.md](docs/test-matrix.md) for the declared test

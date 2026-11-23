@@ -3,6 +3,17 @@
 Status: frozen for Phase 0–5. Changes require a documented decision record in
 [docs/adr/](adr/) and an update to the affected contract schemas.
 
+> **Superseded in part (2026-11-23).** This freeze describes the Phase 0–5
+> scope (CLI-first; no local UI, labelled corpora or evaluation scoring). Later
+> v2.1 work added a local API/UI, an internal R2I seed corpus, an offline
+> evaluation flow and opt-in live harnesses. Those additions are accepted in
+> **[ADR 0015](adr/0015-trustworthy-runtime-and-verification-release.md)**, which
+> also lists what remains out of scope: multi-user authentication and tenancy,
+> hosted operation, a public API bind without an operator opt-in, a GPU/remote
+> runner mesh, and any container-isolation claim before the live OCI gate passes.
+> Read this document as the product *principles*, not as the current feature list;
+> `IMPLEMENTATION_STATUS.md` is the feature truth table.
+
 ## 1. Who this is for
 
 **Primary user — an engineer directing an AI coding agent on a repository they
@@ -221,7 +232,9 @@ measured numbers on the fixture repository rather than extrapolating.
 - Local-first SQLite with WAL and FTS5; no server process.
 - Domain models are Pydantic v2 models with strict extra-field rejection.
 - Provider integration is behind a narrow adapter interface
-  (`ModelProvider.generate`), currently one OpenAI-compatible implementation.
+  (`ModelProvider.generate` plus an optional incremental `stream`), with three
+  native adapters (OpenAI-compatible, Anthropic, Gemini) and a labelled local
+  OpenAI-compatible mode.
 - No telemetry. Nothing leaves the machine unless the user opts into a remote
   model call.
 

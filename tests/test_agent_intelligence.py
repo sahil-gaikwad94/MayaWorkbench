@@ -119,6 +119,7 @@ def test_rootless_task_provisions_one_shared_overlay(
     """An isolated task must route tools and commands through one populated tree."""
     from mayaworkbench.workspace import capabilities as caps_mod
     from mayaworkbench.workspace.backends import (
+        ContainerEvidence,
         RootlessContainerBackend,
         RuntimeCapabilities,
     )
@@ -134,21 +135,37 @@ def test_rootless_task_provisions_one_shared_overlay(
     monkeypatch.setattr(
         caps_mod, "probe_execution_capability_report", lambda: available
     )
+    fake_limits = {
+        "wall_time": LimitEnforcement("enforced", "supervisor"),
+        "cpu_time": LimitEnforcement("enforced", "rlimit:RLIMIT_CPU"),
+        "cpu_quota": LimitEnforcement("enforced", "cgroup-v2:cpu.max"),
+        "memory": LimitEnforcement("enforced", "cgroup-v2:memory.max"),
+        "process_count": LimitEnforcement("enforced", "cgroup-v2:pids.max"),
+        "file_size": LimitEnforcement("enforced", "rlimit:RLIMIT_FSIZE"),
+        "open_files": LimitEnforcement("enforced", "rlimit:RLIMIT_NOFILE"),
+    }
     monkeypatch.setattr(
         RootlessContainerBackend,
         "capabilities",
         lambda self: RuntimeCapabilities(
-            True,
-            ("fake rootless runtime",),
-            {
-                "wall_time": LimitEnforcement("enforced", "supervisor"),
-                "cpu": LimitEnforcement("not_applied", None),
-                "memory": LimitEnforcement("not_applied", None),
-                "process_count": LimitEnforcement("not_applied", None),
-                "file_size": LimitEnforcement("unsupported", None),
-                "open_files": LimitEnforcement("unsupported", None),
-            },
-            "none",
+            True, ("fake rootless runtime",), fake_limits, "none"
+        ),
+    )
+    monkeypatch.setattr(
+        RootlessContainerBackend,
+        "verify_capabilities",
+        lambda self: ContainerEvidence(
+            probe_status="passed",
+            tool="fake-oci",
+            image="python:3.12-slim",
+            mount_policy_sha256="fake-mount-policy",
+            limits=fake_limits,
+            network_egress="denied",
+            source_secret_read="absent",
+            work_secret_read="absent",
+            host_canary_read="absent",
+            root_filesystem="denied:OSError",
+            cleanup="passed",
         ),
     )
 
@@ -178,6 +195,8 @@ def test_rootless_task_provisions_one_shared_overlay(
     binding = run.details["runtime_binding"]
     assert binding["kind"] == "container"
     assert binding["trust_profile"] == "ROOTLESS_CONTAINER"
+    assert binding["capability_evidence"]["probe_status"] == "passed"
+    assert binding["sanitize_policy_sha256"]
     assert binding["runtime_ref"]["backend"] == "rootless-container"
     from pathlib import Path
 

@@ -5,6 +5,25 @@ not a general shell: argv is validated by the same policy as ``run_command``,
 output is bounded and sequenced, input is a typed operation, idle and absolute
 lifetimes are enforced, and cancellation kills the whole process group with an
 acknowledgement. Events can be replayed from a sequence number after reconnect.
+
+Output framing contract (MW-NEW-P1-02)
+---------------------------------------
+Session output is an arbitrary byte/text **chunk stream**. One event carries the
+bytes that were ready when it was read; a logical line, a word or a command's
+entire output may be split across several events, and one event may contain
+many lines. Consumers must concatenate events in ``seq`` order before making
+any line- or phrase-shaped assertion (``SessionManager.stream_text`` does this).
+Events are monotonically sequenced, ``seq`` is stable across replay, and a
+truncation notice is itself an event. There is no promise that one event equals
+one line.
+
+Isolation contract
+------------------
+Session processes are created by an injected :class:`SessionBackend`. The
+host-process backend is available **only** to ``LOCAL_TRUSTED``. An isolated
+runtime gets an :class:`UnavailableSessionBackend` whose ``spawn`` raises a
+typed :class:`PolicyError`: a container task never falls back to host
+``subprocess.Popen``, and the session tool is reported unavailable instead.
 """
 
 from __future__ import annotations
@@ -13,13 +32,12 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 from mayaworkbench.errors import PolicyError
 from mayaworkbench.workspace.runner import CommandRunner
@@ -46,6 +64,206 @@ class SessionEvent:
 
     def as_dict(self) -> dict:
         return {"seq": self.seq, "kind": self.kind, "data": self.data, "timestamp": self.timestamp}
+
+
+@dataclass(frozen=True)
+class SessionCapability:
+    """Whether this runtime can own a persistent session process."""
+
+    available: bool
+    reason: str = ""
+    kind: str = "host-process"
+
+    def as_dict(self) -> dict[str, object]:
+        return {"available": self.available, "reason": self.reason, "kind": self.kind}
+
+
+@dataclass(frozen=True)
+class SessionCommand:
+    """The exact argv to launch, already translated for this runtime.
+
+    ``argv`` is what the host-side client executes. For a container session that
+    is the OCI client (``podman exec``), never the user's command directly.
+    ``display_argv`` is the command the caller asked for; it is what appears in
+    the session reference, so evidence shows the command and not the plumbing.
+    """
+
+    argv: list[str]
+    display_argv: list[str]
+    cwd: Path
+    env: dict[str, str]
+    use_pty: bool
+    env_sha256: str
+    session_id: str
+    timeout_seconds: int
+
+
+class SessionBackend(Protocol):
+    """The only place a session process is created.
+
+    A backend that cannot own a session process must report
+    ``capability.available is False`` and raise from ``build``/``spawn``; it must
+    never delegate to a host process.
+    """
+
+    @property
+    def capability(self) -> SessionCapability: ...
+
+    def build(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: int,
+        use_pty: bool,
+        session_id: str,
+    ) -> SessionCommand: ...
+
+    def spawn(self, command: SessionCommand) -> tuple[subprocess.Popen, int | None]: ...
+
+    def terminate(self, process: subprocess.Popen, *, session_id: str) -> None: ...
+
+
+def env_digest(env: dict[str, str]) -> str:
+    """Stable digest of the exact environment a session process receives."""
+
+    return hashlib.sha256(
+        json.dumps(env, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def kill_process_group(pid: int) -> None:
+    """SIGKILL a host session's whole process group."""
+
+    import signal
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:  # pragma: no cover
+            pass
+
+
+class UnavailableSessionBackend:
+    """Fail-closed backend for a runtime that cannot own sessions."""
+
+    def __init__(self, reason: str):
+        self._capability = SessionCapability(False, reason, "unavailable")
+
+    @property
+    def capability(self) -> SessionCapability:
+        return self._capability
+
+    def build(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: int,
+        use_pty: bool,
+        session_id: str,
+    ) -> SessionCommand:
+        del argv, timeout_seconds, use_pty, session_id
+        raise PolicyError(self._capability.reason)
+
+    def spawn(self, command: SessionCommand) -> tuple[subprocess.Popen, int | None]:
+        del command
+        raise PolicyError(self._capability.reason)
+
+    def terminate(self, process: subprocess.Popen, *, session_id: str) -> None:
+        del process, session_id
+
+
+class LocalProcessSessionBackend:
+    """Host-process sessions. Only valid for an explicitly trusted profile."""
+
+    def __init__(self, runner: CommandRunner, workspace: Path):
+        self.runner = runner
+        self.workspace = Path(workspace).resolve()
+        self._capability = SessionCapability(
+            True, "host process with the user's OS privileges; not a sandbox", "host-process"
+        )
+
+    @property
+    def capability(self) -> SessionCapability:
+        return self._capability
+
+    def build(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: int,
+        use_pty: bool,
+        session_id: str,
+    ) -> SessionCommand:
+        validated = self.runner.validate(argv, timeout_seconds=timeout_seconds)
+        resolved, _ = self.runner._resolve_argv(validated)
+        env = self.runner._environment()
+        return SessionCommand(
+            argv=list(resolved),
+            display_argv=list(validated),
+            cwd=self.workspace,
+            env=env,
+            use_pty=use_pty,
+            env_sha256=env_digest(env),
+            session_id=session_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def spawn(self, command: SessionCommand) -> tuple[subprocess.Popen, int | None]:
+        master_fd: int | None = None
+        slave_fd: int | None = None
+        if command.use_pty:
+            try:
+                import pty as pty_module
+            except ImportError as exc:  # pragma: no cover - Windows
+                raise PolicyError("PTY sessions are not available on this platform") from exc
+            master_fd, slave_fd = pty_module.openpty()
+        child_streams: dict[str, object] = (
+            {"stdin": slave_fd, "stdout": slave_fd, "stderr": slave_fd}
+            if slave_fd is not None
+            else {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            }
+        )
+        preexec, limits_fd, _ = self.runner._limit_probe(
+            cpu_time_seconds=max(
+                1, self.runner.policy.cpu_time_seconds or command.timeout_seconds + 5
+            )
+        )
+        try:
+            process = subprocess.Popen(
+                command.argv,
+                cwd=str(command.cwd),
+                env=command.env,
+                shell=False,
+                start_new_session=True,
+                preexec_fn=preexec,
+                **child_streams,
+            )
+        except BaseException:
+            if master_fd is not None:
+                os.close(master_fd)
+            raise
+        finally:
+            try:
+                os.close(limits_fd)
+            except OSError:  # pragma: no cover
+                pass
+            if slave_fd is not None:
+                # The child owns duplicates of the slave fd; the parent must not
+                # keep it open, or PTY EOF/EIO would never be observed.
+                try:
+                    os.close(slave_fd)
+                except OSError:  # pragma: no cover
+                    pass
+        return process, master_fd
+
+    def terminate(self, process: subprocess.Popen, *, session_id: str) -> None:
+        del session_id
+        kill_process_group(process.pid)
 
 
 @dataclass
@@ -79,14 +297,24 @@ class SessionManager:
         max_sessions: int = 8,
         max_event_bytes: int = 200_000,
         redactor: Callable[[str], str] | None = None,
+        backend: SessionBackend | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self.runner = runner
         self.max_sessions = max_sessions
         self.max_event_bytes = max_event_bytes
         self.redactor = redactor or (lambda value: value)
+        self.backend: SessionBackend = backend or LocalProcessSessionBackend(
+            runner, self.workspace
+        )
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.RLock()
+
+    @property
+    def capability(self) -> SessionCapability:
+        """Whether this runtime can own sessions at all."""
+
+        return self.backend.capability
 
     # ------------------------------------------------------------------ open
     def open(
@@ -100,79 +328,40 @@ class SessionManager:
         use_pty: bool = False,
     ) -> SessionRef:
         del cancel_requested  # sessions are bounded by idle/absolute lifetime instead
-        validated = self.runner.validate(argv, timeout_seconds=timeout_seconds)
-        resolved, _ = self.runner._resolve_argv(validated)
-        env = self.runner._environment()
-        master_fd: int | None = None
-        slave_fd: int | None = None
-        if use_pty:
-            try:
-                import pty as pty_module
-            except ImportError as exc:  # pragma: no cover - Windows
-                raise PolicyError("PTY sessions are not available on this platform") from exc
-            master_fd, slave_fd = pty_module.openpty()
-        env_hash = hashlib.sha256(
-            json.dumps(env, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        preexec, limits_fd, _ = self.runner._limit_probe(
-            cpu_seconds=max(1, self.runner.policy.cpu_seconds or timeout_seconds + 5)
+        capability = self.backend.capability
+        if not capability.available:
+            # Fail closed: an isolated runtime never falls back to host Popen.
+            raise PolicyError(
+                capability.reason,
+                hint="Process sessions are unavailable under this execution trust "
+                "profile; run the command with `run_command` instead.",
+            )
+        with self._lock:
+            if len(self._sessions) >= self.max_sessions:
+                raise PolicyError(f"session limit of {self.max_sessions} reached")
+        # The id exists before the process: a container backend embeds it in the
+        # exec environment so termination can target exactly this session.
+        session_id = "ses_" + uuid.uuid4().hex
+        command = self.backend.build(
+            argv,
+            timeout_seconds=timeout_seconds,
+            use_pty=use_pty,
+            session_id=session_id,
         )
-        process: subprocess.Popen | None = None
-        try:
-            child_streams = (
-                {"stdin": slave_fd, "stdout": slave_fd, "stderr": slave_fd}
-                if slave_fd is not None
-                else {
-                    "stdin": subprocess.PIPE,
-                    "stdout": subprocess.PIPE,
-                    "stderr": subprocess.PIPE,
-                }
-            )
-            process = subprocess.Popen(
-                resolved,
-                cwd=str(self.workspace),
-                env=env,
-                shell=False,
-                start_new_session=True,
-                preexec_fn=preexec,
-                **child_streams,
-            )
-        except BaseException:
-            if master_fd is not None:
-                os.close(master_fd)
-            raise
-        finally:
-            try:
-                os.close(limits_fd)
-            except OSError:  # pragma: no cover
-                pass
-            if slave_fd is not None:
-                # The child owns duplicates of the slave fd; the parent must not
-                # keep it open, or PTY EOF/EIO would never be observed.
-                try:
-                    os.close(slave_fd)
-                except OSError:  # pragma: no cover
-                    pass
+        process, master_fd = self.backend.spawn(command)
         if process is None:  # pragma: no cover - defensive
             if master_fd is not None:
                 os.close(master_fd)
             raise PolicyError("session process could not be started")
         with self._lock:
-            if len(self._sessions) >= self.max_sessions:
-                self._kill(process.pid)
-                process.wait(timeout=5)
-                if master_fd is not None:
-                    os.close(master_fd)
-                raise PolicyError(f"session limit of {self.max_sessions} reached")
-            session_id = "ses_" + uuid.uuid4().hex
             session = _Session(
                 ref=SessionRef(
                     id=session_id,
-                    argv=validated,
-                    cwd=str(self.workspace),
-                    env_sha256=env_hash,
+                    argv=list(command.display_argv),
+                    cwd=str(command.cwd),
+                    env_sha256=command.env_sha256,
                     started_at=time.monotonic(),
-                    pty=use_pty,
+                    pty=command.use_pty,
                 ),
                 process=process,
                 master_fd=master_fd,
@@ -307,6 +496,22 @@ class SessionManager:
         with session.lock:
             return [event.as_dict() for event in session.events if event.seq > after_seq]
 
+    def stream_text(
+        self, session_id: str, *, after_seq: int = 0, kinds: tuple[str, ...] = ("stdout",)
+    ) -> str:
+        """Concatenate ordered chunks into the text a consumer should assert on.
+
+        Output is a chunk stream, not a line stream (see the module docstring),
+        so any phrase-shaped check must accumulate events first. This helper is
+        the supported way to do that.
+        """
+
+        return "".join(
+            event["data"]
+            for event in self.stream(session_id, after_seq=after_seq)
+            if event["kind"] in kinds
+        )
+
     def send_input(self, session_id: str, data: str) -> None:
         session = self._get(session_id)
         with session.lock:
@@ -352,11 +557,16 @@ class SessionManager:
             if session.state in {"STOPPED", "EXITED"}:
                 return {"stopped": True, "reason": reason, "already_finished": True}
             session.state = "STOPPED"
-        self._kill(session.process.pid)
+        # The backend owns termination so a container session is signalled
+        # inside its container rather than only closing the host-side client.
+        try:
+            self.backend.terminate(session.process, session_id=session.ref.id)
+        except Exception:  # noqa: BLE001 - the fallback kill below still runs
+            kill_process_group(session.process.pid)
         try:
             session.process.wait(timeout=5)
         except subprocess.TimeoutExpired:  # pragma: no cover
-            self._kill(session.process.pid)
+            kill_process_group(session.process.pid)
             session.process.wait(timeout=5)
         self._append(session, "status", f"stopped: {reason}")
         if session.master_fd is not None:
@@ -432,17 +642,15 @@ class SessionManager:
             raise PolicyError(f"unknown session: {session_id}")
         return session
 
-    @staticmethod
-    def _kill(pid: int) -> None:
-        import signal
-
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:  # pragma: no cover
-                pass
-
-
-__all__ = ["SessionManager", "SessionRef", "SessionEvent"]
+__all__ = [
+    "LocalProcessSessionBackend",
+    "SessionBackend",
+    "SessionCapability",
+    "SessionCommand",
+    "SessionEvent",
+    "SessionManager",
+    "SessionRef",
+    "UnavailableSessionBackend",
+    "env_digest",
+    "kill_process_group",
+]

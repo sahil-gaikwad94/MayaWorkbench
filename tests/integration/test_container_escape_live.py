@@ -136,7 +136,7 @@ def oci_live(oci_capability, tmp_path, monkeypatch):
         dependency_policy="DENY",
         max_processes=8,
         memory_limit_mb=256,
-        cpu_seconds=4,
+        cpu_time_seconds=4,
         max_runtime_seconds=_MAX_TIMEOUT,
     )
     run_home = tmp_path / "live-run-home"
@@ -144,9 +144,12 @@ def oci_live(oci_capability, tmp_path, monkeypatch):
         source,
         run_home,
         policy,
-        verified=True,  # justified by the gate's real smoke test
         image="python:3.12-slim",
     )
+    # The gate above proved the mechanism is available; this proves the exact
+    # policy values used by the harness are the values the kernel applies.
+    evidence = backend.verify_capabilities()
+    assert evidence.available, evidence.mandatory_failures
     return SimpleNamespace(
         backend=backend,
         source=source,

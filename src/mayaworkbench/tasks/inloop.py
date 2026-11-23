@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from mayaworkbench.domain.enums import CheckKind, CheckOutcome
+from mayaworkbench.domain.enums import CheckKind, CheckOutcome, ExecutionTrust
 from mayaworkbench.domain.models import CheckSpec, TaskContract
 from mayaworkbench.errors import MayaError
 from mayaworkbench.verification import execution
@@ -304,11 +304,21 @@ class DeclaredCheckRunner:
     """Execute only the checks the contract declares, through the command policy.
 
     There is no free-form command here: keys are matched against the immutable
-    contract, argv comes from the contract, and the same ``CommandRunner``
-    (allowlist, no shell, rlimits, network policy, timeout) is used as for
-    verification. ``authorized`` is decided by the caller from a consumed
-    ``COMMAND_EXECUTION`` approval, never by the model.
+    contract, argv comes from the contract, and the task's single injected
+    ``TaskExecutionRuntime`` executes it — the exact same boundary the
+    implementer used, so an isolated task runs its checks inside its container
+    rather than through a hidden host runner. ``authorized`` is decided by the
+    caller from a consumed ``COMMAND_EXECUTION`` approval, never by the model.
     """
+
+    #: Trust profiles that must never fall back to a host command runner.
+    ISOLATED_TRUST = frozenset(
+        {
+            ExecutionTrust.ROOTLESS_CONTAINER.value,
+            ExecutionTrust.REMOTE_MICROVM.value,
+            ExecutionTrust.GPU_RUNNER.value,
+        }
+    )
 
     def __init__(
         self,
@@ -318,11 +328,13 @@ class DeclaredCheckRunner:
         run_home: Path,
         authorized: bool,
         declared: list[CheckSpec] | None = None,
+        runtime: Any | None = None,
     ) -> None:
         self.contract = contract
         self.workspace = Path(workspace)
         self.run_home = Path(run_home)
         self.authorized = authorized
+        self.runtime = runtime
         self._declared = list(declared if declared is not None else contract.verification_checks)
 
     # ------------------------------------------------------------------ lookup
@@ -414,6 +426,16 @@ class DeclaredCheckRunner:
             base.infrastructure = True
             base.command = list(spec.argv or [])
             return base
+        if self.runtime is None and self.contract.constraints.execution_trust in self.ISOLATED_TRUST:
+            # Never construct a host runner for an isolated task: the check is
+            # blocked, and `maya verify run` executes it in a matched runtime.
+            base.reason = (
+                "the task's isolated execution runtime was not supplied to the in-loop "
+                "check runner, so the check is blocked rather than executed on the host"
+            )
+            base.infrastructure = True
+            base.command = list(spec.argv or [])
+            return base
         script: str | None = None
         argv = list(spec.argv or [])
         if spec.kind == CheckKind.ML_INVARIANT:
@@ -443,6 +465,7 @@ class DeclaredCheckRunner:
                 argv=None if script is not None else argv,
                 script=script,
                 timeout_seconds=timeout,
+                runtime=self.runtime,
             )
         except (MayaError, OSError) as exc:
             base.reason = f"the check could not be started: {exc}"

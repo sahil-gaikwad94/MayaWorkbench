@@ -10,9 +10,17 @@ from __future__ import annotations
 import posixpath
 import re
 from typing import Any
-from urllib.parse import ParseResult
+from urllib.parse import ParseResult, urlsplit
 
 from mayaworkbench.api.errors import ApiError
+
+#: The only hostnames this control plane answers for. The browser sends the
+#: hostname from the URL, so a DNS-rebinding page (``evil.example`` resolving to
+#: 127.0.0.1) is rejected by the Host check below even though the TCP connection
+#: is local.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+#: Fetch metadata values that may accompany a same-origin mutation.
+SAFE_FETCH_SITES = frozenset({"same-origin", "none"})
 
 # Bounds chosen to be generous for real identifiers but far below anything that
 # could be used to smuggle a payload through a query string.
@@ -145,14 +153,87 @@ def guard_request_path(parsed: ParseResult) -> None:
         raise ApiError(400, "REQUEST_TOO_LARGE", "The request target is too large.")
 
 
+def host_without_port(value: str | None) -> str:
+    """Normalise a Host header or an Origin netloc to a comparable hostname."""
+
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    if text.startswith("["):  # IPv6 literal: [::1]:8765
+        return text.split("]", 1)[0].lstrip("[")
+    if text.count(":") == 1:
+        return text.rsplit(":", 1)[0]
+    return text
+
+
+def guard_local_request(
+    *,
+    method: str,
+    host_header: str | None,
+    origin: str | None,
+    referer: str | None,
+    sec_fetch_site: str | None,
+) -> None:
+    """Enforce the local-only request contract (MW-NEW-P1-09).
+
+    Four independent checks, each of which the browser can be relied on to
+    send: the Host header must be loopback (DNS-rebinding defence); a mutation
+    must not carry a cross-site fetch metadata value; a mutation must not
+    originate from a non-loopback Origin/Referer; and a mutation from a browser
+    with no Origin at all must not be a cross-site form post. Non-browser local
+    clients (the CLI, a script) send none of these headers and still work.
+    """
+
+    host = host_without_port(host_header)
+    if host and host not in LOOPBACK_HOSTS:
+        raise ApiError(
+            403,
+            "HOST_NOT_LOOPBACK",
+            "This control plane answers only loopback hostnames.",
+            hint="Use http://127.0.0.1:<port> or http://localhost:<port>.",
+        )
+
+    mutation = method.upper() not in {"GET", "HEAD", "OPTIONS"}
+    site = (sec_fetch_site or "").strip().lower()
+    if mutation and site and site not in SAFE_FETCH_SITES:
+        raise ApiError(
+            403,
+            "CROSS_SITE_REQUEST",
+            "Cross-site mutations are refused by the local security contract.",
+        )
+    for label, value in (("Origin", origin), ("Referer", referer)):
+        if not value:
+            continue
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"}:
+            if mutation:
+                raise ApiError(
+                    403, "CROSS_ORIGIN_REQUEST", f"The {label} header is not a web origin."
+                )
+            continue
+        if host_without_port(parsed.netloc) not in LOOPBACK_HOSTS and mutation:
+            raise ApiError(
+                403,
+                "CROSS_ORIGIN_REQUEST",
+                "Cross-origin mutations are refused by the local security contract.",
+                hint="Drive the API from the local UI or a local client.",
+            )
+    if mutation and not origin and site in {"cross-site", "same-site"}:  # pragma: no cover
+        raise ApiError(403, "CROSS_SITE_REQUEST", "Cross-site mutations are refused.")
+
+
 __all__ = [
     "MAX_BODY_BYTES",
     "ID_RE",
     "SLUG_RE",
     "PROJECT_REF_RE",
     "SEARCH_MODES",
+    "LOOPBACK_HOSTS",
+    "SAFE_FETCH_SITES",
     "param",
     "ensure_safe_path",
     "parse_body",
     "guard_request_path",
+    "guard_local_request",
+    "host_without_port",
 ]

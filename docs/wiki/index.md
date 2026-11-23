@@ -27,3 +27,19 @@ current code; each code claim cites the commit or date it was true.
   [Signed run bundles spec](../spec-signed-run-bundles.md), [Real-model eval spec](../spec-real-model-eval.md),
   [Parallel discovery spec](../spec-parallel-discovery.md), [LSP client spec](../spec-lsp-client.md),
   [MLflow connector spec](../spec-mlflow-connector.md) — final audit packages (2026-11-22).
+- [2026-11-23 audit remediation](audit-2026-11-23-remediation.md) — per-finding status,
+  evidence and remaining work for the Trustworthy Runtime + Verification package
+  (sanitized snapshot, evidence-based capability probe, one runtime for the whole
+  lifecycle, baseline parity, CPU split, hermetic tests, local API contract).
+- [ADR 0015](../adr/0015-trustworthy-runtime-and-verification-release.md) — the dated
+  decision record for that package and the product-freeze reconciliation.
+- [ADR 0016](../adr/0016-container-owned-sessions-and-environment-provisioning.md) —
+  container-owned sessions (retained container, per-session marker, generated
+  terminator) and the immutable environment spec/provisioner with its network gate
+  and truthful inventory.
+- [ADR 0017](../adr/0017-model-provider-hardening.md) — provider-correct structured
+  output, parameter adaptation, cache/tool semantics, hybrid streaming and honest
+  failure/usage accounting for the OpenAI-compatible, Anthropic and Gemini adapters.
+- [Release evidence 2026-11-23](../reports/test-run-2026-11-23.json) — machine-readable
+  full-suite record (834 collected, 827 passed, 7 skipped, 0 failed) with the JUnit XML
+  beside it.

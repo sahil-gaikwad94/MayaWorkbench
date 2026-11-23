@@ -1158,6 +1158,11 @@ class ToolGateway:
         manager = self.session_manager
         if manager is None:
             raise ToolBlocked("this runtime does not provide process sessions")
+        capability = getattr(manager, "capability", None)
+        if capability is not None and not capability.available:
+            # Typed capability refusal: an isolated runtime does not fall back
+            # to a host process just because a session was requested.
+            raise ToolBlocked(f"process sessions are unavailable: {capability.reason}")
         max_runtime = self.contract.constraints.max_runtime_seconds
         if tool == "open_session":
             timeout = min(args["timeout_seconds"], max_runtime)

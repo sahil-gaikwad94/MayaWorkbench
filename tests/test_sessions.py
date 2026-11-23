@@ -9,7 +9,10 @@ import pytest
 
 from mayaworkbench.errors import PolicyError
 from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
-from mayaworkbench.workspace.sessions import SessionManager
+from mayaworkbench.workspace.sessions import (
+    SessionManager,
+    UnavailableSessionBackend,
+)
 
 from .test_tool_gateway_runner import build_gateway
 
@@ -27,6 +30,11 @@ def _manager(tmp_path, *, max_output_bytes=20_000) -> SessionManager:
         run_home=tmp_path / "run-home",
     )
     return SessionManager(tmp_path, runner, redactor=lambda text: text.replace("sk-secret", "[redacted]"))
+
+
+def _joined(events, kind="stdout"):
+    """Concatenate ordered chunks: output is a chunk stream, not a line stream."""
+    return "".join(item["data"] for item in events if item["kind"] == kind)
 
 
 def _wait_for(manager, session_id, predicate, timeout=5):
@@ -50,14 +58,13 @@ def test_session_streams_input_and_replays_by_sequence(tmp_path):
         ],
         timeout_seconds=15,
     )
-    events = _wait_for(manager, ref.id, lambda e: any(x["data"].strip() == "one" for x in e))
+    events = _wait_for(manager, ref.id, lambda e: "one" in _joined(e))
     assert any(item["kind"] == "stdout" for item in events)
     first_seq = max(item["seq"] for item in events)
 
     manager.send_input(ref.id, "hello\n")
     def _got_input(events):
-        joined = "".join(x["data"] for x in events if x["kind"] == "stdout")
-        return "got hello" in joined
+        return "got hello" in _joined(events)
 
     events = _wait_for(manager, ref.id, _got_input)
     replay = manager.stream(ref.id, after_seq=first_seq)
@@ -91,8 +98,8 @@ def test_session_output_is_bounded_and_redacted(tmp_path):
         ["python", "-u", "-c", "print('sk-secret-should-not-appear'); print('x' * 5000)"],
         timeout_seconds=15,
     )
-    events = _wait_for(manager, ref.id, lambda e: any("x" * 100 in x["data"] for x in e))
-    joined = "".join(item["data"] for item in events)
+    events = _wait_for(manager, ref.id, lambda e: "x" * 100 in _joined(e))
+    joined = _joined(events)
     assert "sk-secret" not in joined
     assert "[redacted]" in joined
     assert manager.status(ref.id)["truncated"] is True
@@ -121,9 +128,72 @@ def test_pty_session_streams_and_accepts_input(tmp_path):
     )
     assert manager.status(ref.id)["pty"] is True
     manager.send_input(ref.id, "hello-pty\n")
-    events = _wait_for(manager, ref.id, lambda e: any("PTY_GOT hello-pty" in x["data"] for x in e))
+    # Output is an arbitrary chunk stream: a phrase may be split across several
+    # events, so the assertion accumulates ordered chunks first (MW-NEW-P1-02).
+    events = _wait_for(manager, ref.id, lambda e: "hello-pty" in _joined(e))
     assert any(item["kind"] == "stdout" for item in events)
+    assert "PTY_GOT hello-pty" in manager.stream_text(ref.id)
     manager.stop(ref.id, reason="test complete")
+
+
+def test_isolated_runtime_refuses_sessions_instead_of_using_the_host(tmp_path):
+    """MW-NEW-P0-04: no silent fallback from a container to host Popen.
+
+    The positive container-owned path (``ContainerSessionBackend``) is covered in
+    ``tests/test_container_sessions.py``; this test fixes the fail-closed
+    contract every unavailable backend must satisfy.
+    """
+    runner = CommandRunner(
+        tmp_path,
+        policy=CommandPolicy(
+            profile="CPU_SMOKE",
+            network_policy="ALLOW_WITH_APPROVAL",
+            dependency_policy="DENY",
+            max_runtime_seconds=20,
+        ),
+        run_home=tmp_path / "run-home",
+    )
+    manager = SessionManager(
+        tmp_path,
+        runner,
+        backend=UnavailableSessionBackend(
+            "this runtime cannot own a session process"
+        ),
+    )
+    assert manager.capability.available is False
+    with pytest.raises(PolicyError, match="this runtime cannot own a session process"):
+        manager.open(["python", "-c", "print('never runs')"], timeout_seconds=5)
+    assert manager.stop_all(reason="test") == []
+
+
+def test_gateway_reports_unavailable_sessions_as_a_typed_refusal(
+    services, indexed, tmp_path
+):
+    from mayaworkbench.domain.enums import ToolCallStatus
+
+    gateway, workspace, *_ = build_gateway(services, indexed, tmp_path)
+    runner = CommandRunner(
+        workspace,
+        policy=CommandPolicy(
+            profile="CPU_SMOKE",
+            network_policy="ALLOW_WITH_APPROVAL",
+            dependency_policy="DENY",
+            max_runtime_seconds=20,
+        ),
+        run_home=tmp_path / "session-home",
+    )
+    gateway.session_manager = SessionManager(
+        workspace,
+        runner,
+        backend=UnavailableSessionBackend("no container-owned sessions on this runtime"),
+    )
+    gateway.contract.constraints.capabilities = ["process.session"]
+    result = gateway.invoke(
+        "open_session",
+        {"argv": ["python", "-c", "print('x')"], "timeout_seconds": 10},
+    )
+    assert result.status == ToolCallStatus.BLOCKED
+    assert "no container-owned sessions" in result.summary
 
 
 def test_session_record_replay_is_durable_and_sequence_aware(tmp_path):

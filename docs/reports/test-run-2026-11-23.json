@@ -1,0 +1,48 @@
+{
+  "commit": "f57fad1c44d19d78bc157d56e3c63e2be17a062f",
+  "work_tree": "dirty: model/provider hardening not yet committed",
+  "modified_tracked_files": 55,
+  "date": "2026-11-23",
+  "python": "3.12.3",
+  "platform": "Linux-6.1.102-x86_64-with-glibc2.39",
+  "pytest": "pytest 9.2.0",
+  "command": "python -m pytest -q --junitxml=docs/reports/pytest-2026-11-23.xml --durations=12",
+  "counts": {
+    "tests": 834,
+    "passed": 827,
+    "skipped": 7,
+    "failed": 0
+  },
+  "duration_seconds": 85.5,
+  "slowest": [
+    {
+      "test": "tests::test_task_cli::test_cli_full_flow_uses_a_separate_worker_process",
+      "seconds": 2.27
+    },
+    {
+      "test": "tests::test_lsp_client::test_child_environment_is_sanitized",
+      "seconds": 2.02
+    },
+    {
+      "test": "tests::test_sessions::test_idle_timeout_stops_the_process_group",
+      "seconds": 1.61
+    }
+  ],
+  "skips": [
+    "tests::integration::test_container_escape_live::test_container_denies_host_reads_and_reports_honest_limits",
+    "tests::integration::test_container_escape_live::test_overlay_is_populated_and_secret_free",
+    "tests::integration::test_container_escape_live::test_stop_removes_container_and_overlay_and_no_child_survives",
+    "tests::integration::test_model_live::test_live_model_requires_spend_cap_when_enabled",
+    "tests::integration::test_model_live::test_live_structured_output_is_schema_valid",
+    "tests::integration::test_model_live::test_live_tool_calls_are_declared_and_parseable",
+    "tests::test_workbench_ui::test_browser_render_if_playwright_available"
+  ],
+  "junit": "docs/reports/pytest-2026-11-23.xml",
+  "live_gates": {
+    "oci": "NOT RUN (MAYA_OCI_LIVE unset; no rootless OCI runtime in this environment)",
+    "model": "NOT RUN (MAYA_LIVE_MODEL unset; no provider key in this environment)"
+  },
+  "added_tests": {
+    "tests/test_provider_adapters.py": 20
+  }
+}

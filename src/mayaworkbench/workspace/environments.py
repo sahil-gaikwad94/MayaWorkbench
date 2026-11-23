@@ -386,12 +386,271 @@ def build_plan(
     return ProvisioningPlan(info.root, runtime, tuple(steps), digest, fingerprint, tuple(notes))
 
 
+# ------------------------------------------------------- environment contract
+#: Steps that download packages. Kept as purposes so a provisioner can gate them
+#: without inferring semantics from argv (an install step is not identifiable
+#: from the binary alone once wrappers are involved).
+_NETWORK_PURPOSES = frozenset(
+    {
+        "container-build-proposal",
+        "go-check",
+        "go-vet",
+        "java-test",
+        "node-install",
+        "python-install",
+        "rust-check",
+        "rust-test",
+    }
+)
+
+#: Ecosystems for which a missing lockfile is a real reproducibility risk.
+_LOCKFILE_EXPECTED = frozenset({"python", "node", "rust", "go"})
+
+
+def requires_network(step: ProvisionStep) -> bool:
+    """Whether a step needs package downloads, and therefore approval."""
+
+    if step.purpose in _NETWORK_PURPOSES:
+        return True
+    return step.argv[:1] in {
+        ("cargo",),
+        ("go",),
+        ("mvn",),
+        ("./mvnw",),
+        ("gradle",),
+        ("./gradlew",),
+    }
+
+
+@dataclass(frozen=True)
+class ServiceSpec:
+    """A service the environment declares but does not (yet) manage.
+
+    ``health_check`` is the argv a runtime would execute inside the task
+    environment. Declaring the dependency is useful for parity and evidence;
+    starting it is a separate capability that must be verified, so the
+    provisioner reports services as ``not_started`` rather than pretending.
+    """
+
+    name: str
+    port: int
+    health_check: tuple[str, ...] = ()
+    required: bool = True
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "port": self.port,
+            "health_check": list(self.health_check),
+            "required": self.required,
+        }
+
+
+@dataclass(frozen=True)
+class EnvironmentSpec:
+    """Immutable, replayable description of an engineering environment.
+
+    This is the contract a provisioner executes and a baseline reuses. It
+    records what was *detected* (lockfile hashes, managers) and what was
+    *requested* (image, services, secret references) separately, so evidence
+    never presents a guess as a pin.
+    """
+
+    root: str
+    runtime: str
+    image: str
+    image_digest: str
+    ecosystems: tuple[str, ...]
+    steps: tuple[ProvisionStep, ...]
+    lockfiles: dict[str, str]
+    lockfile_absent: tuple[str, ...]
+    package_managers: dict[str, str]
+    system_packages: tuple[str, ...]
+    services: tuple[ServiceSpec, ...]
+    env: dict[str, str]
+    network_gated_steps: tuple[str, ...]
+    hardware: dict[str, Any]
+    provenance: dict[str, Any]
+    notes: tuple[str, ...]
+    spec_sha256: str
+
+    @property
+    def commands(self) -> dict[str, tuple[str, ...]]:
+        """Purpose -> argv for every step, in plan order."""
+
+        return {step.purpose: step.argv for step in self.steps}
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "root": self.root,
+            "runtime": self.runtime,
+            "image": self.image,
+            "image_digest": self.image_digest,
+            "ecosystems": list(self.ecosystems),
+            "steps": [step.as_dict() for step in self.steps],
+            "commands": {
+                purpose: list(argv) for purpose, argv in sorted(self.commands.items())
+            },
+            "lockfiles": dict(sorted(self.lockfiles.items())),
+            "lockfile_absent": list(self.lockfile_absent),
+            "package_managers": dict(sorted(self.package_managers.items())),
+            "system_packages": list(self.system_packages),
+            "services": [service.as_dict() for service in self.services],
+            "env": dict(sorted(self.env.items())),
+            "network_gated_steps": list(self.network_gated_steps),
+            "hardware": dict(sorted(self.hardware.items())),
+            "provenance": self.provenance,
+            "notes": list(self.notes),
+            "spec_sha256": self.spec_sha256,
+        }
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _package_manager(purpose: str, argv: tuple[str, ...]) -> tuple[str, str] | None:
+    if not argv:
+        return None
+    if purpose == "python-install":
+        return "python", {"uv": "uv", "poetry": "poetry"}.get(argv[0], "pip")
+    if purpose == "node-install":
+        return "node", argv[0]
+    if purpose.startswith("rust-"):
+        return "rust", "cargo"
+    if purpose.startswith("go-"):
+        return "go", "go"
+    if purpose == "java-test":
+        manager = "gradle" if argv[0].endswith("gradlew") or argv[0] == "gradle" else "maven"
+        return "java", manager
+    if purpose.startswith("cpp-"):
+        return "cpp", "cmake" if argv[0] == "cmake" else "make"
+    return None
+
+
+def resolve_spec(
+    root: str | Path,
+    *,
+    runtime: str = "ROOTLESS_CONTAINER",
+    image: str = "python:3.12-slim",
+    image_digest: str = "",
+    services: tuple[ServiceSpec, ...] | list[ServiceSpec] = (),
+    secret_refs: tuple[str, ...] | list[str] = (),
+    hardware: dict[str, Any] | None = None,
+) -> EnvironmentSpec:
+    """Resolve a deterministic environment spec from detected files.
+
+    The spec never invents a lockfile: ``lockfiles`` contains only files that
+    exist, with the hash of their real bytes, and ``lockfile_absent`` names the
+    ecosystems where reproducibility is therefore weaker.
+    """
+
+    info = detect(root)
+    plan = build_plan(info.root, runtime=runtime, detection=info)
+    base = Path(info.root)
+
+    lockfiles: dict[str, str] = {}
+    for items in info.lockfiles.values():
+        for name in items:
+            digest = _sha256_file(base / name)
+            if digest is not None:
+                lockfiles[name] = digest
+    lockfile_absent = tuple(
+        ecosystem
+        for ecosystem in sorted(info.ecosystems)
+        if ecosystem in _LOCKFILE_EXPECTED and not info.lockfiles.get(ecosystem)
+    )
+
+    managers: dict[str, str] = {}
+    for step in plan.steps:
+        found = _package_manager(step.purpose, step.argv)
+        if found is not None and found[0] not in managers:
+            managers[found[0]] = found[1]
+
+    steps = tuple(step for step in plan.steps if step.purpose != "verify-runtime")
+    notes = list(plan.notes)
+    notes.append(
+        "Runtime pre-flight is not part of the spec: the runtime is verified and "
+        "provisioned before any step runs."
+    )
+    if lockfile_absent:
+        notes.append(
+            "No lockfile was detected for: "
+            + ", ".join(lockfile_absent)
+            + ". Install steps are explicit requests, not invented pins."
+        )
+    if not hardware:
+        notes.append("No hardware requirement was declared; the runtime default applies.")
+    notes.append(
+        "System packages are properties of the pinned image; they are not parsed "
+        "from a Dockerfile."
+    )
+
+    env = {name: f"secret:{name}" for name in sorted(set(secret_refs))}
+    network_gated = tuple(
+        sorted({step.purpose for step in steps if requires_network(step)})
+    )
+
+    payload: dict[str, Any] = {
+        "root": info.root,
+        "runtime": runtime,
+        "image": image,
+        "image_digest": image_digest,
+        "ecosystems": list(info.ecosystems),
+        "steps": [step.as_dict() for step in steps],
+        "lockfiles": dict(sorted(lockfiles.items())),
+        "lockfile_absent": list(lockfile_absent),
+        "package_managers": dict(sorted(managers.items())),
+        "system_packages": [],
+        "services": [service.as_dict() for service in services],
+        "env": dict(sorted(env.items())),
+        "network_gated_steps": list(network_gated),
+        "hardware": dict(sorted((hardware or {}).items())),
+        "provenance": {
+            "detection_confidence": info.confidence,
+            "descriptors": {key: list(value) for key, value in sorted(info.descriptors.items())},
+            "fingerprint_sha256": plan.fingerprint_sha256,
+            "plan_sha256": plan.plan_sha256,
+        },
+        "notes": notes,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    return EnvironmentSpec(
+        root=info.root,
+        runtime=runtime,
+        image=image,
+        image_digest=image_digest,
+        ecosystems=info.ecosystems,
+        steps=steps,
+        lockfiles=lockfiles,
+        lockfile_absent=lockfile_absent,
+        package_managers=managers,
+        system_packages=(),
+        services=tuple(services),
+        env=env,
+        network_gated_steps=network_gated,
+        hardware=dict(hardware or {}),
+        provenance=payload["provenance"],
+        notes=tuple(notes),
+        spec_sha256=digest,
+    )
+
+
 __all__ = [
     "MARKERS",
     "LOCKFILES",
     "EnvironmentDetection",
+    "EnvironmentSpec",
     "ProvisionStep",
     "ProvisioningPlan",
-    "detect",
+    "ServiceSpec",
     "build_plan",
+    "detect",
+    "requires_network",
+    "resolve_spec",
 ]

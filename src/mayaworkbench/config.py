@@ -21,7 +21,22 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from mayaworkbench.errors import ConfigError
 
 DataPolicy = Literal["LOCAL_ONLY", "BYOK_REMOTE_MODEL"]
-ModelProviderKind = Literal["none", "openai_compatible", "anthropic", "gemini"]
+ModelProviderKind = Literal[
+    "none",
+    "openai_compatible",
+    "anthropic",
+    "gemini",
+    "local_openai_compatible",
+]
+
+#: Provider-specific key variables used when the user has not overridden
+#: ``model.api_key_env``. Values are variable *names*, never credentials.
+PROVIDER_KEY_ENV = {
+    "anthropic": "MAYA_ANTHROPIC_API_KEY",
+    "gemini": "MAYA_GEMINI_API_KEY",
+    "local_openai_compatible": "MAYA_LOCAL_MODEL_API_KEY",
+}
+DEFAULT_MODEL_KEY_ENV = "MAYA_MODEL_API_KEY"
 
 SETTINGS_SCHEMA_VERSION = "1"
 
@@ -117,7 +132,7 @@ class ModelSettings(BaseModel):
     provider: ModelProviderKind = "none"
     base_url: str = "https://api.openai.com/v1"
     model: str = ""
-    api_key_env: str = "MAYA_MODEL_API_KEY"
+    api_key_env: str = DEFAULT_MODEL_KEY_ENV
     timeout_seconds: int = Field(default=120, ge=5, le=900)
     max_output_tokens: int = Field(default=2000, ge=128, le=32000)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -385,18 +400,32 @@ def save_settings(paths: AppPaths, settings: Settings) -> None:
         raise ConfigError(f"Cannot write settings to {paths.config_path}: {exc}") from exc
 
 
+def provider_key_env(settings: Settings) -> str:
+    """Resolve the key variable for the configured provider (never the value).
+
+    A user-set ``model.api_key_env`` always wins. Otherwise the provider's
+    conventional variable is used so an Anthropic or Gemini key does not have to
+    be re-exported under the OpenAI-compatible name.
+    """
+    configured = settings.model.api_key_env
+    if configured and configured != DEFAULT_MODEL_KEY_ENV:
+        return configured
+    return PROVIDER_KEY_ENV.get(settings.model.provider, configured or DEFAULT_MODEL_KEY_ENV)
+
+
 def api_key_from_env(settings: Settings) -> str | None:
     """Read the provider key from its configured environment variable.
 
     The key is returned only to the provider adapter; it is never logged,
-    persisted, or included in exported artifacts.
+    persisted, or included in exported artifacts. This uses the explicitly
+    configured variable; use :func:`provider_key_env` for provider defaults.
     """
     raw = os.environ.get(settings.model.api_key_env)
     return raw or None
 
 
 def redacted_settings_view(paths: AppPaths, settings: Settings) -> dict:
-    key_present = api_key_from_env(settings) is not None
+    key_present = bool(os.environ.get(provider_key_env(settings)))
     return {
         "home": str(paths.home),
         "database": str(paths.db_path),

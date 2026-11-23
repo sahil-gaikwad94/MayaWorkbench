@@ -47,12 +47,15 @@ def test_address_space_limit_stops_a_memory_hog(tmp_path):
 
 
 def test_cpu_limit_terminates_a_cpu_spin(tmp_path):
-    runner = _runner(tmp_path, cpu_seconds=1)
+    runner = _runner(tmp_path, cpu_time_seconds=1)
     result = runner.run(
         ["python", "-c", "while True: pass"],
         timeout_seconds=20,
     )
-    assert result.limits["cpu"].status == "enforced"
+    assert result.limits["cpu_time"].status == "enforced"
+    # CPU concurrency is a different control and is never claimed by the host
+    # runner just because RLIMIT_CPU was applied.
+    assert result.limits["cpu_quota"].status == "unsupported"
     assert not result.timed_out, "the wall clock, not RLIMIT_CPU, ended the command"
     assert result.exit_code is not None and result.exit_code != 0
     assert result.duration_ms < 10_000

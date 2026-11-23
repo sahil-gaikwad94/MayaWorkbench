@@ -12,7 +12,8 @@
   `python -m pip install -e ".[dev]"` plus `pypdf` for PDF tests.
 - Full suite: `python -m pytest -q`
 - Compile: `python -m compileall -q src`
-- Capability report: `python -m mayaworkbench.cli.main runner doctor --json`
+- Capability report: `python -m mayaworkbench.cli.main --json runner doctor` (global
+  `--json` must precede the subcommand)
 
 ## Code conventions
 - `domain/` has no I/O; `storage/stores.py` owns all SQL; CLI handlers call services only.
