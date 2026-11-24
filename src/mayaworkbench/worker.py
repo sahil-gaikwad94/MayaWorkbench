@@ -89,7 +89,10 @@ class Worker:
                 {"owner": self.owner, "attempt": job.attempts},
             )
             try:
-                self._execute(job)
+                if (job.details or {}).get("kind") == "provision":
+                    self._execute_provision(job)
+                else:
+                    self._execute(job)
             except LeaseLost as exc:
                 log.warning("worker lease lost", extra={"job_id": job.id, "error": str(exc)})
                 self._event(job, EventType.WORKER_LEASE_LOST, {"owner": self.owner})
@@ -105,6 +108,108 @@ class Worker:
                 return 0
             if once:
                 return 0
+
+    # ------------------------------------------------------------ provisioning
+    def _execute_provision(self, job: WorkerJob) -> None:
+        """Run the approved environment plan, then enqueue implementation.
+
+        Provisioning is opt-in and explicitly approved. It never runs on a
+        hidden host runner for an isolated profile: an isolated runtime without
+        a provisioning-capable backend settles as BLOCKED rather than silently
+        installing on the host.
+        """
+        from mayaworkbench.domain.enums import DependencyPolicy, ExecutionTrust
+
+        run = self.services.runs.get(job.run_id)
+        if run.state != WorkflowState.ENVIRONMENT_PROVISIONING:
+            self.services.jobs.finish(
+                job.id, status=WorkerJobStatus.FAILED,
+                error=f"run is {run.state.value}, not ENVIRONMENT_PROVISIONING",
+            )
+            return
+        contract = self.services.contracts.get(run.contract_id)
+        workspace = self.services.workspaces.get_by_run(run.id)
+        if workspace is None or workspace.status.value == "REMOVED":
+            self.services.jobs.finish(job.id, status=WorkerJobStatus.FAILED, error="missing workspace")
+            return
+        trust = contract.constraints.execution_trust
+        if trust != ExecutionTrust.LOCAL_TRUSTED.value:
+            reason = (
+                "environment provisioning for the isolated profile requires a "
+                "provisioning-capable backend with approved network access; the "
+                "host is never used as a fallback"
+            )
+            self._transition_or_fail(run.id, WorkflowState.BLOCKED, reason)
+            self.services.jobs.finish(job.id, status=WorkerJobStatus.DONE, error=reason[:4000])
+            return
+
+        from dataclasses import replace
+
+        from mayaworkbench.workspace.environments import build_plan
+        from mayaworkbench.workspace.provisioning import EnvironmentProvisioner
+        from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
+        from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace
+        from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
+
+        root = Path(workspace.path)
+        run_home = root.parent / "provision-home"
+        plan = build_plan(root, runtime=trust)
+        consumed = self.services.approvals.list(run_id=run.id, status=ApprovalStatus.CONSUMED)
+        command_approved = any(
+            item.action == ApprovalAction.COMMAND_EXECUTION for item in consumed
+        )
+        install_authorized = bool(
+            command_approved
+            and contract.constraints.dependency_install == DependencyPolicy.APPROVAL_REQUIRED.value
+        )
+        from mayaworkbench.workspace.runner import INSTALL_EXECUTABLES
+
+        policy = CommandPolicy.from_constraints(contract.constraints)
+        # Plan argv is immutable and approval-gated, so the provisioning runner
+        # may address the plan's closed tool list; installs still need consent.
+        policy = replace(policy, allowed_executables=INSTALL_EXECUTABLES)
+        if install_authorized:
+            policy = replace(policy, network_policy="ALLOW_WITH_APPROVAL")
+        ws = RuntimeWorkspace.for_host(root)
+        runner = CommandRunner(ws.path, policy=policy, run_home=run_home)
+        runtime = CommandRunnerTaskRuntime(
+            workspace=ws, runner=runner, trust_profile=trust,
+            install_authorized=install_authorized,
+        )
+        approved = frozenset({"install", "install-build", "install-runtime"}) if install_authorized else frozenset()
+        report = EnvironmentProvisioner(
+            plan=plan, runtime=runtime, approved_purposes=approved,
+            run_home=run_home, artifacts=self.services.artifacts,
+            image="host", runtime_id=ws.runtime.id if ws.runtime else "",
+            timeout_seconds=contract.constraints.max_runtime_seconds,
+        ).provision()
+        self.services.runs.update_progress(
+            run.id,
+            details={
+                **self.services.runs.get(run.id).details,
+                "environment_provisioning": report.as_dict(),
+            },
+        )
+        self._event(
+            job, EventType.ENVIRONMENT_SPECIFIED,
+            {"plan_sha256": plan.plan_sha256, "status": report.status,
+             "canonical_sha256": report.canonical_sha256},
+        )
+        if report.status in {"FAILED", "BLOCKED"}:
+            self._transition_or_fail(run.id, WorkflowState.BLOCKED, f"environment provisioning {report.status}")
+            self.services.jobs.finish(job.id, status=WorkerJobStatus.DONE, error=report.status)
+            return
+        self._transition_or_fail(run.id, WorkflowState.IMPLEMENTING, "environment provisioned")
+        # Finish the provisioning job BEFORE enqueueing the implementation job:
+        # the store allows only one live (QUEUED/LEASED) job per run.
+        self.services.jobs.finish(job.id, status=WorkerJobStatus.DONE)
+        self.services.jobs.enqueue(
+            WorkerJob(
+                id="job_" + new_ulid(), run_id=run.id,
+                task_id=run.task_id, project_id=run.project_id,
+            )
+        )
+        self._event(job, EventType.WORKER_FINISHED, {"status": "DONE", "state": "IMPLEMENTING"})
 
     # --------------------------------------------------------------- execution
     def _execute(self, job: WorkerJob) -> None:
@@ -215,16 +320,24 @@ class Worker:
             # One canonical capability report decides availability. A runtime
             # that has not passed a real OCI smoke test is never silently
             # downgraded to host execution.
-            capability = probe_execution_capability_report().trust_profiles[trust]
+            capability_report = probe_execution_capability_report()
+            capability = capability_report.trust_profiles[trust]
             if not capability["available"]:
                 raise PolicyError(
                     f"ROOTLESS_CONTAINER cannot be established: {capability['reason']}"
                 )
+            # Only limits the live probe actually observed may be claimed by
+            # this backend. The same evidence travels with the run so the
+            # verifier rebuilds an identical execution boundary.
+            verified_limits = capability_report.execution_backends.get(
+                "rootless-container", {}
+            ).get("verified_limits", {})
             container_backend = RootlessContainerBackend(
                 Path(workspace.path),
                 run_home,
                 replace(contract_policy, trust_profile=ExecutionTrust.LOCAL_TRUSTED.value),
                 verified=True,
+                verified_limits=verified_limits,
             )
             # Provision once. The overlay is the single file view used by all
             # tools, commands, in-loop checks and artifact collection.
@@ -270,6 +383,10 @@ class Worker:
                     if runtime_workspace.runtime
                     else None,
                     "trust_profile": trust,
+                    "verified_limits": verified_limits if trust == ExecutionTrust.ROOTLESS_CONTAINER.value else {},
+                    "mount_policy_sha256": runtime_workspace.runtime.mount_policy_sha256
+                    if runtime_workspace.runtime
+                    else "",
                 },
             }
             self.services.runs.update_progress(run.id, details=binding)
@@ -287,6 +404,13 @@ class Worker:
                 command_approval is not None
                 and ApprovalAction.COMMAND_EXECUTION in contract.required_approvals
             ),
+            runtime=task_runtime,
+            require_isolated_runtime=trust
+            in {
+                ExecutionTrust.ROOTLESS_CONTAINER.value,
+                ExecutionTrust.REMOTE_MICROVM.value,
+                ExecutionTrust.GPU_RUNNER.value,
+            },
         )
         try:
             orientation = build_orientation(

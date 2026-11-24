@@ -80,7 +80,7 @@ claims of implementation.
 | Tool families beyond workspace/Git/command/check | 18 typed tools incl. API/DB/log/notebook/env/session/skill families | `tests/test_advanced_tools.py` | `SHIPPED` |
 | Execution trust profiles | `ExecutionTrust` enum; `LOCAL_TRUSTED` and code-enforced `READ_ONLY_ANALYSIS` available; isolated profiles block unless a real runtime is verified | `tests/test_runner_limits.py`, `tests/test_runner_capabilities.py`, `tests/test_tool_gateway_runner.py` | `SHIPPED` |
 | `ExecutionBackend` protocol + `TrustedLocalBackend` | `workspace/backends.py` | `tests/test_execution_backends.py` | `SHIPPED` |
-| `RootlessContainerBackend` (read-only source at `/src`, populated writable overlay at `/work`, cgroup args, no home/socket/secrets, deny network) | `workspace/backends.py`; no "enforced" claim from controller names; must be smoke-verified before provision | `tests/test_execution_backends.py`, `tests/test_runtime_workspace.py` | `EXPERIMENTAL` (fail-closed; no real OCI host in CI) |
+| `RootlessContainerBackend` (sanitized immutable source snapshot at `/src`, populated writable overlay at `/work`, cgroup args, no home/socket/secrets, deny network) | `workspace/backends.py`; no "enforced" claim from controller names or smoke markers; must pass the live in-container probe before provision | `tests/test_execution_backends.py`, `tests/test_runtime_workspace.py` | `EXPERIMENTAL` (fail-closed; no real OCI host in CI) |
 | Worker routing by contract trust profile | worker provisions one `RuntimeWorkspace` and one `CommandRunnerTaskRuntime` for file tools, commands, in-loop checks and artifact/diff capture | `tests/test_runtime_workspace.py`, `tests/test_task_workflow.py` | `SHIPPED` (routing/boundary); `EXPERIMENTAL` (real isolation) |
 | Remote microVM / user-owned GPU runner backends | `workspace/remote_backends.py`: allowlisted endpoint/executor, fail-closed provision/submit, no secret forwarding | `tests/test_remote_backends.py` | `SHIPPED` as adapters (execution needs user infrastructure) |
 
@@ -214,6 +214,51 @@ claims of implementation.
 | Native-language lockfile planning and CLI ergonomics | `workspace/environments.py`, `cli/environment_commands.py` | `tests/test_environments.py` | `SHIPPED` |
 | NDJSON `fetch` client, real approvals, `/ui` redirect | `api/ui/index.html`, `api/server.py` | `tests/test_api_control_plane.py` | `SHIPPED` |
 | Experience memory wired into the live agent context | `worker.py` | `tests/test_task_workflow.py` | `SHIPPED` |
+
+## 2026-11-23/24 execution-trust and verification closure (WP0/WP1)
+
+This package closes the five P0 findings and the deterministic-test findings in
+`MayaWorkbench_Audit_and_Engineering_Upgrade_Roadmap_2026-11-23.md`. Statuses
+below deliberately separate source implementation from live OCI proof.
+
+| Fix | Implementation | Test | Status |
+|---|---|---|---|
+| P0-01 sanitized immutable source mount | `runtime_workspace.sanitize_source_tree()` (single canonical path/content/symlink filter, frozen 0444/0555 tree, policy fingerprint); `RootlessContainerBackend.provision()` builds a task-owned `/src` snapshot and `/work` overlay and proves equal manifests; `_oci_argv()` never mounts the original worktree | `tests/test_runtime_workspace.py`, `tests/test_execution_backends.py`, `tests/integration/test_container_escape_live.py` (probes `/src/.env`, `/src/.git/config`, `/src/.npmrc`) | `IMPLEMENTED`, `UNIT_TESTED`; live namespace proof `UNVERIFIED` without an OCI host |
+| P0-02 verified OCI capability probe | `capabilities._oci_probe()` now constructs the production backend with identical flags, reads `pids.max`/`memory.max`/`cpu.max` from inside the container, tests network denial with a host listener canary, secret denial from every mount and mount visibility, and requires clean teardown; per-limit evidence is threaded into the worker backend and into verification | `tests/test_runner_capabilities.py`, `tests/test_execution_backends.py` | `IMPLEMENTED`, `UNIT_TESTED` (fake OCI + pure evidence rules); `LIVE_VERIFIED` requires `MAYA_OCI_SMOKE=1` on a real rootless host |
+| P0-03 in-loop checks share the task runtime | `DeclaredCheckRunner(runtime=..., require_isolated_runtime=...)`; worker injects the exact `TaskExecutionRuntime`; invariant scripts use `runtime.exec_script()`; an isolated profile with no runtime returns typed `BLOCKED`, never a host runner | `tests/test_agent_intelligence.py` (spies on the runtime and forbids `make_runner`) | `SHIPPED` |
+| P0-04 container-owned sessions | `ProcessSessionBackend` protocol, `LocalProcessSessionBackend` (explicitly trusted host only) and `OciExecSessionBackend` (task-owned keepalive container + bounded `podman exec`; stop kills the whole container so no descendant survives; PTY refused with typed capability error); `SessionManager` never calls host `Popen` for an isolated runner | `tests/test_session_backends.py`, `tests/test_sessions.py` | `IMPLEMENTED`, `UNIT_TESTED` (fake OCI); `LIVE_VERIFIED` needs a real rootless OCI host |
+| P0-05 isolated baseline/candidate parity | `VerificationService._baseline_runtime()` provisions a second isolated runtime with identical image, policy, limit evidence and mount-policy hash; baseline checks run through it; a mismatched/unavailable baseline yields `BASELINE_PARITY_MISSING` (ERROR) and caps an otherwise-passing check at `INCONCLUSIVE` — no host fallback, no silent skip | `tests/test_isolated_baseline.py`, `tests/test_verification.py` (host baseline still exercises regression/PREEXISTING paths) | `IMPLEMENTED`, `UNIT_TESTED`; live parity `UNVERIFIED` on this host |
+| P1-01 CPU limit semantics | `CommandPolicy.cpu_time_seconds` (RLIMIT_CPU), `cpu_cores` (OCI `--cpus`) and `wall_time_seconds` (supervisor) are separate; `cpu_seconds` is a documented legacy alias only; `CommandResult` records each dimension; `TaskConstraints` carries the two new fields | `tests/test_runner_limits.py`, `tests/test_execution_backends.py` | `SHIPPED` |
+| P1-02 session chunk framing | Documented arbitrary-length ordered chunk contract (`seq` is the only ordering guarantee) plus `accumulate_session_events()`; PTY/session tests accumulate before assertions | `tests/test_sessions.py` | `SHIPPED` |
+| P1-03 hermetic optional-dependency tests | `_block_torch()` shadows globally installed `torch` with an import-time `ModuleNotFoundError` in the child `cwd`; the missing-dependency SKIP no longer depends on host site-packages | `tests/test_method_invariants.py` | `SHIPPED` |
+| P1-04 deterministic test evidence | One canonical JUnit XML + pytest summary are the source of truth for `docs/test-matrix.md`; duplicated skip counts removed | JUnit report + `docs/test-matrix.md` | `SHIPPED` |
+| P1-09 local API security contract | loopback binding + host/origin validation (DNS-rebinding/CSRF), rate limiting, response secret scrubbing, non-loopback bind warning, security headers | `tests/test_api_control_plane.py` | `SHIPPED` (local only; no hosted multi-user mode) |
+
+Live gates that require external infrastructure remain honestly unverified:
+real OCI containment on a rootless host, real provider task quality, and held-out
+expert-labelled R2I evaluation. They are documented as harnesses, not results.
+
+## 2026-11-24 WP2–WP7 engineering release (source-complete, live gates pending)
+
+All seven roadmap packages now have implementation through the relevant
+layers, with deterministic tests. What remains is *external evidence*: live OCI
+hosts, provider keys/spend caps, independent expert annotators and user studies.
+Those are gated in `docs/release-gates.md`; no result is claimed from them.
+
+| Package | Implementation | Test | Status |
+|---|---|---|---|
+| WP2 environment provisioning | `workspace/provisioning.py` (`EnvironmentProvisioner`, `ProvisionReport`, `ServiceSpec`, loopback health checks, lockfile inventory); `TaskExecutionRuntime.exec_install` with approval-gated `INSTALL_EXECUTABLES`; `TaskService.prepare_execution(provision=True)` + worker `ENVIRONMENT_PROVISIONING` phase and implementation handoff; CLI `maya env provision` | `tests/test_provisioning.py`, `tests/test_task_workflow.py` | `SHIPPED` (host install path); isolated installs `BLOCKED` by design until a provisioning-capable OCI backend exists |
+| WP3 provider reliability & evaluation | `evaluation/providers.py` (two frozen provider profiles), control arm in `evaluation/live.py`, Wilson intervals + per-family rates + latency/traces, `evaluation/gold/model_safety_seed.json` (injection/connector probes), CLI `eval providers/safety/compare` | `tests/test_eval_live.py` | `IMPLEMENTED`/`UNIT_TESTED`; `HARNESS_ONLY` for live provider quality — no provider key was supplied |
+| WP4 R2I benchmark & evidence UI | `evaluation/r2i_grading.py` (two-annotator + adjudication contract, Cohen's kappa, grading guide), 8-case expanded development corpus, `research/equations.py`, `verification/method_adapters.py`, read-only R2I graph API + UI panel, CLI `eval grading-guide/holdout-check` | `tests/test_r2i_expansion.py` | `IMPLEMENTED`/`UNIT_TESTED`; held-out benchmark `NOT_STARTED` (needs ≥50 expert-labelled cases) |
+| WP5 repository intelligence breadth | `indexing/impact.py` (change impact, test-to-symbol, config refs, resolved vs heuristic), `indexing/gold.py` (7-language gold manifests + precision/recall), `retrieval/evaluation.py` (measured uplift, MRR) | `tests/test_repo_intelligence_gold.py` | `IMPLEMENTED`/`UNIT_TESTED`; optional Tree-sitter/LSP adapters remain env-gated, lexical fallbacks stay LOW |
+| WP6 connectors | `models/connectors/extended.py`: Jupyter (injected runtime only), scholarly (host allowlist), container services (loopback + grant-gated writes), DB schema/migration plan (read-only); wired into advanced registry | `tests/test_extended_connectors.py` | `SHIPPED` (contract + fake transports); no live external service exercised |
+| WP7 workbench polish | read-only X-ray, task DAG, session trace, project report endpoints; keyboard navigation, focus-visible, responsive layout, searchable trace, aria labels | `tests/test_workbench_polish.py`, `tests/test_workbench_ui.py` | `SHIPPED` (local loopback); usability study & hosted tenancy out of freeze scope |
+| WP1 CI attestation | canonical JUnit report (845 collected / 836 passed / 0 failed / 9 skipped) + 82/82 adversarial harnesses | `artifacts/junit-maya-2026-11-24.xml` | `PARTIAL`: CI-attested report tied to a final commit SHA must be produced by the release pipeline |
+
+Live gates that require external infrastructure remain honestly unverified:
+real OCI containment, two-provider task quality with a hard spend cap, held-out
+expert R2I evaluation, and user studies. They are harnesses/contracts, not
+results. See `docs/release-gates.md`.
 
 ## Reconciliation of the separate v2.0 blueprint
 

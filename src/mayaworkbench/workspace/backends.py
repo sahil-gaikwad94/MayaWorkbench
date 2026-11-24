@@ -17,7 +17,7 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from mayaworkbench.errors import RuntimeUnavailable
 from mayaworkbench.workspace.runner import (
@@ -56,9 +56,14 @@ class RuntimeRef:
     overlay: Path
     image: str
     container_name: str
+    #: Immutable, secret-free source snapshot actually mounted at /src. Never
+    #: the original user worktree. ``None`` only for refs from older records.
+    sanitized_source: Path | None = None
+    #: Fingerprint of the sanitized manifest + its policy version.
+    mount_policy_sha256: str = ""
 
     def as_dict(self) -> dict[str, str]:
-        return {
+        data: dict[str, str] = {
             "id": self.id,
             "backend": self.backend,
             "source": str(self.source),
@@ -66,6 +71,11 @@ class RuntimeRef:
             "image": self.image,
             "container_name": self.container_name,
         }
+        if self.sanitized_source is not None:
+            data["sanitized_source"] = str(self.sanitized_source)
+        if self.mount_policy_sha256:
+            data["mount_policy_sha256"] = self.mount_policy_sha256
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, str]) -> "RuntimeRef":
@@ -76,6 +86,10 @@ class RuntimeRef:
             overlay=Path(data["overlay"]),
             image=data["image"],
             container_name=data["container_name"],
+            sanitized_source=(
+                Path(data["sanitized_source"]) if data.get("sanitized_source") else None
+            ),
+            mount_policy_sha256=data.get("mount_policy_sha256", ""),
         )
 
 
@@ -195,6 +209,7 @@ class RootlessContainerBackend:
         tool: str | None = None,
         allow_docker: bool = False,
         verified: bool = False,
+        verified_limits: dict[str, dict[str, Any]] | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self.run_home = Path(run_home).resolve()
@@ -202,9 +217,12 @@ class RootlessContainerBackend:
         self.image = image
         self._tool_override = tool
         self._allow_docker = allow_docker
-        # A smoke test on a real rootless OCI host must set this. Controller
-        # presence alone is never converted into an "enforced" claim.
+        # A live in-container probe must set this. Controller presence alone is
+        # never converted into an "enforced" claim.
         self._verified = verified
+        # Per-limit evidence from that probe. Without it, every finite limit is
+        # reported as `not_applied`, even when `verified=True`.
+        self._verified_limits = dict(verified_limits or {})
 
     # -------------------------------------------------------------- capability
     def _detect_tool(self) -> tuple[str | None, str | None]:
@@ -243,33 +261,33 @@ class RootlessContainerBackend:
             )
         limits: dict[str, LimitEnforcement] = {}
         limits["wall_time"] = LimitEnforcement("enforced", "supervisor")
-        for name in ("cpu", "memory"):
-            if name not in controllers:
-                limits[name] = LimitEnforcement("unsupported", None, "controller missing")
-            elif verified:
-                limits[name] = LimitEnforcement(
-                    "enforced", "cgroup-v2", "applied per container and smoke-verified"
+
+        def _evidence(name: str, controller: str) -> LimitEnforcement:
+            """Only a live readback can turn a limit into an enforced claim."""
+            if controller not in controllers:
+                return LimitEnforcement("unsupported", None, "controller missing")
+            record = self._verified_limits.get(name, {})
+            observed = record.get("observed")
+            if (
+                verified
+                and record.get("status") == "enforced"
+                and observed not in (None, "", "max", "unreadable")
+            ):
+                return LimitEnforcement(
+                    "enforced",
+                    record.get("mechanism") or "cgroup-v2-live-readback",
+                    f"observed inside the task container: {observed}",
                 )
-            else:
-                limits[name] = LimitEnforcement(
-                    "not_applied",
-                    None,
-                    "cgroup controller present; not verified by a real OCI smoke test",
-                )
-        if "pids" not in controllers:
-            limits["process_count"] = LimitEnforcement(
-                "unsupported", None, "pids controller missing"
-            )
-        elif verified:
-            limits["process_count"] = LimitEnforcement(
-                "enforced", "cgroup-v2", "pids.max applied per container and smoke-verified"
-            )
-        else:
-            limits["process_count"] = LimitEnforcement(
+            return LimitEnforcement(
                 "not_applied",
                 None,
-                "pids controller present; no applied/read-back evidence on a real runtime",
+                "cgroup controller present but no live in-container readback evidence "
+                "was supplied for this limit",
             )
+
+        limits["cpu"] = _evidence("cpu_quota", "cpu")
+        limits["memory"] = _evidence("memory_bytes", "memory")
+        limits["process_count"] = _evidence("pids", "pids")
         limits["file_size"] = LimitEnforcement(
             "unsupported", None, "no verified per-container file-size controller"
         )
@@ -294,19 +312,31 @@ class RootlessContainerBackend:
                 + ". The task is blocked, not downgraded to host execution.",
             )
         # Import here to keep the type-only dependency one-way.
-        from mayaworkbench.workspace.runtime_workspace import populate_overlay
+        from mayaworkbench.workspace.runtime_workspace import (
+            populate_overlay,
+            sanitize_source_tree,
+            sanitized_policy_fingerprint,
+        )
 
         runtime_id = uuid.uuid4().hex
-        overlay = self.run_home / "containers" / runtime_id / "work"
-        # Populate the exact tree the container will see at /work. An empty
-        # overlay would make commands test a different project than the one the
-        # file tools edited — the core MW-01 defect.
+        container_root = self.run_home / "containers" / runtime_id
+        sanitized_source = container_root / "src"
+        overlay = container_root / "work"
+        # P0-01: never bind-mount the original worktree. Build a sanitized,
+        # immutable reference at /src and a writable overlay at /work from the
+        # SAME canonical filter, then prove they describe the exact same tree.
         try:
-            populate_overlay(self.workspace, overlay)
+            source_manifest = sanitize_source_tree(self.workspace, sanitized_source)
+            overlay_manifest = populate_overlay(self.workspace, overlay)
         except Exception as exc:
             raise RuntimeUnavailable(
-                f"ROOTLESS_CONTAINER overlay could not be populated: {exc}"
+                f"ROOTLESS_CONTAINER task trees could not be populated: {exc}"
             ) from exc
+        if source_manifest != overlay_manifest:
+            raise RuntimeUnavailable(
+                "ROOTLESS_CONTAINER sanitized source and writable overlay disagree; "
+                "refusing to run against a partial task tree"
+            )
         return RuntimeRef(
             id=runtime_id,
             backend=self.backend_id,
@@ -314,6 +344,8 @@ class RootlessContainerBackend:
             overlay=overlay,
             image=self.image,
             container_name=f"maya-{runtime_id[:16]}",
+            sanitized_source=sanitized_source,
+            mount_policy_sha256=sanitized_policy_fingerprint(source_manifest),
         )
 
     def _oci_argv(self, runtime: RuntimeRef, argv: list[str]) -> list[str]:
@@ -346,9 +378,14 @@ class RootlessContainerBackend:
             "--memory",
             f"{self.policy.memory_limit_mb}m",
             "--cpus",
-            str(max(1, min(4, self.policy.cpu_seconds or 1))),
+            # P1-01: --cpus is a CPU *core quota*, NOT a cumulative CPU-time
+            # budget. The time budget is enforced in-container via RLIMIT_CPU.
+            str(max(1, min(4, self.policy.cpu_cores or 1))),
             "--mount",
-            f"type=bind,src={runtime.source},dst=/src,readonly",
+            # Only the sanitized, task-owned snapshot is ever visible. Mounting
+            # ``runtime.source`` (the original user worktree) would let a
+            # project process read /src/.env and other excluded files.
+            f"type=bind,src={runtime.sanitized_source or runtime.overlay},dst=/src,readonly",
             "--mount",
             f"type=bind,src={runtime.overlay},dst=/work",
             "-w",
@@ -407,6 +444,9 @@ class RootlessContainerBackend:
             cleanup_succeeded=observed.cleanup_succeeded,
             env_names=sorted({"PATH", "LANG", "LC_ALL", "HOME", "PYTHONDONTWRITEBYTECODE"}),
             cwd=str(runtime.overlay),
+            cpu_time_seconds=self.policy.effective_cpu_time_seconds,
+            cpu_cores=self.policy.cpu_cores,
+            wall_time_seconds=self.policy.wall_time_seconds or timeout,
         )
 
     def stop(
@@ -433,6 +473,11 @@ class RootlessContainerBackend:
                 pass
         overlay_root = runtime.overlay.parent
         if overlay_root.exists() and not keep_overlay:
+            from mayaworkbench.workspace.runtime_workspace import unfreeze_tree
+
+            # The sanitized /src tree is frozen 0555/0444; restore write bits
+            # first or rmtree cannot unlink its children without CAP_DAC_OVERRIDE.
+            unfreeze_tree(overlay_root)
             shutil.rmtree(overlay_root, ignore_errors=True)
 
     def collect_artifacts(self, runtime: RuntimeRef) -> list[Path]:
@@ -463,6 +508,13 @@ class BackendCommandRunner:
             network_policy="DENY_BY_DEFAULT",
             dependency_policy="DENY",
         ))
+
+    @property
+    def runtime(self) -> RuntimeRef:
+        """The single provisioned runtime, created lazily on first use."""
+        if self._runtime is None:
+            self._runtime = self.backend.provision()
+        return self._runtime
 
     def run(
         self,

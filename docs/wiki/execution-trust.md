@@ -35,3 +35,31 @@
   is reused by verification for candidate checks; baseline checks stay in a separate clean
   tree. Real kernel escape tests still require an OCI host. Evidence:
   `tests/test_runtime_workspace.py`.
+- **2026-11-23 (supersedes the read-only `/src` mount decision):** the original user
+  worktree is NEVER bind-mounted into an isolated task. A task-owned, immutable,
+  secret-free sanitized snapshot (0444 files, 0555 directories) is produced by the same
+  canonical filter as the writable overlay and mounted at `/src`; the policy fingerprint
+  binds the manifest to the filter version. Read-only was not secret isolation: a task
+  could previously read `/src/.env` and `.git/config` from the original worktree. Evidence:
+  `tests/test_runtime_workspace.py`, `tests/test_execution_backends.py`, and the live
+  canary probes in `tests/integration/test_container_escape_live.py`.
+- **2026-11-23:** capability evidence comes from a live in-container probe built on the
+  production backend. It reads effective `pids.max`, `memory.max` and `cpu.max`, tests
+  network denial with a host listener, tests secret denial on every mount, checks mount
+  visibility and verifies teardown. A passing smoke marker or a controller name cannot
+  make a limit `enforced`; an unverified limit is `not_applied`. Evidence:
+  `tests/test_runner_capabilities.py`, `tests/test_execution_backends.py`.
+- **2026-11-23:** one `TaskExecutionRuntime` reaches in-loop command and invariant checks.
+  An isolated profile with no injected runtime returns typed `BLOCKED` rather than building
+  a host runner. Terminal sessions use a `ProcessSessionBackend`: host `Popen` only for
+  explicitly trusted profiles; an OCI task gets a keepalive container and `podman exec`.
+  PTY is refused with a typed capability error in the isolated profile. Evidence:
+  `tests/test_agent_intelligence.py`, `tests/test_session_backends.py`.
+- **2026-11-23:** baseline and candidate checks use equivalent isolated runtimes. A second
+  container is provisioned with identical image, policy, limit evidence and mount-policy
+  hash; only the source tree differs. A missing or mismatched baseline runtime produces
+  `BASELINE_PARITY_MISSING` and caps the check at `INCONCLUSIVE` — never a host fallback and
+  never a silent skip. Evidence: `tests/test_isolated_baseline.py`.
+- **2026-11-23:** CPU *time* (RLIMIT_CPU), CPU *quota* (`--cpus`) and wall time are separate
+  policy and evidence fields. `cpu_seconds` is a legacy alias only. Evidence:
+  `tests/test_runner_limits.py`.

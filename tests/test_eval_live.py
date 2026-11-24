@@ -381,3 +381,107 @@ def test_cli_live_without_gates_is_usage_error(capsys, tmp_path: Path, monkeypat
     assert payload["code"] == "USAGE_ERROR"
     assert "MAYA_LIVE_EVAL" in payload["error"]
     assert "MAYA_LIVE_SPEND_CAP_USD" in payload["error"]
+
+
+# ------------------------------------------------------------------- WP3
+def test_provider_profiles_are_frozen_and_secret_free():
+    from mayaworkbench.evaluation.providers import (
+        default_profiles,
+        resolve_profile,
+    )
+
+    profiles = default_profiles()
+    assert len(profiles) >= 2
+    assert len({item.provider for item in profiles}) >= 2
+    assert len({item.id for item in profiles}) == len(profiles)
+    assert all(item.model_id and item.harness_version for item in profiles)
+    for item in profiles:
+        public = item.public_dict()
+        assert not any("key" in name.lower() for name in public)  # no key *field*
+        assert not any(token in json.dumps(public).lower()
+                       for token in ("sk-", "ghp_", "bearer "))  # no key *value*
+    assert resolve_profile(profiles[0].id) == profiles[0]
+    with pytest.raises(Exception):
+        resolve_profile("does-not-exist")
+
+
+def test_wilson_interval_and_family_breakdown():
+    from mayaworkbench.evaluation.metrics import wilson_interval
+
+    lo, hi = wilson_interval(8, 10)
+    assert 0 < lo < 0.8 < hi < 1
+    assert wilson_interval(0, 0) == (0.0, 0.0)
+    assert wilson_interval(0, 10)[1] > 0  # zero successes still has an upper bound
+
+    results = [
+        TaskResult(task_id="a", family="bug_fix", expected_decision_class="ACCEPTED",
+                   decision="ACCEPTED", evidence_complete=True, verification_report_present=True),
+        TaskResult(task_id="b", family="bug_fix", expected_decision_class="ACCEPTED",
+                   decision="REJECTED"),
+        TaskResult(task_id="c", family="adversarial", expected_decision_class="REJECTED",
+                   decision="REJECTED", anti_gaming_probe=True),
+    ]
+    flags = EvalFlags(live=False, dry_run=True)
+    card = build_scorecard(corpus_fingerprint="x", flags=flags, results=results)
+    assert set(card.family_breakdown) == {"bug_fix", "adversarial"}
+    assert card.family_breakdown["bug_fix"]["verified_rate"] == 0.5
+    assert card.metrics.verified_completion_rate_ci[0] <= card.metrics.verified_completion_rate
+    assert card.metrics.anti_gaming_catch_rate_ci[1] >= card.metrics.anti_gaming_catch_rate
+
+
+def test_control_run_records_context_disabled(tmp_path):
+    corpus = bundled_seed_corpus()[:2]
+    direct = run_eval(corpus, task_limit=2)
+    control = run_eval(corpus, task_limit=2, control_mode=True, trace=True)
+    assert all(item.control_mode for item in control.results)
+    assert not any(item.control_mode for item in direct.results)
+    assert control.flags.control_mode is True
+    assert all(item.trace.get("maya_context_disabled") is True for item in control.results)
+
+
+def test_comparison_runs_two_profiles_and_control(tmp_path):
+    from mayaworkbench.evaluation.live import run_comparison
+
+    corpus = bundled_seed_corpus()[:1]
+    report = run_comparison(corpus, task_limit=1, trace=True)
+    assert len(report.arms) >= 2
+    assert any(name.endswith("-control") for name in report.arms)
+    assert all(arm.corpus_hash == report.corpus_hash for arm in report.arms.values())
+    assert report.deltas  # at least one assisted/control delta
+
+
+def test_model_safety_corpus_is_valid_and_scorable():
+    from mayaworkbench.evaluation.live import load_model_safety_corpus
+
+    corpus = load_model_safety_corpus()
+    assert len(corpus) >= 5
+    assert all(item.anti_gaming_probe for item in corpus)
+    assert {item.family for item in corpus} <= KNOWN_FAMILIES
+    card = run_eval(corpus, task_limit=2, trace=True)
+    assert card.counts.anti_gaming_total >= 2
+    assert card.metrics.anti_gaming_catch_rate_ci
+
+
+def test_cli_eval_providers_and_compare(capsys, tmp_path):
+    from mayaworkbench.cli.main import main
+
+    code, payload, captured = _cli(capsys, ["--home", str(tmp_path / "home"), "--json", "eval", "providers"])
+    assert code == 0, captured.err
+    assert len(payload["profiles"]) >= 2
+
+    out = tmp_path / "cards"
+    for name, extra in (("assisted", []), ("control", ["--control"])):
+        code, _, captured = _cli(
+            capsys,
+            ["--home", str(tmp_path / "home"), "--json", "eval", "run",
+             "--task-limit", "1", "--out", str(out / name), *extra],
+        )
+        assert code == 0, captured.err
+    code, payload, captured = _cli(
+        capsys,
+        ["--home", str(tmp_path / "home"), "--json", "eval", "compare",
+         str(out / "assisted" / "scorecard.json"), str(out / "control" / "scorecard.json")],
+    )
+    assert code == 0, captured.err
+    assert "assisted" in payload["arms"] and "control" in payload["arms"]
+    assert "control" in payload["deltas_from_first"]

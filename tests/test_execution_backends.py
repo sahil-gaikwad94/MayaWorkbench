@@ -54,11 +54,28 @@ def oci_env(tmp_path, monkeypatch):
         max_processes=8,
         memory_limit_mb=512,
     )
+    # Stand-in live readback evidence: the fake OCI client cannot really read
+    # cgroups, so the fixture supplies the values a passed probe would observe.
+    verified_limits = {
+        "cpu_quota": {
+            "status": "enforced", "requested": "1 CPU cores",
+            "observed": "100000 100000", "mechanism": "cgroup-v2-live-readback",
+        },
+        "memory_bytes": {
+            "status": "enforced", "requested": "536870912 bytes",
+            "observed": "536870912", "mechanism": "cgroup-v2-live-readback",
+        },
+        "pids": {
+            "status": "enforced", "requested": 8,
+            "observed": 8, "mechanism": "cgroup-v2-live-readback",
+        },
+    }
     return RootlessContainerBackend(
         tmp_path / "workspace",
         tmp_path / "run-home",
         policy,
         verified=True,  # the fake OCI client stands in for a smoke-verified host
+        verified_limits=verified_limits,
         tool="podman",
         image="python:3.12-slim",
     )
@@ -68,9 +85,19 @@ def test_rootless_backend_capabilities_are_verified(oci_env):
     capabilities = oci_env.capabilities()
     assert capabilities.available is True
     assert capabilities.network_isolation == "none"
-    assert capabilities.limits["process_count"].mechanism == "cgroup-v2"
+    assert capabilities.limits["process_count"].mechanism == "cgroup-v2-live-readback"
     assert capabilities.limits["memory"].status == "enforced"
     assert capabilities.limits["file_size"].status == "unsupported"
+
+
+def test_verified_backend_without_live_limit_evidence_claims_nothing(oci_env):
+    """P0-02: a smoke marker or controller name is not enforcement evidence."""
+    oci_env._verified_limits = {}
+    caps = oci_env.capabilities()
+    assert caps.available is True  # the runtime itself is reachable
+    for name in ("cpu", "memory", "process_count"):
+        assert caps.limits[name].status == "not_applied", name
+        assert caps.limits[name].mechanism is None, name
 
 
 def test_unverified_backend_never_claims_enforcement_or_provisions(tmp_path, monkeypatch):
@@ -186,6 +213,46 @@ def test_rootless_provision_blocks_when_isolation_is_unverified(tmp_path, monkey
     assert capabilities.available is False
     with pytest.raises(RuntimeUnavailable, match="blocked|not be established"):
         backend.provision()
+
+
+def test_rootless_src_mount_is_sanitized_not_the_original_worktree(oci_env, tmp_path):
+    """P0-01: an excluded source file must be unreachable from every mount.
+
+    The old code bind-mounted ``runtime.source`` (the user's worktree) at /src,
+    so a project process could read ``/src/.env`` even though the overlay filter
+    removed it. The reference mount must now point at a task-owned sanitized
+    snapshot, and the original file must still exist on the host (we filter a
+    copy, we do not mutate the repository).
+    """
+    source = oci_env.workspace
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    env_file = source / ".env"
+    env_file.write_text("MAYA_MODEL_API_KEY=sk-should-never-be-readable\n", encoding="utf-8")
+    (source / "config").mkdir()
+    (source / "config" / "credentials.json").write_text('{"token": "secret"}', encoding="utf-8")
+
+    runtime = oci_env.provision()
+    assert runtime.sanitized_source is not None
+    assert runtime.sanitized_source != source
+    assert runtime.mount_policy_sha256
+
+    argv = oci_env._oci_argv(runtime, ["python", "-c", "print('x')"])
+    mounts = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--mount"]
+    src_mount = next(m for m in mounts if "dst=/src" in m)
+    work_mount = next(m for m in mounts if "dst=/work" in m)
+    # /src points at the sanitized task-owned tree, never the original worktree.
+    assert f"src={runtime.sanitized_source}" in src_mount
+    assert f"src={source}" not in src_mount
+    assert "readonly" in src_mount
+    assert "readonly" not in work_mount
+    # The excluded files are absent from BOTH task-visible trees.
+    for tree in (runtime.sanitized_source, runtime.overlay):
+        assert not (tree / ".env").exists()
+        assert not (tree / "config" / "credentials.json").exists()
+        assert (tree / "app.py").read_text() == "print('hello')\n"
+    # The host file was not deleted -- only a filtered copy was made.
+    assert env_file.exists()
 
 
 def test_rootless_backend_never_mounts_host_canary_or_secrets(oci_env, tmp_path):

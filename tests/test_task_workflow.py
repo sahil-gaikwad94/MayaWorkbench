@@ -39,6 +39,48 @@ def make_task(services, indexed, *, allowed=("utils.py",), max_steps=8, max_tool
     )
 
 
+def test_environment_provisioning_phase_runs_before_implementation(
+    services, indexed, task_model
+):
+    """WP2: an opted-in run parks in ENVIRONMENT_PROVISIONING and attests its plan."""
+    task, _contract = services.task_service.create_task(
+        project_id=indexed.project.id,
+        title="Provision then fix",
+        goal="Provision the environment before editing utils.py",
+        task_type=TaskType.ENGINEERING_CHANGE,
+        snapshot_id=indexed.snapshot.id,
+        allowed_paths=["utils.py"],
+        acceptance_criteria=["count_tokens returns the number of words"],
+        verification_checks=[],
+        constraints={
+            "max_steps": 8,
+            "max_tool_calls": 20,
+            "max_model_tokens": 20_000,
+            "max_runtime_seconds": 120,
+            "network_access": "ALLOW_WITH_APPROVAL",
+            "dependency_install": "APPROVAL_REQUIRED",
+        },
+    )
+    result = start_and_approve(
+        services, task, task_model, actions=[read_utils(), finish_action()]
+    )
+    prepared = services.task_service.prepare_execution(result.run.id, provision=True)
+    run = services.runs.get(result.run.id)
+    assert run.state == WorkflowState.ENVIRONMENT_PROVISIONING
+    assert prepared.job.details.get("kind") == "provision"
+
+    Worker(services).run(once=True)
+    run = services.runs.get(result.run.id)
+    prov = run.details["environment_provisioning"]
+    assert prov["schema_version"] == "environment-provisioning/v1"
+    assert prov["plan_sha256"]
+    assert prov["status"] in {"PROVISIONED", "PARTIAL"}, prov["steps"]
+    # The provisioning worker finished its job and enqueued implementation.
+    next_job = services.jobs.get_by_run(result.run.id)
+    assert next_job is not None
+    assert (next_job.details or {}).get("kind") != "provision"
+
+
 def start_and_approve(services, task, provider, *, actions):
     provider.actions = list(actions)
     result = services.task_service.start_task(task.id)

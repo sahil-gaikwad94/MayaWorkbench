@@ -63,6 +63,12 @@ except ImportError:  # pragma: no cover - exercised only on Windows
     resource = None  # type: ignore[assignment]
 
 DEFAULT_EXECUTABLES = ("python", "python3", "pytest", "ruff", "mypy")
+#: Only the dedicated provisioning runner may use this closed allowlist.
+INSTALL_EXECUTABLES = (
+    "python", "python3", "pip", "pip3", "uv", "poetry",
+    "npm", "pnpm", "yarn", "cargo", "go", "mvn", "gradle",
+    "cmake", "make", "ctest", "maya",
+)
 MAX_ARGS = 64
 MAX_ARG_LENGTH = 4096
 MAX_TOTAL_ARG_BYTES = 16_384
@@ -159,10 +165,20 @@ class CommandPolicy:
     max_processes: int = 128
     max_open_files: int = 1024
     max_file_size_mb: int = 256
-    #: Explicit RLIMIT_CPU seconds. ``None`` derives it from the wall timeout so
-    #: the CPU guard is a backstop for a wall-clock failure, not the primary
-    #: limit. Tests set it directly to exercise the rlimit path.
+    #: DEPRECATED alias for ``cpu_time_seconds``. Kept so older contracts and
+    #: tests keep working, but it is NEVER interpreted as a CPU-core quota.
     cpu_seconds: int | None = None
+    #: Cumulative CPU-time ceiling enforced by RLIMIT_CPU in the child. This is
+    #: a TIME budget: a wall-clock sleep consumes almost none of it.
+    cpu_time_seconds: int | None = None
+    #: ONLY set on a dedicated, explicitly approved provisioning runner. The
+    #: ordinary task runner never permits dependency installation commands.
+    allow_dependency_install: bool = False
+    #: CPU concurrency/quota (OCI ``--cpus``). Independent of CPU time and of
+    #: wall time. ``None`` means the default single core.
+    cpu_cores: int | None = None
+    #: External wall-clock deadline enforced by the supervisor.
+    wall_time_seconds: int | None = None
     #: Extra non-secret environment entries for one job (an experiment seed, for
     #: example). The runner's allowlist is the base; these are merged on top and
     #: their names are reported in ``env_names`` so provenance stays visible.
@@ -178,6 +194,18 @@ class CommandPolicy:
             max_runtime_seconds=constraints.max_runtime_seconds,
             max_output_bytes=constraints.max_output_bytes,
             max_processes=constraints.max_processes,
+            cpu_time_seconds=constraints.cpu_time_seconds,
+            cpu_cores=constraints.cpu_cores,
+            wall_time_seconds=constraints.max_runtime_seconds,
+        )
+
+    @property
+    def effective_cpu_time_seconds(self) -> int | None:
+        """The cumulative CPU-time budget, with the legacy alias as fallback."""
+        return (
+            self.cpu_time_seconds
+            if self.cpu_time_seconds is not None
+            else self.cpu_seconds
         )
 
     def describe(self) -> dict:
@@ -194,7 +222,11 @@ class CommandPolicy:
             "max_processes": self.max_processes,
             "max_open_files": self.max_open_files,
             "max_file_size_mb": self.max_file_size_mb,
+            "allow_dependency_install": self.allow_dependency_install,
             "cpu_seconds": self.cpu_seconds,
+            "cpu_time_seconds": self.effective_cpu_time_seconds,
+            "cpu_cores": self.cpu_cores,
+            "wall_time_seconds": self.wall_time_seconds or self.max_runtime_seconds,
             "shell": False,
         }
 
@@ -221,6 +253,11 @@ class CommandResult:
     cleanup_succeeded: bool = True
     env_names: list[str] = field(default_factory=list)
     cwd: str = ""
+    #: Distinct budget dimensions (P1-01). A CPU-time budget is NOT a core quota
+    #: and neither is a wall-clock deadline; each is recorded on its own.
+    cpu_time_seconds: int | None = None
+    cpu_cores: int | None = None
+    wall_time_seconds: int | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -311,12 +348,14 @@ class CommandRunner:
                 f"executable is not allowed by this task: {executable}",
                 hint=f"Allowed: {', '.join(self.policy.allowed_executables)}",
             )
-        if any(
+        install_command = any(
             arg in {"pip", "pip3", "poetry", "uv", "conda"} for arg in argv[1:3]
-        ):
-            raise PolicyError("dependency installation is not permitted in this task")
-        if len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pip", "ensurepip"}:
-            raise PolicyError("dependency installation is not permitted in this task")
+        ) or (len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pip", "ensurepip"})
+        if install_command and not self.policy.allow_dependency_install:
+            raise PolicyError(
+                "dependency installation is not permitted in this task; "
+                "it requires an explicitly approved provisioning step"
+            )
         for arg in argv[1:]:
             if (
                 not self.policy.allow_absolute_args
@@ -671,8 +710,8 @@ class CommandRunner:
         preexec, limits_fd, evidence = self._limit_probe(
             cpu_seconds=max(
                 1,
-                self.policy.cpu_seconds
-                if self.policy.cpu_seconds is not None
+                self.policy.effective_cpu_time_seconds
+                if self.policy.effective_cpu_time_seconds is not None
                 else int(timeout_seconds) + 5,
             )
         )
@@ -806,6 +845,9 @@ class CommandRunner:
             cleanup_succeeded=cleanup_succeeded,
             env_names=sorted(env),
             cwd=str(self.workspace),
+            cpu_time_seconds=self.policy.effective_cpu_time_seconds,
+            cpu_cores=self.policy.cpu_cores,
+            wall_time_seconds=self.policy.wall_time_seconds or timeout_seconds,
         )
 
     def _blocked_result(
@@ -952,6 +994,7 @@ __all__ = [
     "CommandResult",
     "CommandRunner",
     "DEFAULT_EXECUTABLES",
+    "INSTALL_EXECUTABLES",
     "LimitEnforcement",
     "LIMIT_NAMES",
     "summarize_limits",

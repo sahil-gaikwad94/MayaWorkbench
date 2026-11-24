@@ -23,7 +23,15 @@ from mayaworkbench.api.validation import (
     ensure_safe_path,
     guard_request_path,
     parse_body,
+    check_host_header,
+    check_origin,
+    compute_allowed_hosts,
+    compute_allowed_origins,
+    scrub_secrets,
+    RATE_WINDOW_MAX,
+    RATE_WINDOW_SECONDS,
 )
+import time
 from mayaworkbench.app.container import Services
 from mayaworkbench.errors import MayaError
 
@@ -32,6 +40,23 @@ DEFAULT_PORT = 8765
 
 _UI_PATH = Path(__file__).with_name("ui") / "index.html"
 UI_HTML = _UI_PATH.read_text(encoding="utf-8") if _UI_PATH.is_file() else ""
+
+
+class _RateLimiter:
+    """Bounded per-IP request counter; 429 above the threshold per window."""
+
+    def __init__(self, threshold: int = RATE_WINDOW_MAX):
+        self.threshold = threshold
+        self._windows: dict[str, list[float]] = {}
+
+    def hit(self, key: str) -> bool:
+        now = time.monotonic()
+        window = [t for t in self._windows.get(key, []) if now - t < RATE_WINDOW_SECONDS]
+        self._windows[key] = window
+        if len(window) >= self.threshold:
+            return False
+        window.append(now)
+        return True
 
 
 class ControlPlaneHandler(BaseHTTPRequestHandler):
@@ -60,6 +85,9 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         try:
+            # P1-09: local-only security contract — Host/origin/rate checks run
+            # BEFORE any routing or service call, fail closed on violation.
+            self._check_boundary(method)
             parsed = urlsplit(self.path)
             guard_request_path(parsed)
             path = ensure_safe_path(unquote(parsed.path))
@@ -89,6 +117,35 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             # Keep details in the local server log only; never in the response.
             self.log_error("Unhandled control-plane error:\n%s", traceback.format_exc())
             self._send_json(500, internal_error())
+
+    def _check_boundary(self, method: str) -> None:
+        server = self.server
+        allowed_hosts = getattr(server, "allowed_hosts", set())
+        check_host_header(self.headers.get("Host"), expected_hosts=allowed_hosts)
+        if method == "POST":
+            check_origin(self.headers.get("Origin"), allowed_origins=getattr(server, "allowed_origins", set()))
+        ip = self.client_address[0] if self.client_address else "127.0.0.1"
+        limiter = getattr(server, "_rate_limiter", None)
+        if limiter is not None and not limiter.hit(ip):
+            raise ApiError(
+                429,
+                "RATE_LIMIT",
+                f"Too many requests from {ip} in {int(RATE_WINDOW_SECONDS)}s.",
+                hint="Retry shortly, or bind the control plane to a trusted loopback address only.",
+            )
+
+    def _send_json(self, status: int, payload: Any) -> None:
+        data = json.dumps(
+            scrub_secrets(payload), ensure_ascii=False, sort_keys=False, default=str
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _send_mapped(self, mapped: ApiError) -> None:
         self._send_json(mapped.status, mapped.to_payload())
@@ -169,6 +226,15 @@ def create_server(
     server = ThreadingHTTPServer((host, port), ControlPlaneHandler)
     server.app = ControlPlane(services)  # type: ignore[attr-defined]
     server.daemon_threads = True
+    server.allowed_hosts = compute_allowed_hosts(host, port)  # type: ignore[attr-defined]
+    server.allowed_origins = compute_allowed_origins(host, port)  # type: ignore[attr-defined]
+    server._rate_limiter = _RateLimiter()  # type: ignore[attr-defined]
+    if host not in {DEFAULT_HOST, "127.0.0.1"} and not host.strip() in {"", "localhost"}:
+        server.security_notes = (  # type: ignore[attr-defined]
+            f"WARNING: the control plane is bound to {host}:{port} — the local-only "
+            "security contract does not apply to non-loopback hosts. Do not expose it "
+            "to other machines; this product has no hosted multi-user mode."
+        )
     return server
 
 

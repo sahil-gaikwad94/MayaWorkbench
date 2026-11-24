@@ -164,6 +164,8 @@ class ArtifactKind(StrEnum):
     # WP R2I — backend-computed, inspectable four-tier reproduction report.
     # Additive only: no migration is required for an enum member.
     REPRODUCIBILITY_REPORT = "REPRODUCIBILITY_REPORT"
+    # WP2 — content-addressed environment provisioning evidence.
+    ENVIRONMENT_PROVISIONING_REPORT = "ENVIRONMENT_PROVISIONING_REPORT"
     OTHER = "OTHER"
 
 

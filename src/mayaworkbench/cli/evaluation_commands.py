@@ -82,6 +82,168 @@ def register_evaluation_commands(sub: argparse._SubParsersAction) -> None:  # ty
         "--json", action="store_true", dest="eval_run_json", help="Emit the scorecard as JSON"
     )
     run.set_defaults(func=cmd_eval_run)
+    run.add_argument("--control", action="store_true",
+                     help="Disable Maya repository context (same-model control arm)")
+    run.add_argument("--profile", help="Frozen provider profile id (see `eval providers`)")
+    run.add_argument("--trace", action="store_true", help="Store per-task traces in the scorecard")
+
+    providers = subcommands.add_parser("providers", help="List frozen provider profiles (no secrets)")
+    providers.set_defaults(func=cmd_eval_providers)
+
+    safety = subcommands.add_parser("safety", help="Run the prompt-injection/connector seed corpus")
+    safety.add_argument("--max-spend-usd", type=float)
+    safety.add_argument("--task-limit", type=int)
+    safety.add_argument("--out")
+    safety.add_argument("--json", action="store_true", dest="eval_safety_json")
+    safety.set_defaults(func=cmd_eval_safety)
+
+    compare = subcommands.add_parser("compare", help="Compare assisted vs control scorecards")
+    compare.add_argument("scorecards", nargs="+", help="scorecard.json files (labelled by filename)")
+    compare.add_argument("--json", action="store_true", dest="eval_compare_json")
+    compare.set_defaults(func=cmd_eval_compare)
+
+    guide = subcommands.add_parser("grading-guide", help="Print the R2I held-out grading protocol")
+    guide.set_defaults(func=cmd_eval_grading_guide)
+
+    holdout = subcommands.add_parser("holdout-check", help="Validate a claimed held-out R2I corpus")
+    holdout.add_argument("corpus", help="JSON file with per-case annotator labels")
+    holdout.add_argument("--json", action="store_true", dest="eval_holdout_json")
+    holdout.set_defaults(func=cmd_eval_holdout_check)
+
+
+def cmd_eval_grading_guide(args: argparse.Namespace) -> int:
+    from mayaworkbench.evaluation.r2i_grading import grading_guide_markdown
+
+    payload = {"guide": grading_guide_markdown()}
+    console = args.console
+    console.json(payload) if console.json_mode else print(payload["guide"])
+    return 0
+
+
+def cmd_eval_holdout_check(args: argparse.Namespace) -> int:
+    from mayaworkbench.evaluation.r2i_grading import (
+        AnnotatorLabel,
+        HoldoutCase,
+        cohens_kappa,
+        validate_holdout_corpus,
+    )
+
+    raw = json.loads(Path(args.corpus).read_text(encoding="utf-8"))
+    rows = raw.get("cases", raw) if isinstance(raw, dict) else raw
+    cases: list[HoldoutCase] = []
+    for row in rows:
+        labels = tuple(
+            AnnotatorLabel(
+                annotator_id=str(item["annotator_id"]),
+                claim_id=str(item["claim_id"]),
+                expected_status=str(item["expected_status"]),
+                source_span=str(item.get("source_span", "")),
+            )
+            for item in row.get("labels", [])
+        )
+        cases.append(
+            HoldoutCase(
+                case_id=str(row["case_id"]),
+                labels=labels,
+                adjudicated_status=row.get("adjudicated_status"),
+                adjudicator=row.get("adjudicator"),
+                adjudication_note=str(row.get("adjudication_note", "")),
+            )
+        )
+    report = validate_holdout_corpus(cases)
+    report["cohens_kappa"] = cohens_kappa(
+        [(label.claim_id, label.expected_status) for label in cases[0].labels],
+        [(label.claim_id, label.expected_status) for label in cases[-1].labels],
+    ) if len(cases) >= 2 else 0.0
+    console = args.console
+    console.json(report) if getattr(args, "eval_holdout_json", False) else _print_json(report)
+    return 0 if report["qualifies_as_held_out"] else 1
+
+
+def cmd_eval_providers(args: argparse.Namespace) -> int:
+    from mayaworkbench.evaluation.providers import default_profiles
+
+    payload = {
+        "harness_version": "eval-harness/2.0",
+        "profiles": [item.public_dict() for item in default_profiles()],
+        "note": "No credential values are stored in profiles; keys come from the environment.",
+    }
+    console = args.console
+    console.json(payload) if console.json_mode else _print_json(payload)
+    return 0
+
+
+def _print_json(payload) -> None:
+    import json
+
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def cmd_eval_safety(args: argparse.Namespace) -> int:
+    from mayaworkbench.evaluation.live import (
+        load_model_safety_corpus,
+        render_markdown,
+        run_eval,
+    )
+
+    corpus = load_model_safety_corpus()
+    if not corpus:
+        raise UsageError("the bundled model safety corpus is missing")
+    card = run_eval(
+        corpus,
+        max_spend_usd=args.max_spend_usd,
+        task_limit=args.task_limit,
+        trace=True,
+    )
+    if args.out:
+        from pathlib import Path
+
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "scorecard.json").write_text(
+            json.dumps(card.model_dump(mode="json"), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        (out / "scorecard.md").write_text(render_markdown(card), encoding="utf-8")
+    payload = card.model_dump(mode="json")
+    console = args.console
+    console.json(payload) if getattr(args, "eval_safety_json", False) else _print_json(payload)
+    return 0
+
+
+def cmd_eval_compare(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from mayaworkbench.evaluation.live import EvalScorecard
+
+    cards: dict[str, dict] = {}
+    for name in args.scorecards:
+        path = Path(name)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        card = EvalScorecard.model_validate(payload)
+        arm = path.parent.name if path.stem == "scorecard" else path.stem
+        cards[arm] = {
+            "corpus_hash": card.corpus_hash,
+            "metrics": card.metrics.model_dump(),
+            "flags": card.flags.model_dump(),
+        }
+    hashes = {item["corpus_hash"] for item in cards.values()}
+    if len(hashes) != 1:
+        raise UsageError("cannot compare scorecards built from different corpus hashes")
+    names = list(cards)
+    deltas = {
+        name: {
+            key: round(cards[name]["metrics"][key] - cards[names[0]]["metrics"][key], 4)
+            for key in (
+                "verified_completion_rate", "anti_gaming_catch_rate",
+                "median_cost_usd", "median_latency_ms",
+            )
+        }
+        for name in names[1:]
+    }
+    payload = {"schema_version": "eval-comparison/1.0", "arms": cards, "deltas_from_first": deltas}
+    console = args.console
+    console.json(payload) if getattr(args, "eval_compare_json", False) else _print_json(payload)
+    return 0
 
 
 def cmd_eval_score(args: argparse.Namespace) -> int:
@@ -249,12 +411,18 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
                 ),
             )
     tasks = _load_task_corpus(args)
+    from mayaworkbench.evaluation.providers import resolve_profile
+
+    profile = resolve_profile(getattr(args, "profile", None))
     try:
         scorecard = run_eval(
             tasks,
             live=args.live,
             max_spend_usd=args.max_spend_usd,
             task_limit=args.task_limit,
+            control_mode=bool(getattr(args, "control", False)),
+            profile=profile,
+            trace=bool(getattr(args, "trace", False)),
         )
     except ValueError as exc:
         raise UsageError(f"Invalid evaluation run: {exc}") from exc

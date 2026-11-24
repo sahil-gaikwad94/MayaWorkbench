@@ -9,7 +9,7 @@ import pytest
 
 from mayaworkbench.errors import PolicyError
 from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
-from mayaworkbench.workspace.sessions import SessionManager
+from mayaworkbench.workspace.sessions import SessionManager, accumulate_session_events
 
 from .test_tool_gateway_runner import build_gateway
 
@@ -33,7 +33,9 @@ def _wait_for(manager, session_id, predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         events = manager.stream(session_id)
-        if predicate(events):
+        # P1-02: output is a chunk stream; predicates operate on the
+        # accumulated text because a phrase may be split across events.
+        if predicate(accumulate_session_events(events)):
             return events
         time.sleep(0.05)
     raise AssertionError(f"predicate not met: {events}")
@@ -50,19 +52,18 @@ def test_session_streams_input_and_replays_by_sequence(tmp_path):
         ],
         timeout_seconds=15,
     )
-    events = _wait_for(manager, ref.id, lambda e: any(x["data"].strip() == "one" for x in e))
+    events = _wait_for(manager, ref.id, lambda text: "one" in text)
     assert any(item["kind"] == "stdout" for item in events)
     first_seq = max(item["seq"] for item in events)
 
     manager.send_input(ref.id, "hello\n")
-    def _got_input(events):
-        joined = "".join(x["data"] for x in events if x["kind"] == "stdout")
-        return "got hello" in joined
+    def _got_input(text):
+        return "got hello" in text
 
     events = _wait_for(manager, ref.id, _got_input)
     replay = manager.stream(ref.id, after_seq=first_seq)
     assert all(item["seq"] > first_seq for item in replay)
-    assert _got_input(replay)
+    assert _got_input(accumulate_session_events(replay))
 
     stopped = manager.stop(ref.id, reason="test complete")
     assert stopped["stopped"] is True
@@ -91,8 +92,8 @@ def test_session_output_is_bounded_and_redacted(tmp_path):
         ["python", "-u", "-c", "print('sk-secret-should-not-appear'); print('x' * 5000)"],
         timeout_seconds=15,
     )
-    events = _wait_for(manager, ref.id, lambda e: any("x" * 100 in x["data"] for x in e))
-    joined = "".join(item["data"] for item in events)
+    events = _wait_for(manager, ref.id, lambda text: "x" * 100 in text)
+    joined = accumulate_session_events(events)
     assert "sk-secret" not in joined
     assert "[redacted]" in joined
     assert manager.status(ref.id)["truncated"] is True
@@ -107,7 +108,11 @@ def test_session_rejects_out_of_scope_argv(tmp_path):
 def test_session_input_rejected_after_exit(tmp_path):
     manager = _manager(tmp_path)
     ref = manager.open(["python", "-c", "print('done')"], timeout_seconds=10)
-    _wait_for(manager, ref.id, lambda e: any(x["kind"] == "exit" for x in e))
+    for _ in range(100):
+        if manager.status(ref.id)["state"] != "RUNNING":
+            break
+        time.sleep(0.05)
+    assert any(item["kind"] == "exit" for item in manager.stream(ref.id))
     with pytest.raises(PolicyError, match="no longer accepting input"):
         manager.send_input(ref.id, "x\n")
 
@@ -121,15 +126,30 @@ def test_pty_session_streams_and_accepts_input(tmp_path):
     )
     assert manager.status(ref.id)["pty"] is True
     manager.send_input(ref.id, "hello-pty\n")
-    events = _wait_for(manager, ref.id, lambda e: any("PTY_GOT hello-pty" in x["data"] for x in e))
+    # P1-02: the phrase is asserted on the ACCUMULATED stream, because a chunk
+    # stream may split it across two events.
+    events = _wait_for(manager, ref.id, lambda text: "PTY_GOT hello-pty" in text)
     assert any(item["kind"] == "stdout" for item in events)
+    assert "PTY_GOT hello-pty" in accumulate_session_events(events)
+    manager.stop(ref.id, reason="test complete")
+
+
+def test_session_events_have_strict_sequence_order(tmp_path):
+    """P1-02: events are an ordered chunk stream; seq is the only ordering."""
+    manager = _manager(tmp_path)
+    ref = manager.open(["python", "-u", "-c", "print('a'); print('b'); print('c')"], timeout_seconds=15)
+    events = _wait_for(manager, ref.id, lambda text: "c" in text)
+    seqs = [item["seq"] for item in events]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+    text = accumulate_session_events(events)
+    assert text.index("a") < text.index("b") < text.index("c")
     manager.stop(ref.id, reason="test complete")
 
 
 def test_session_record_replay_is_durable_and_sequence_aware(tmp_path):
     manager = _manager(tmp_path)
     ref = manager.open(["python", "-c", "print('replay-me')"], timeout_seconds=10)
-    _wait_for(manager, ref.id, lambda e: any("replay-me" in x["data"] for x in e))
+    _wait_for(manager, ref.id, lambda text: "replay-me" in text)
     record = manager.export_session(ref.id)
     later = SessionManager.replay_session(record)
     assert later and later[0]["seq"] >= 1

@@ -318,12 +318,18 @@ class DeclaredCheckRunner:
         run_home: Path,
         authorized: bool,
         declared: list[CheckSpec] | None = None,
+        runtime: Any | None = None,
+        require_isolated_runtime: bool = False,
     ) -> None:
         self.contract = contract
         self.workspace = Path(workspace)
         self.run_home = Path(run_home)
         self.authorized = authorized
         self._declared = list(declared if declared is not None else contract.verification_checks)
+        # P0-03: the SAME task runtime the implementer used must execute checks.
+        # No component may construct a hidden host runner for an isolated task.
+        self.runtime = runtime
+        self.require_isolated_runtime = require_isolated_runtime
 
     # ------------------------------------------------------------------ lookup
     @property
@@ -414,6 +420,17 @@ class DeclaredCheckRunner:
             base.infrastructure = True
             base.command = list(spec.argv or [])
             return base
+        if self.require_isolated_runtime and self.runtime is None:
+            # A trust profile that needs isolation must NEVER be silently
+            # downgraded to a host CommandRunner. Type the refusal so the run
+            # settles as a broken checker rather than executing on the host.
+            base.reason = (
+                "the task requires an isolated execution runtime, but no runtime was "
+                "injected into the in-loop check runner; the check was not executed"
+            )
+            base.infrastructure = True
+            base.command = list(spec.argv or [])
+            return base
         script: str | None = None
         argv = list(spec.argv or [])
         if spec.kind == CheckKind.ML_INVARIANT:
@@ -443,6 +460,7 @@ class DeclaredCheckRunner:
                 argv=None if script is not None else argv,
                 script=script,
                 timeout_seconds=timeout,
+                runtime=self.runtime,
             )
         except (MayaError, OSError) as exc:
             base.reason = f"the check could not be started: {exc}"

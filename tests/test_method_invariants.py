@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 from mayaworkbench.domain.models import InvariantSpec
 from mayaworkbench.verification.math_invariants import (
@@ -337,6 +338,16 @@ def _run_in(script: str, cwd) -> tuple[int, dict | None]:
     return proc.returncode, payload
 
 
+def _block_torch(directory) -> None:
+    """Deterministically make ``torch`` importable-as-absent (P1-03)."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "torch.py").write_text(
+        "raise ModuleNotFoundError('torch is blocked for this hermetic test')\n",
+        encoding="utf-8",
+    )
+
+
 def _spec_for(tmp_path, name: str, callable_name: str, **params) -> InvariantSpec:
     module = tmp_path / "new_methods.py"
     spec = _spec(name, callable_name, **params)
@@ -379,9 +390,9 @@ def test_reduced_precision_stability_pass_fail_and_skip(tmp_path):
     assert code != 0 and payload["status"] == "FAIL", payload
     assert payload["max_deviation"] > 1e-2
 
-    # No torch at all -> honest skip (run in a directory without the stub).
+    # No torch at all -> honest skip (P1-03: the missing dependency is forced).
     empty = tmp_path / "no_torch"
-    empty.mkdir()
+    _block_torch(empty)
     code, payload = _run_in(render_invariant(okay), empty)
     assert code == 2 and payload["status"] == "SKIP", payload
 
@@ -432,7 +443,7 @@ def test_gradient_flow_contract_pass_fail_and_skip(tmp_path):
     assert code == 2 and payload["status"] == "SKIP", payload
 
     empty = tmp_path / "no_torch"
-    empty.mkdir(exist_ok=True)
+    _block_torch(empty)
     code, payload = _run_in(render_invariant(okay), empty)
     assert code == 2 and payload["status"] == "SKIP", payload
 
@@ -513,6 +524,6 @@ def test_seed_determinism_pass_fail_and_skip(tmp_path):
     assert code == 2 and payload["status"] == "SKIP", payload
 
     empty = tmp_path / "no_torch"
-    empty.mkdir(exist_ok=True)
+    _block_torch(empty)
     code, payload = _run_in(render_invariant(okay), empty)
     assert code == 2 and payload["status"] == "SKIP", payload

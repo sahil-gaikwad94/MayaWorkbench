@@ -31,3 +31,39 @@ Truth table: IMPLEMENTATION_STATUS.md. Test matrix: docs/test-matrix.md.
 - Docs reconciled from one status registry; see `docs/wiki/audit-2026-11-22-remediation.md`.
 
 Verification numbers for this package are recorded in `docs/test-matrix.md`.
+
+## 2026-11-24 execution-trust + WP2–WP7 engineering release
+
+WP0 (P0-01…05): sanitized immutable `/src` snapshot with a single canonical
+filter and policy fingerprint; live in-container capability probe of effective
+pids/memory/cpu plus network/secret/mount/cleanup canaries; one task runtime in
+in-loop checks; container-owned sessions with container teardown; equivalent
+isolated baseline/candidate runtimes with recorded parity evidence. CPU time,
+core quota and wall time are separate fields.
+
+WP1: chunk-stream framing contract, hermetic forced-missing torch tests,
+canonical JUnit report, local API host/origin/rate/redaction security contract.
+
+WP2: `EnvironmentProvisioner` executes approved plans through the injected
+runtime with an attested report; opt-in ENVIRONMENT_PROVISIONING workflow phase
+and implementation handoff; `maya env provision`. Isolated installs fail closed.
+
+WP3: frozen provider profiles, same-model control arm, Wilson intervals,
+per-family rates, latency/traces, prompt-injection/connector safety corpus,
+`maya eval providers|safety|compare`.
+
+WP4: R2I held-out contract (two annotators + adjudication + kappa), grading
+guide, expanded development corpus, equation extraction, method adapters,
+read-only claim→code→obligation graph API and UI.
+
+WP5: change-impact analysis with resolved vs heuristic edges, 7-language gold
+manifests with precision/recall, retrieval evaluation with measured uplift.
+
+WP6: Jupyter, scholarly, container-service and DB-schema connectors with
+explicit scopes, grants, host allowlists and loopback-only service binding.
+
+WP7: X-ray, task DAG, searchable session trace, project report endpoints;
+keyboard navigation, focus-visible styling, responsive layout and aria labels.
+
+No live OCI/provider/expert result is claimed; those gates stay opt-in.
+Verification numbers live in `docs/test-matrix.md` and the canonical JUnit report.

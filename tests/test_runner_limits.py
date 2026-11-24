@@ -205,3 +205,52 @@ def test_deny_by_default_requires_positive_namespace_proof(tmp_path):
         )
         assert result.blocked and "DENY_BY_DEFAULT" in (result.blocked_reason or "")
         assert not marker.exists()
+
+
+def test_cpu_time_and_core_quota_are_recorded_separately(tmp_path):
+    """P1-01: a 'cpu' number must never be interpreted as both budgets."""
+    from mayaworkbench.domain.models import TaskConstraints
+
+    policy = CommandPolicy(
+        profile="CPU_SMOKE",
+        network_policy="ALLOW_WITH_APPROVAL",
+        dependency_policy="DENY",
+        cpu_seconds=30,  # legacy alias, still reported
+        cpu_cores=4,
+        wall_time_seconds=120,
+    )
+    described = policy.describe()
+    assert described["cpu_time_seconds"] == 30   # cumulative CPU TIME budget
+    assert described["cpu_cores"] == 4           # concurrency QUOTA
+    assert described["wall_time_seconds"] == 120
+    assert policy.effective_cpu_time_seconds == 30
+    # The legacy alias still reports for old callers but is not the authority.
+    assert policy.cpu_seconds == 30
+
+    constraints = TaskConstraints(
+        cpu_time_seconds=5,
+        cpu_cores=2,
+        max_runtime_seconds=90,
+        compute_profile="CPU_SMOKE",
+    )
+    mapped = CommandPolicy.from_constraints(constraints)
+    assert mapped.cpu_time_seconds == 5
+    assert mapped.cpu_cores == 2
+    assert mapped.wall_time_seconds == 90
+
+
+def test_command_result_records_each_cpu_dimension_independently(tmp_path):
+    policy = CommandPolicy(
+        profile="CPU_SMOKE",
+        network_policy="ALLOW_WITH_APPROVAL",
+        dependency_policy="DENY",
+        cpu_cores=2,
+        cpu_time_seconds=15,
+        max_runtime_seconds=60,
+    )
+    runner = CommandRunner(tmp_path, policy=policy, run_home=tmp_path / "home")
+    result = runner.run(["python", "-c", "print('x')"], timeout_seconds=10)
+    assert result.cpu_cores == 2
+    assert result.cpu_time_seconds == 15
+    # The wall deadline is the observed supervisor timeout, recorded separately.
+    assert result.wall_time_seconds == 10

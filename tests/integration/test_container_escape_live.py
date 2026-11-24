@@ -59,6 +59,10 @@ targets = (
     ("docker_sock", "/var/run/docker.sock"),
     ("shadow", "/etc/shadow"),
     ("home_dot_ssh", os.path.join(os.environ.get("HOME", ""), ".ssh")),
+    # P0-01: the original worktree's secrets must be unreachable from /src.
+    ("src_env", "/src/.env"),
+    ("src_git_config", "/src/.git/config"),
+    ("src_npmrc", "/src/.npmrc"),
 )
 for label, path in targets:
     try:
@@ -240,10 +244,14 @@ def test_container_denies_host_reads_and_reports_honest_limits(
     lines = result.stdout.splitlines()
     assert "HOME=/work" in lines, f"container HOME is not remapped: {lines}"
     assert "EUID=0" not in lines, "rootless gate requires a non-root container user"
-    for label in ("host_canary", "host_home", "docker_sock", "shadow", "home_dot_ssh"):
+    for label in (
+        "host_canary", "host_home", "docker_sock", "shadow", "home_dot_ssh",
+        "src_env", "src_git_config", "src_npmrc",
+    ):
         assert f"DENIED:{label}" in lines, f"{label} was readable inside the container: {lines}"
         assert f"LEAK:{label}" not in lines, f"{label} leaked: {lines}"
     assert _HOST_CANARY not in result.stdout, "the host canary content leaked into stdout"
+    assert _FAKE_SECRET not in result.stdout, "the source .env secret leaked from /src"
 
     argv = captured["argv"]
     assert argv[1] == "run", f"unexpected OCI argv: {argv}"
@@ -256,7 +264,14 @@ def test_container_denies_host_reads_and_reports_honest_limits(
     assert argv[argv.index("--pids-limit") + 1] == str(oci_live.policy.max_processes), argv
 
     mounts = [argv[i + 1] for i, flag in enumerate(argv) if flag == "--mount"]
-    assert any("dst=/src" in mount and "readonly" in mount for mount in mounts), mounts
+    src_mount = next((m for m in mounts if "dst=/src" in m and "readonly" in m), None)
+    assert src_mount is not None, mounts
+    # /src must be the task-owned sanitized snapshot, never the original worktree.
+    sanitized = oci_runtime.sanitized_source
+    assert sanitized is not None
+    assert f"src={sanitized}" in src_mount, src_mount
+    assert f"src={oci_live.source}" not in src_mount, src_mount
+    assert not (sanitized / ".env").exists(), "the sanitized /src still contains .env"
     assert any("dst=/work" in mount and "readonly" not in mount for mount in mounts), mounts
     joined = " ".join(argv)
     for forbidden in (

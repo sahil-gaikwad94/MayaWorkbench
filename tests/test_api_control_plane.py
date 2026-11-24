@@ -80,6 +80,122 @@ def _get(base: str, path: str) -> tuple[int, Any]:
     return _request(base, "GET", path)
 
 
+def _raw(
+    base: str,
+    method: str,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    body: dict[str, Any] | None = None,
+) -> tuple[int, Any, dict[str, str]]:
+    """Send a request with explicit headers and return headers too."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    all_headers: dict[str, str] = {"Content-Type": "application/json", **(headers or {})}
+    request = urllib.request.Request(base + path, data=data, headers=all_headers, method=method)
+    try:
+        with _OPENER.open(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8")), dict(response.headers.items())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8")), dict(exc.headers.items())
+
+
+def test_cross_origin_post_is_refused(tmp_path):
+    """P1-09: browser-originated cross-site POSTs cannot trigger mutations."""
+    from mayaworkbench.api import create_server
+    from mayaworkbench.api.validation import check_origin
+
+    # Pure contract check first.
+    check_origin(None, allowed_origins={"http://127.0.0.1:1"})
+    with pytest.raises(Exception) as exc:
+        check_origin("http://evil.example", allowed_origins={"http://127.0.0.1:1"})
+    assert "ORIGIN_FORBIDDEN" in str(exc.value) or "Cross-origin" in str(exc.value)
+
+    server = create_server(_services_for(tmp_path), host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, payload, _ = _raw(
+            base, "POST", "/anything", headers={"Origin": "http://evil.example"}, body={}
+        )
+        assert status == 403
+        assert payload["code"] == "ORIGIN_FORBIDDEN"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_host_header_rebinding_guard(tmp_path):
+    """P1-09: the local API refuses requests for foreign Host names."""
+    from mayaworkbench.api import create_server
+    from mayaworkbench.api.validation import check_host_header, compute_allowed_hosts
+
+    allowed = compute_allowed_hosts("127.0.0.1", 8765)
+    check_host_header("127.0.0.1:8765", expected_hosts=allowed)
+    check_host_header("localhost:8765", expected_hosts=allowed)
+    with pytest.raises(Exception) as exc:
+        check_host_header("attacker.example", expected_hosts=allowed)
+    assert "HOST_MISMATCH" in str(exc.value) or "Unexpected Host" in str(exc.value)
+
+
+def test_rate_limit_returns_429(tmp_path):
+    """P1-09: a bounded local API cannot be flooded without limit."""
+    from mayaworkbench.api import create_server
+
+    server = create_server(_services_for(tmp_path), host="127.0.0.1", port=0)
+    server._rate_limiter.threshold = 1
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, _, _ = _raw(base, "GET", "/health")
+        assert status == 200
+        status, payload, _ = _raw(base, "GET", "/health")
+        assert status == 429
+        assert payload["code"] == "RATE_LIMIT"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_non_loopback_bind_carries_an_explicit_warning(tmp_path):
+    """P1-09: the server advertises when it is exposed beyond loopback."""
+    from mayaworkbench.api import create_server
+
+    server = create_server(_services_for(tmp_path), host="0.0.0.0", port=0)
+    server.server_close()
+    notes = getattr(server, "security_notes", "")
+    assert notes and "WARNING" in notes and "loopback" in notes
+    local = create_server(_services_for(tmp_path), host="127.0.0.1", port=0)
+    local.server_close()
+    assert not getattr(local, "security_notes", "")
+
+
+def test_response_scrubber_removes_secrets_from_nested_payloads():
+    """P1-09: no secret value may survive in a serialised control-plane response."""
+    from mayaworkbench.api.validation import scrub_secrets
+
+    token = "sk-" + ("A" * 40)
+    payload = {
+        "events": [{"data": f"TOKEN={token}", "nested": [f"ghp_{'b' * 25}"]}],
+        "count": 2,
+    }
+    scrubbed = scrub_secrets(payload)
+    assert token not in json.dumps(scrubbed)
+    assert "ghp_" + "b" * 25 not in json.dumps(scrubbed)
+    assert "[REDACTED]" in json.dumps(scrubbed)
+    assert scrubbed["count"] == 2
+
+
+def _services_for(tmp_path):
+    from mayaworkbench.app.container import Services
+
+    services = Services.open(tmp_path / "api-home")
+    return services
+
+
 def _post(base: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
     return _request(base, "POST", path, body if body is not None else {})
 

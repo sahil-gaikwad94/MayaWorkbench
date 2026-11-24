@@ -70,23 +70,42 @@ MAYA_OCI_LIVE=1 MAYA_OCI_SMOKE=1 \
 Required environment:
 
 * `MAYA_OCI_LIVE=1` — deliberate opt-in. Without it the tests skip with a reason.
-* `MAYA_OCI_SMOKE=1` — makes the canonical capability probe run a bounded real
-  container smoke test. `probe_execution_capability_report()` must report
-  `execution_backends["rootless-container"]["available"] is True`; a bare OCI
-  binary or cgroup controller names are not enough.
+* `MAYA_OCI_SMOKE=1` — makes the canonical capability probe build the **actual
+  production backend** with identical flags and run a bounded in-container probe.
+  `probe_execution_capability_report()` must report
+  `execution_backends["rootless-container"]["available"] is True`. A bare OCI
+  binary, a smoke marker or cgroup controller names are never enough.
 * A **rootless** podman on `PATH` plus a writable cgroup-v2 delegation with an
   exact finite limit readback. Docker requires `MAYA_ALLOW_DOCKER=1` and is not
   treated as verified by the canonical probe; prefer podman.
 
-What a pass licenses: the harness used the real `RootlessContainerBackend`
-(`verified=True`), populated `/work` from a pinned source while excluding `.env`
-and a host canary, observed the real OCI argv (`--network none`, `--read-only`,
-`--cap-drop ALL`, `--pids-limit` with the configured value, `/src` read-only,
-no home/SSH/socket/cloud-credential mounts, no host secret in the environment),
-confirmed a malicious in-container script could not read the host canary, host
-home, Docker socket, `/etc/shadow` or `HOME/.ssh`, accepted a real `pids.max`
-readback before any "enforced" claim, and verified that `stop()` removed the
-container and overlay with no surviving child. All subprocess timeouts are <= 60 s.
+What a pass licenses (all mandatory, reported per control in
+`oci_verification.smoke_test`):
+
+* `/work` is populated from the pinned source while `.env`, credential paths,
+  credential-shaped content and symlinks are excluded; `/src` is the **sanitized
+  task-owned snapshot**, never the original worktree (`mount_policy_hash` binds
+  the manifest to the filter version).
+* Real OCI argv is observed: `--network none`, `--read-only`, `--cap-drop ALL`,
+  `--security-opt no-new-privileges`, `--pids-limit`, `--memory`, `--cpus` (a CPU
+  *core quota*), no home/SSH/socket/cloud-credential mounts, no host secret in
+  the environment. CPU *time* is a separate RLIMIT_CPU dimension.
+* **Effective** cgroup values are read from inside the task container and compared
+  to the request: `pids.max`, `memory.max` and `cpu.max` must each show `enforced`
+  with the observed value in the evidence. A control that is ignored is reported
+  `not_applied`/`unsupported`, not masked by a passing one.
+* Network denial is proven actively: the container cannot reach a host listener
+  on loopback (not merely `--network none` in argv).
+* Secret/canary denial is proven from every mount: `/src/.env`, `/src/.git/config`,
+  `/src/.npmrc` and credential paths are unreadable; host canary, host home,
+  Docker socket, `/etc/shadow` and `HOME/.ssh` are unreadable; mount visibility is
+  confirmed from `/proc/self/mountinfo` (`/src` read-only, `/work` writable).
+* Rootless terminal sessions run in a task-owned container, report `pwd=/work`,
+  cannot read host canaries, and are fully cleaned up (no descendant survives).
+* Baseline and candidate checks run in separate isolated runtimes with matching
+  image, policy, limit evidence and mount-policy hash; parity is recorded.
+* `stop()` removed the container and overlay with no surviving child. All
+  subprocess timeouts are <= 60 s.
 
 What a skip means: no verified rootless runtime was available. **No container
 isolation, cgroup-enforcement or host-escape claim is licensed.** The gate must
