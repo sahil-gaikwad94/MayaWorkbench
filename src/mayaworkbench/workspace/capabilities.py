@@ -13,7 +13,6 @@ cannot drift between surfaces.
 
 from __future__ import annotations
 
-import json
 import os
 import platform
 import shutil
@@ -41,7 +40,7 @@ except ImportError:  # pragma: no cover - Windows
 
 
 _RLIMIT_BY_NAME = {
-    "cpu": "RLIMIT_CPU",
+    "cpu_time": "RLIMIT_CPU",
     "memory": "RLIMIT_AS",
     "open_files": "RLIMIT_NOFILE",
     "file_size": "RLIMIT_FSIZE",
@@ -109,9 +108,6 @@ def _cgroup_probe() -> dict[str, Any]:
     }
 
 
-#: A bounded, machine-readable probe. It runs inside the SAME production
-#: container (identical argv/flags/mounts) and reports *observed* values from
-#: inside the container, never values copied from the policy object.
 _OCI_LIMIT_PROBE = r"""
 import json, os, socket, sys
 
@@ -211,28 +207,33 @@ def verified_limits_from_probe(oci: dict[str, Any]) -> dict[str, dict[str, Any]]
     }
 
 
-def _oci_probe() -> dict[str, Any]:
-    """Verify rootless OCI using the real backend and live in-container readbacks.
 
-    Controller names, argv flags and a basic smoke marker are presence evidence
-    only. Availability requires a bounded probe that constructs the actual
-    production backend, reads effective cgroup limits from inside the container,
-    proves network/secret/mount denial with active canaries, and verifies clean
-    teardown. Each control is reported independently: a failed control cannot
-    be masked by a passing one.
+def _oci_probe() -> dict[str, Any]:
+    """Verify rootless OCI availability with a live, task-equivalent probe.
+
+    Controller names and a `container starts` smoke test are not evidence that
+    a *specific* limit is applied. The authoritative answer comes from
+    :meth:`RootlessContainerBackend.verify_capabilities`, which reads the
+    effective ``pids.max``/``memory.max``/``cpu.max`` and rlimits back from
+    inside a container launched with the same flags a task uses.
+
+    The probe is opt-in (``MAYA_OCI_SMOKE=1``) because it starts a container;
+    until it passes, every limit stays ``not_applied`` and the profile is
+    unavailable.
     """
+
     allow_docker = os.environ.get("MAYA_ALLOW_DOCKER", "").lower() in {"1", "true", "yes"}
     podman = shutil.which("podman")
     docker = shutil.which("docker") if allow_docker else None
     tool = podman or docker
+    rootless = False
     reasons: list[str] = []
     if tool is None:
         reasons.append(
             "no verified rootless OCI runtime found (podman preferred; docker requires "
             "MAYA_ALLOW_DOCKER=1 and explicit rootless verification)"
         )
-    rootless = False
-    if tool and Path(tool).name == "podman":
+    elif Path(tool).name == "podman":
         try:
             info = subprocess.run(
                 [tool, "info", "--format", "{{.Host.Security.Rootless}}"],
@@ -241,217 +242,82 @@ def _oci_probe() -> dict[str, Any]:
                 timeout=10,
                 check=False,
             )
-            rootless = info.returncode == 0 and info.stdout.decode("ascii", "replace").strip() == "true"
+            rootless = (
+                info.returncode == 0
+                and info.stdout.decode("ascii", "replace").strip() == "true"
+            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             reasons.append(f"podman rootless verification failed: {exc}")
         if not rootless:
             reasons.append("podman did not confirm a rootless host")
-    elif tool:
+    else:
         reasons.append("docker rootless status is unverified by this probe")
 
     cgroup = probe_cgroup_enforcement()
-    if not cgroup["available"]:
-        reasons.append("no writable, read-back-verified cgroup v2 process limit")
-
-    smoke_enabled = os.environ.get("MAYA_OCI_SMOKE", "").lower() in {"1", "true", "yes"}
-    smoke: dict[str, Any] = {
-        "status": "not_run",
-        "limits": {},
-        "network": {"policy": "denied", "active_probe": "not_run"},
-        "host_canary": "not_run",
-        "secret_mount_probe": "not_run",
-        "cleanup": "not_run",
-        "mount_policy_hash": "",
-    }
-    if not smoke_enabled:
-        smoke["detail"] = (
-            "set MAYA_OCI_SMOKE=1 to run a bounded live OCI probe; "
-            "availability stays false until every mandatory control passes"
-        )
-    elif not (tool and rootless and cgroup["available"]):
-        smoke["status"] = "skipped"
-        smoke["detail"] = "prerequisites (rootless runtime/cgroup) unavailable"
-    else:
-        try:
-            smoke = _run_live_oci_probe(tool, smoke)
-        except Exception as exc:  # noqa: BLE001 - a probe failure must fail closed
-            smoke = {
-                **smoke,
-                "status": "failed",
-                "detail": f"{type(exc).__name__}: {exc}"[:1000],
-            }
-
-    mandatory = [
-        smoke.get("limits", {}).get(name, {}).get("status") == "enforced"
-        for name in ("pids", "memory_bytes", "cpu_quota")
-    ]
-    network_ok = smoke.get("network", {}).get("active_probe") == "passed"
-    secrets_ok = smoke.get("secret_mount_probe") == "denied"
-    cleanup_ok = smoke.get("cleanup") == "passed"
-    available = bool(
-        tool and rootless and cgroup["available"]
-        and smoke.get("status") == "passed"
-        and all(mandatory) and network_ok and secrets_ok and cleanup_ok
-    )
-    if not available and not reasons:
-        failed = [
-            name for name, ok in zip(("pids", "memory_bytes", "cpu_quota"), mandatory)
-            if not ok
-        ]
-        reason = f"rootless OCI probe is {smoke.get('status')}"
-        if failed:
-            reason += f"; unverified limits: {', '.join(failed)}"
-        if not network_ok:
-            reason += "; network denial not proven"
-        if not secrets_ok:
-            reason += "; secret/mount denial not proven"
-        if not cleanup_ok:
-            reason += "; cleanup not proven"
-        reasons.append(reason)
-    return {
-        "available": available,
-        "runtime": {"tool": tool, "rootless": rootless},
-        "cgroup": cgroup,
-        "smoke_test": smoke,
-        "reason": "; ".join(reasons) if reasons else "rootless OCI verified by live in-container probe",
-    }
-
-
-def _run_live_oci_probe(tool: str, smoke: dict[str, Any]) -> dict[str, Any]:
-    """Construct the real backend, run the limit probe and assemble evidence."""
-    import socket as socket_module
-    import tempfile
-
-    from mayaworkbench.workspace.backends import RootlessContainerBackend
-
-    marker = "maya-oci-secret-canary-do-not-leak"
+    # Deliberately small, fast values: the probe proves the *mechanism* at these
+    # values. A real task re-verifies with its own contract policy before use.
     policy = CommandPolicy(
         profile="CPU_SMOKE",
         trust_profile="LOCAL_TRUSTED",
         network_policy="DENY_BY_DEFAULT",
         dependency_policy="DENY",
-        max_processes=8,
-        memory_limit_mb=256,
-        # P0-02: use the same finite values the production backend applies so
-        # the readback is compared against the real request.
-        cpu_cores=2,
-        cpu_time_seconds=15,
-        max_runtime_seconds=60,
+        max_processes=16,
+        memory_limit_mb=512,
+        cpu_time_seconds=2,
+        cpu_quota=1.0,
+        max_runtime_seconds=300,
     )
-    requested_cpus = str(max(1, min(4, policy.cpu_cores or 1)))
-    with tempfile.TemporaryDirectory(prefix="maya-oci-probe-") as tmp:
-        root = Path(tmp)
-        source = root / "source"
-        source.mkdir(mode=0o700)
-        (source / "app.py").write_text("print('probe')\n", encoding="utf-8")
-        # The original worktree contains a secret; the sanitized /src must not.
-        (source / ".env").write_text(f"TOKEN={marker}\n", encoding="utf-8")
-        (source / ".git").mkdir()
-        (source / ".git" / "config").write_text(marker, encoding="utf-8")
-        backend = RootlessContainerBackend(
-            source, root / "run-home", policy, tool=tool, verified=True
+    probe_home = Path(tempfile.gettempdir()) / "maya-capability-probe"
+    backend = RootlessContainerBackend(
+        Path.cwd(),
+        probe_home,
+        policy,
+        tool=Path(tool).name if tool else None,
+        allow_docker=allow_docker,
+    )
+    prerequisites_ok, prerequisite_reasons = backend.prerequisites()
+    smoke_enabled = os.environ.get("MAYA_OCI_SMOKE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    smoke: dict[str, Any] = {"status": "not_run"}
+    evidence: dict[str, Any] | None = None
+    if not smoke_enabled:
+        smoke["detail"] = (
+            "set MAYA_OCI_SMOKE=1 to run the bounded in-container probe; "
+            "availability stays false until it passes"
         )
-        runtime = backend.provision()
-        listener = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
-        try:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen(8)
-            port = int(listener.getsockname()[1])
-            result = backend.exec(
-                runtime,
-                [
-                    "python", "-c", _OCI_LIMIT_PROBE,
-                    str(port), str(policy.max_processes), str(policy.memory_limit_mb),
-                    requested_cpus, marker,
-                ],
-                timeout=60,
-            )
-        finally:
-            listener.close()
-
-        payload: dict[str, Any] | None = None
-        for line in (result.stdout or "").splitlines():
-            if line.startswith("MAYA_OCI_PROBE="):
-                try:
-                    payload = json.loads(line.split("=", 1)[1])
-                except json.JSONDecodeError:
-                    payload = None
-        if payload is None:
-            return {
-                **smoke,
-                "status": "failed",
-                "detail": (result.stderr or result.stdout or "probe printed no marker").strip()[:500],
-            }
-
-        limits: dict[str, Any] = {}
-        observed_pids = payload["limits"].get("pids", "")
-        limits["pids"] = _verified_limit("pids", policy.max_processes, observed_pids)
-
-        observed_mem = payload["limits"].get("memory_bytes", "")
-        expected_mem = policy.memory_limit_mb * 1024 * 1024
-
-        def _memory_ok(value: Any) -> bool:
-            return str(value).isdigit() and int(value) == expected_mem
-
-        limits["memory_bytes"] = _verified_limit(
-            "memory_bytes", f"{expected_mem} bytes ({policy.memory_limit_mb} MB)",
-            observed_mem, matcher=_memory_ok,
-        )
-
-        observed_cpu = str(payload["limits"].get("cpu_quota", ""))
-        expected_cpu_cpus = int(requested_cpus)
-
-        def _cpu_ok(value: Any) -> bool:
-            parts = str(value).split()
-            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-                return False
-            quota, period = int(parts[0]), int(parts[1])
-            return period > 0 and abs(quota / period - expected_cpu_cpus) < 0.01
-
-        limits["cpu_quota"] = _verified_limit(
-            "cpu_quota", f"{requested_cpus} CPU cores (cgroup quota)",
-            observed_cpu or "unreadable", matcher=_cpu_ok,
-        )
-
-        network_ok = payload.get("network") == "DENIED"
-        secret_probe = payload.get("secrets", {})
-        secrets_ok = bool(secret_probe) and all(
-            value == "DENIED" for value in secret_probe.values()
-        )
-        mounts = payload.get("mounts", {})
-        mounts_ok = mounts.get("src") is True and mounts.get("work") is True
-        if not mounts_ok:
-            secrets_ok = False
-        cleanup_succeeded = True
-        try:
-            backend.stop(runtime, reason="capability probe complete")
-        except Exception:  # noqa: BLE001
-            cleanup_succeeded = False
-        overlay_root = runtime.overlay.parent
-        cleanup_ok = cleanup_succeeded and not overlay_root.exists()
-        passed = (
-            result.exit_code == 0
-            and all(item["status"] == "enforced" for item in limits.values())
-            and network_ok and secrets_ok and cleanup_ok
-        )
-        return {
-            "status": "passed" if passed else "failed",
-            "detail": (
-                "live in-container readback of pids/memory/cpu, active network "
-                "probe, secret denial and cleanup"
-            ),
-            "limits": limits,
-            "network": {
-                "policy": "denied",
-                "active_probe": "passed" if network_ok else "failed",
-                "detail": payload.get("network"),
-            },
-            "host_canary": "denied" if secrets_ok else "leaked",
-            "secret_mount_probe": "denied" if secrets_ok else "leaked",
-            "mount_visibility": mounts,
-            "cleanup": "passed" if cleanup_ok else "failed",
-            "mount_policy_hash": getattr(runtime, "mount_policy_sha256", ""),
+    elif not prerequisites_ok:
+        smoke = {
+            "status": "skipped",
+            "detail": "; ".join(prerequisite_reasons),
         }
+    else:
+        observed = backend.verify_capabilities()
+        evidence = observed.as_dict()
+        smoke = {
+            "status": observed.probe_status,
+            "detail": observed.detail[:500],
+            "mandatory_failures": observed.mandatory_failures,
+        }
+
+    capabilities = backend.capabilities().as_dict()
+    available = bool(capabilities["available"] and smoke["status"] == "passed")
+    if not available:
+        reasons.extend(capabilities.get("reasons") or [])
+    return {
+        "available": available,
+        "runtime": {"tool": tool, "rootless": rootless},
+        "cgroup": cgroup,
+        "smoke_test": smoke,
+        "evidence": evidence,
+        "capabilities": capabilities,
+        "limit_policy": policy.describe(),
+        "reason": "; ".join(dict.fromkeys(reasons))
+        if reasons
+        else "rootless OCI isolation verified by a live in-container probe",
+    }
 
 
 @dataclass(frozen=True)
@@ -497,6 +363,14 @@ def probe_execution_capability_report() -> ExecutionCapabilityReport:
                 "scope (CommandRunner use_cgroup_scope) or a container backend, "
                 "and is reported per run in CommandResult.limits",
             }
+        elif name == "cpu_quota":
+            limits[name] = {
+                "available": False,
+                "mechanism": None,
+                "detail": "CPU concurrency (cores) is a cgroup cpu.max control; the "
+                "host runner reports it as unsupported and the container backend "
+                "proves it with an in-container readback",
+            }
         else:
             attribute = _RLIMIT_BY_NAME[name]
             supported = resource is not None and hasattr(resource, attribute)
@@ -510,20 +384,9 @@ def probe_execution_capability_report() -> ExecutionCapabilityReport:
     network = _network_probe()
     cgroup = _cgroup_probe()
     oci = _oci_probe()
-    container_backend = RootlessContainerBackend(
-        Path.cwd(),
-        Path(tempfile.gettempdir()) / "maya-capability-probe",
-        CommandPolicy(
-            profile="CPU_SMOKE",
-            network_policy="DENY_BY_DEFAULT",
-            dependency_policy="DENY",
-        ),
-    )
-    backend_caps = container_backend.capabilities().as_dict()
+    backend_caps = dict(oci["capabilities"])
     backend_caps["available"] = bool(backend_caps["available"] and oci["available"])
     backend_caps["oci_verification"] = oci
-    # A backend may only repeat limits that the live probe actually observed.
-    backend_caps["verified_limits"] = verified_limits_from_probe(oci)
 
     profiles: dict[str, Any] = {}
     descriptions = {
@@ -591,6 +454,9 @@ def probe_execution_capabilities() -> dict[str, Any]:
 
 __all__ = [
     "ExecutionCapabilityReport",
+    "_OCI_LIMIT_PROBE",
+    "_verified_limit",
+    "verified_limits_from_probe",
     "probe_execution_capability_report",
     "probe_execution_capabilities",
 ]

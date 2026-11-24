@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -327,25 +328,48 @@ NEW_PROBES = (
 )
 
 
-def _run_in(script: str, cwd) -> tuple[int, dict | None]:
+#: A hermetic "torch is not installed" fixture. A temporary working directory
+#: is not isolation: if the interpreter has torch in site-packages, ``import
+#: torch`` still succeeds. A startup hook installed through ``sitecustomize``
+#: makes the import fail deterministically, whatever the host has installed
+#: (MW-NEW-P1-03).
+_TORCH_BLOCKER = '''
+import sys
+
+
+class _BlockTorch:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "torch" or fullname.startswith("torch."):
+            raise ModuleNotFoundError("torch is blocked by this hermetic test")
+        return None
+
+
+sys.meta_path.insert(0, _BlockTorch())
+'''
+
+
+def _run_in(
+    script: str, cwd, *, block_torch: bool = False
+) -> tuple[int, dict | None]:
+    env = dict(os.environ)
+    if block_torch:
+        blocker = Path(cwd) / "_torch_blocker"
+        blocker.mkdir(parents=True, exist_ok=True)
+        (blocker / "sitecustomize.py").write_text(_TORCH_BLOCKER, encoding="utf-8")
+        env["PYTHONPATH"] = str(blocker)
     proc = subprocess.run(
-        [sys.executable, "-c", script], cwd=cwd, capture_output=True, text=True, timeout=30
+        [sys.executable, "-c", script],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     payload = None
     for line in proc.stdout.splitlines():
         if line.startswith("{"):
             payload = json.loads(line)
     return proc.returncode, payload
-
-
-def _block_torch(directory) -> None:
-    """Deterministically make ``torch`` importable-as-absent (P1-03)."""
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "torch.py").write_text(
-        "raise ModuleNotFoundError('torch is blocked for this hermetic test')\n",
-        encoding="utf-8",
-    )
 
 
 def _spec_for(tmp_path, name: str, callable_name: str, **params) -> InvariantSpec:
@@ -390,10 +414,11 @@ def test_reduced_precision_stability_pass_fail_and_skip(tmp_path):
     assert code != 0 and payload["status"] == "FAIL", payload
     assert payload["max_deviation"] > 1e-2
 
-    # No torch at all -> honest skip (P1-03: the missing dependency is forced).
-    empty = tmp_path / "no_torch"
-    _block_torch(empty)
-    code, payload = _run_in(render_invariant(okay), empty)
+    # No torch at all -> honest skip. The blocker makes the import fail even on
+    # a host that has torch installed globally.
+    no_torch = tmp_path / "no_torch"
+    no_torch.mkdir(exist_ok=True)
+    code, payload = _run_in(render_invariant(okay), no_torch, block_torch=True)
     assert code == 2 and payload["status"] == "SKIP", payload
 
     # An unavailable declared dtype -> honest skip even with torch present.
@@ -442,9 +467,9 @@ def test_gradient_flow_contract_pass_fail_and_skip(tmp_path):
     code, payload = _run_in(render_invariant(no_params), tmp_path)
     assert code == 2 and payload["status"] == "SKIP", payload
 
-    empty = tmp_path / "no_torch"
-    _block_torch(empty)
-    code, payload = _run_in(render_invariant(okay), empty)
+    no_torch = tmp_path / "no_torch"
+    no_torch.mkdir(exist_ok=True)
+    code, payload = _run_in(render_invariant(okay), no_torch, block_torch=True)
     assert code == 2 and payload["status"] == "SKIP", payload
 
 
@@ -523,7 +548,7 @@ def test_seed_determinism_pass_fail_and_skip(tmp_path):
     code, payload = _run_in(render_invariant(nondet), tmp_path)
     assert code == 2 and payload["status"] == "SKIP", payload
 
-    empty = tmp_path / "no_torch"
-    _block_torch(empty)
-    code, payload = _run_in(render_invariant(okay), empty)
+    no_torch = tmp_path / "no_torch"
+    no_torch.mkdir(exist_ok=True)
+    code, payload = _run_in(render_invariant(okay), no_torch, block_torch=True)
     assert code == 2 and payload["status"] == "SKIP", payload

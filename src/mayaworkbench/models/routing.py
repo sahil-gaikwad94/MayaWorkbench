@@ -601,9 +601,11 @@ def provider_specs_from_settings(settings: Any) -> list[ProviderSpec]:
         "anthropic": "anthropic",
         "gemini": "gemini",
     }.get(kind, LOCAL_OPENAI_COMPATIBLE if primary_local else "openai_compatible")
-    from mayaworkbench.models.gateway import provider_key_env
+    from mayaworkbench.config import provider_key_env
 
     key_env = provider_key_env(settings)
+    # Every shipped adapter implements streaming, structured output and tool
+    # calls; only OpenAI-compatible adapters expose multiple parallel calls.
     specs = [
         ProviderSpec(
             name="primary",
@@ -614,9 +616,10 @@ def provider_specs_from_settings(settings: Any) -> list[ProviderSpec]:
             tier="reliable",
             capabilities=ModelCapabilities(
                 structured_output=True,
-                streaming=kind == "openai_compatible",
+                streaming=kind != "none",
                 tool_calling=True,
-                parallel_tool_calls=kind == "openai_compatible",
+                parallel_tool_calls=kind in {"openai_compatible", "local_openai_compatible"},
+                prompt_caching=kind == "anthropic",
                 provider_family=mode,
             ),
             cost_per_mtok=settings.model.output_cost_per_mtok,
@@ -637,7 +640,12 @@ def provider_specs_from_settings(settings: Any) -> list[ProviderSpec]:
                 local=fallback_local,
                 priority=20,
                 tier="fast" if fallback_local else "reasoning",
-                capabilities=ModelCapabilities(structured_output=True, streaming=False),
+                capabilities=ModelCapabilities(
+                    structured_output=True,
+                    streaming=True,
+                    tool_calling=True,
+                    parallel_tool_calls=True,
+                ),
                 key_env=fallback_env,
                 key_present=bool(os.environ.get(fallback_env)),
             )

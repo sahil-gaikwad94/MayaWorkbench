@@ -1,6 +1,6 @@
 # Release gates
 
-**Date:** 2026-11-22
+**Date:** 2026-11-23
 **Status:** normative for releases; the two live harnesses in this document are opt-in.
 
 This page is the authority for what a release may claim. Every gate below has an
@@ -23,7 +23,7 @@ meaning of a **skip**.
 |---|---|---|---|---|
 | Deterministic suite | `python -m compileall -q src` then `python -m pytest -q` | none | Code compiles; the deterministic suite is green at the recorded count | Not applicable — this gate must pass, never skip |
 | Adversarial harnesses | `PYTHONPATH=src python artifacts/adversarial/harness{1..4}.py` | none | The 82 scripted probes pass; scripted-model behaviour only | Not applicable — a `[FAIL]`/`[ERROR]` is a release failure |
-| OCI live | `MAYA_OCI_LIVE=1 MAYA_OCI_SMOKE=1 python -m pytest -q -m oci tests/integration/test_container_escape_live.py -rs` | rootless podman on PATH, cgroup-v2 delegation, `MAYA_OCI_LIVE=1`, `MAYA_OCI_SMOKE=1` | The real rootless container boundary was exercised: overlay, argv flags, host-read denial, pids readback, cleanup | No verified rootless runtime was present; **no isolation claim is licensed** |
+| OCI live | `MAYA_OCI_LIVE=1 MAYA_OCI_SMOKE=1 python -m pytest -q -m oci tests/integration/test_container_escape_live.py -rs` | rootless podman on PATH, cgroup-v2 delegation, `MAYA_OCI_LIVE=1`, `MAYA_OCI_SMOKE=1` | The real rootless container boundary was exercised: sanitized snapshot, single `/work` mount, argv flags, host/secret-read denial, per-limit cgroup/rlimit readback, cleanup | No verified rootless runtime was present; **no isolation claim is licensed** |
 | Model live | `MAYA_LIVE_MODEL=1 MAYA_MODEL_API_KEY=… MAYA_LIVE_SPEND_CAP_USD=0.10 python -m pytest -q -m live_model tests/integration/test_model_live.py -rs` | explicit opt-in key, hard spend cap, remote-model policy | The configured adapter produced schema-valid structured output and well-formed tool calls (if it declares `tool_calling`) | No key/cap/policy/capability; **no real-provider quality claim is licensed** |
 | Release evidence | `maya release evidence --pytest-report PATH --adversarial-dir PATH --out DIR --json` | real pytest report and adversarial results; `git` metadata | A machine-readable record assembled from real inputs only | Not a skip gate: missing required inputs must exit non-zero with a typed error |
 
@@ -70,46 +70,58 @@ MAYA_OCI_LIVE=1 MAYA_OCI_SMOKE=1 \
 Required environment:
 
 * `MAYA_OCI_LIVE=1` — deliberate opt-in. Without it the tests skip with a reason.
-* `MAYA_OCI_SMOKE=1` — makes the canonical capability probe build the **actual
-  production backend** with identical flags and run a bounded in-container probe.
-  `probe_execution_capability_report()` must report
-  `execution_backends["rootless-container"]["available"] is True`. A bare OCI
-  binary, a smoke marker or cgroup controller names are never enough.
+* `MAYA_OCI_SMOKE=1` — makes the canonical capability probe run the bounded
+  **in-container** verification. `probe_execution_capability_report()` must
+  report `execution_backends["rootless-container"]["available"] is True` and its
+  `evidence.probe_status` must be `passed`; a bare OCI binary or cgroup
+  controller names are not enough, and a container that merely starts is not
+  evidence for any specific limit.
 * A **rootless** podman on `PATH` plus a writable cgroup-v2 delegation with an
   exact finite limit readback. Docker requires `MAYA_ALLOW_DOCKER=1` and is not
   treated as verified by the canonical probe; prefer podman.
 
-What a pass licenses (all mandatory, reported per control in
-`oci_verification.smoke_test`):
-
-* `/work` is populated from the pinned source while `.env`, credential paths,
-  credential-shaped content and symlinks are excluded; `/src` is the **sanitized
-  task-owned snapshot**, never the original worktree (`mount_policy_hash` binds
-  the manifest to the filter version).
-* Real OCI argv is observed: `--network none`, `--read-only`, `--cap-drop ALL`,
-  `--security-opt no-new-privileges`, `--pids-limit`, `--memory`, `--cpus` (a CPU
-  *core quota*), no home/SSH/socket/cloud-credential mounts, no host secret in
-  the environment. CPU *time* is a separate RLIMIT_CPU dimension.
-* **Effective** cgroup values are read from inside the task container and compared
-  to the request: `pids.max`, `memory.max` and `cpu.max` must each show `enforced`
-  with the observed value in the evidence. A control that is ignored is reported
-  `not_applied`/`unsupported`, not masked by a passing one.
-* Network denial is proven actively: the container cannot reach a host listener
-  on loopback (not merely `--network none` in argv).
-* Secret/canary denial is proven from every mount: `/src/.env`, `/src/.git/config`,
-  `/src/.npmrc` and credential paths are unreadable; host canary, host home,
-  Docker socket, `/etc/shadow` and `HOME/.ssh` are unreadable; mount visibility is
-  confirmed from `/proc/self/mountinfo` (`/src` read-only, `/work` writable).
-* Rootless terminal sessions run in a task-owned container, report `pwd=/work`,
-  cannot read host canaries, and are fully cleaned up (no descendant survives).
-* Baseline and candidate checks run in separate isolated runtimes with matching
-  image, policy, limit evidence and mount-policy hash; parity is recorded.
-* `stop()` removed the container and overlay with no surviving child. All
-  subprocess timeouts are <= 60 s.
+What a pass licenses: the harness used the real `RootlessContainerBackend`
+after `verify_capabilities()` produced passing evidence **for the harness policy**,
+built the task view from an immutable sanitized snapshot, observed the real OCI
+argv (`--network none`, `--read-only`, `--cap-drop ALL`, `--pids-limit`,
+`--memory`, `--memory-swap`, `--cpus`, `--ulimit cpu/fsize/nofile`, exactly one
+bind mount at `/work`, no `/src` mount, no home/SSH/socket/cloud-credential
+paths, no host secret in the environment), confirmed a malicious in-container
+script could not read the host canary, host home, Docker socket, `/etc/shadow`
+or `HOME/.ssh`, and that `.env`, credential-shaped paths and credential-shaped
+content are absent from **every** mount. It must also show `pids.max`,
+`memory.max`, `cpu.max` and the rlimits read back from inside the container with
+the requested values, and that `stop()` removed the container, the overlay and
+the sanitized snapshot with no surviving child. All subprocess timeouts are
+<= 60 s.
 
 What a skip means: no verified rootless runtime was available. **No container
 isolation, cgroup-enforcement or host-escape claim is licensed.** The gate must
 appear in `unverified` with its concrete reason string.
+
+Additional mandatory OCI checks before any isolation claim:
+
+1. A secret path, a credential-shaped file *name* and a credential-shaped file
+   *content* are all unreadable from every mount visible to the task
+   (`tests/test_execution_backends.py` proves the mount policy statically).
+2. Baseline and candidate checks run in two separately provisioned runtimes
+   whose image, mount policy, resource policy and sanitizer policy hashes match
+   (`services.verification._baseline_runtime`, `tests/test_isolation_contract.py`).
+3. A rootless task's `open_session` returns a typed capability refusal; no host
+   process is created for a session (`tests/test_sessions.py`).
+4. An in-loop declared check observes the candidate write inside `/work` and no
+   host command runner is invoked (`tests/test_isolation_contract.py`).
+5. A session opens inside the retained container with the same hardening flags
+   and the same single `/work` mount; the host process table shows only the OCI
+   client; stopping that session terminates only its marker-tagged processes and
+   the retained container is removed by `stop()`
+   (`tests/test_container_sessions.py` proves the argv; the live gate must prove
+   signal delivery and `/proc` marker scanning).
+6. `maya env provision --execute` runs every step inside the runtime, refuses
+   `LOCAL_TRUSTED`, blocks downloads without `--allow-network`, and its inventory
+   is read from inside the same container
+   (`tests/test_environment_provisioning.py`; the live gate must show a real
+   install plus a real inventory).
 
 ## 4. Model live gate (opt-in, real provider, hard spend cap)
 
@@ -125,9 +137,13 @@ python -m pytest -q -m live_model tests/integration/test_model_live.py -rs
 Required environment:
 
 * `MAYA_LIVE_MODEL=1` — deliberate opt-in; no network call is made without it.
-* `MAYA_MODEL_API_KEY` — supplied by the operator. The harness never logs or
-  writes the key. Anthropic/Gemini adapters resolve their own provider-specific
-  key variable from configuration; export that variable as well when using them.
+* The key variable the configured adapter resolves: `MAYA_MODEL_API_KEY` for
+  `openai_compatible`, `MAYA_ANTHROPIC_API_KEY` for `anthropic`,
+  `MAYA_GEMINI_API_KEY` for `gemini`, or the user's `model.api_key_env`. A
+  loopback `openai_compatible`/`local_openai_compatible` endpoint may be keyless
+  under `LOCAL_ONLY`; the harness uses the gateway's own callability check
+  instead of requiring a variable that the adapter does not read. The harness
+  never logs or writes the key.
 * `MAYA_LIVE_SPEND_CAP_USD` — parseable, finite and > 0. **If the live flag is on
   and this is missing or invalid, the guard test FAILS (not skips).**
 * `MAYA_DATA_POLICY=BYOK_REMOTE_MODEL` and the usual `MAYA_MODEL_PROVIDER`,
@@ -135,13 +151,16 @@ Required environment:
   Settings are read-only in the harness; no config file is mutated.
 
 The harness makes at most two calls with `max_output_tokens <= 256`: (1) a tiny
-JSON schema response that must validate, and (2) an echo tool definition whose
-returned tool calls (if any) must name a declared tool and carry parseable JSON
-arguments. If the configured adapter declares `tool_calling=False`, only the
-tool test skips with a reason. Every assertion message records the hard spend cap.
+JSON schema response that must validate, streamed when the adapter declares
+streaming, and (2) an echo tool definition whose returned tool calls (if any)
+must name a declared tool and carry parseable JSON arguments. If the configured
+adapter declares `tool_calling=False`, only the tool test skips with a reason.
+Every assertion message records the hard spend cap.
 
-What a skip means: no key, no cap, no remote-model policy, or no declared tool
-capability. **No real-provider output-quality or tool-call claim is licensed.**
+What a skip means: no key for a remote provider, no cap, no remote-model policy,
+or no declared tool capability. **No real-provider output-quality or tool-call
+claim is licensed.** Typed refusal, quota, blocked-content and context-length
+errors are failures, not skips: the adapter must never turn them into an answer.
 
 ## 5. Release evidence
 
@@ -190,3 +209,7 @@ Re-running with unchanged inputs must yield the same evidence hash.
 A release may claim only what a **passing** gate licenses. Any skip is copied
 verbatim into `unverified`. It is never acceptable to describe a skipped OCI or
 live-model gate as "green", "verified" or "all tests pass".
+
+Container sessions and environment provisioning are implemented and unit-tested,
+but their isolated profiles stay `EXPERIMENTAL` until a real rootless host passes
+gates 5 and 6 above. Unit evidence is never reported as live evidence.

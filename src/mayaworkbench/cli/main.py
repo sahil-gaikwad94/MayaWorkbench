@@ -287,6 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     from mayaworkbench.cli.environment_commands import register_environment_commands
     from mayaworkbench.cli.evaluation_commands import register_evaluation_commands
     from mayaworkbench.cli.experience_commands import register_experience_commands
+    from mayaworkbench.cli.impact_commands import register_impact_commands
     from mayaworkbench.cli.model_commands import register_model_commands
     from mayaworkbench.cli.release_commands import register_release_commands
     from mayaworkbench.cli.runner_bundle_commands import register_runner_bundle_commands
@@ -305,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_runner_commands(sub)
     register_workspace_commands(sub)
     register_experience_commands(sub)
+    register_impact_commands(sub)
     register_evaluation_commands(sub)
     register_environment_commands(sub)
     register_api_commands(sub)

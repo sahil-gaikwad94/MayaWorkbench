@@ -1,311 +1,373 @@
-"""Environment provisioning: turn a dry-run plan into an evidenced lifecycle.
+"""Execute an environment spec inside the isolated runtime (P1-05 / WP2).
 
-A :class:`~mayaworkbench.workspace.environments.ProvisioningPlan` is a pure
-argv plan. This module executes it through the task's single injected runtime,
-never through a hidden host runner, and returns a content-addressed report that
-records exactly which steps ran, which were blocked for lack of approval, what
-the package inventory and service health were, and whether cleanup succeeded.
+The provisioner is the only component that installs dependencies, and it can
+only do so through an injected :class:`ProvisioningRuntime`. In practice that is
+the task's single isolated runtime, so an install step runs inside the container
+that will later run the checks. Two rules are enforced in code, not documented:
 
-Design boundaries (WP2):
+1. ``LOCAL_TRUSTED`` is refused. A host install is not a provisioned
+   environment, and the product must not claim one.
+2. A step that needs package downloads is ``BLOCKED`` unless the caller approved
+   network access explicitly. There is no implicit network permission.
 
-* install steps require an explicit, hash-bound approval -- the ordinary task
-  command policy hard-denies dependency installation;
-* every argv comes from the immutable plan, never from model output;
-* output is redacted and bounded before it enters an artifact or an event;
-* service checks are loopback-only; a non-loopback bind is a typed refusal;
-* a blocked or failed step never produces a "provisioned" claim.
+What a run records
+------------------
+The spec digest, every step with its argv, exit code, duration and a hash of its
+log, the package inventory read back from inside the runtime (or the concrete
+reason it could not be read), the runtime description, declared services and
+cleanup ownership. Nothing is inferred: a missing inventory is reported as
+``unavailable``, never as an empty package list.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import socket
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol
 
-from mayaworkbench.errors import MayaError, PolicyError
-from mayaworkbench.workspace.environments import ProvisioningPlan, ProvisionStep
-from mayaworkbench.workspace.tools import redact
+from mayaworkbench.errors import PolicyError
+from mayaworkbench.workspace.environments import EnvironmentSpec, requires_network
+from mayaworkbench.workspace.runner import CommandResult
 
-SCHEMA_VERSION = "environment-provisioning/v1"
-MAX_EXCERPT_CHARS = 4000
-INSTALL_PURPOSES = frozenset({"install", "install-build", "install-runtime"})
-CHECK_PURPOSES = frozenset({"verify-runtime", "check", "test", "compile"})
+#: Bounded, read-only inventory commands. Only ecosystems with a stable JSON
+#: output are listed; anything else reports ``not_supported`` rather than an
+#: invented package list.
+_INVENTORY_COMMANDS: dict[str, tuple[str, ...]] = {
+    "python": ("python", "-m", "pip", "list", "--format=json", "--disable-pip-version-check"),
+    "node": ("npm", "ls", "--json", "--all"),
+    "rust": ("cargo", "metadata", "--no-deps", "--format-version", "1"),
+}
+_MAX_INVENTORY_PACKAGES = 500
+_LOG_TAIL_CHARS = 2_000
+_ISOLATED_PROFILES = frozenset({"ROOTLESS_CONTAINER"})
 
 
-class ProvisioningError(MayaError):
-    """A provisioning step could not be executed or authorized."""
+class ProvisioningRuntime(Protocol):
+    """The subset of the task runtime that provisioning needs."""
+
+    @property
+    def trust_profile(self) -> str: ...
+
+    def exec(
+        self, argv: list[str], *, timeout_seconds: int, run_home: Path | None = None
+    ) -> CommandResult: ...
+
+    def describe(self) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
-class ProvisionStepResult:
+class StepResult:
     purpose: str
-    argv: tuple[str, ...]
-    outcome: str  # PASSED | FAILED | BLOCKED | NOT_RUN
-    exit_code: int | None = None
-    duration_ms: int = 0
-    blocked_reason: str = ""
-    output_excerpt: str = ""
+    argv: list[str]
+    status: str
+    exit_code: int | None
+    duration_ms: int
+    log_sha256: str
+    log_tail: str
+    detail: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "purpose": self.purpose,
             "argv": list(self.argv),
-            "outcome": self.outcome,
+            "status": self.status,
             "exit_code": self.exit_code,
             "duration_ms": self.duration_ms,
-            "blocked_reason": self.blocked_reason,
-            "output_excerpt": self.output_excerpt,
+            "log_sha256": self.log_sha256,
+            "log_tail": self.log_tail,
+            "detail": self.detail,
         }
 
 
 @dataclass(frozen=True)
-class ServiceSpec:
-    """A task-owned service whose readiness is checked on loopback only."""
+class EnvironmentRun:
+    spec_sha256: str
+    status: str
+    steps: tuple[StepResult, ...]
+    inventory: dict[str, Any]
+    services: dict[str, Any]
+    runtime: dict[str, Any]
+    cleanup: dict[str, Any]
+    notes: tuple[str, ...]
+    run_sha256: str
 
-    name: str
-    port: int
-    host: str = "127.0.0.1"
-    timeout_seconds: float = 2.0
-
-    def __post_init__(self) -> None:
-        if not self.name or len(self.name) > 60:
-            raise PolicyError("service name must be 1-60 characters")
-        if self.host not in {"127.0.0.1", "localhost", "::1"}:
-            raise PolicyError(
-                f"service host {self.host!r} is not loopback; remote binding is not allowed"
-            )
-        if not 1 <= self.port <= 65535:
-            raise PolicyError("service port must be between 1 and 65535")
-        if not 0 < self.timeout_seconds <= 10:
-            raise PolicyError("service timeout must be between 0 and 10 seconds")
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "host": self.host, "port": self.port}
-
-
-@dataclass(frozen=True)
-class ServiceHealth:
-    name: str
-    host: str
-    port: int
-    status: str  # HEALTHY | UNHEALTHY | NOT_CHECKED
-    detail: str = ""
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "PASSED"
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "name": self.name, "host": self.host, "port": self.port,
-            "status": self.status, "detail": self.detail,
-        }
-
-
-@dataclass(frozen=True)
-class ProvisionReport:
-    schema_version: str
-    plan_sha256: str
-    fingerprint_sha256: str
-    runtime_id: str
-    image: str
-    status: str  # PROVISIONED | PARTIAL | BLOCKED | FAILED
-    steps: tuple[ProvisionStepResult, ...]
-    services: tuple[ServiceHealth, ...]
-    package_inventory_sha256: str
-    cleanup: str
-    notes: tuple[str, ...]
-    canonical_sha256: str = ""
-
-    def as_dict(self) -> dict[str, Any]:
-        payload = {
-            "schema_version": self.schema_version,
-            "plan_sha256": self.plan_sha256,
-            "fingerprint_sha256": self.fingerprint_sha256,
-            "runtime_id": self.runtime_id,
-            "image": self.image,
+            "spec_sha256": self.spec_sha256,
             "status": self.status,
-            "steps": [item.as_dict() for item in self.steps],
-            "services": [item.as_dict() for item in self.services],
-            "package_inventory_sha256": self.package_inventory_sha256,
+            "succeeded": self.succeeded,
+            "steps": [step.as_dict() for step in self.steps],
+            "inventory": self.inventory,
+            "services": self.services,
+            "runtime": self.runtime,
             "cleanup": self.cleanup,
             "notes": list(self.notes),
+            "run_sha256": self.run_sha256,
         }
-        payload["canonical_sha256"] = self.canonical_sha256 or canonical_sha256(payload)
-        return payload
 
 
-def canonical_sha256(payload: dict[str, Any]) -> str:
-    body = dict(payload)
-    body.pop("canonical_sha256", None)
+def _digest(payload: Any) -> str:
     return hashlib.sha256(
-        json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 
-def _excerpt(result: Any) -> str:
-    text = redact(((result.stdout or "") + "\n" + (result.stderr or "")).strip())
-    if len(text) > MAX_EXCERPT_CHARS:
-        return text[:MAX_EXCERPT_CHARS] + "\n[excerpt truncated]"
-    return text
-
-
-def package_inventory(root: Path) -> tuple[str, dict[str, str]]:
-    """Content-addressed inventory of descriptor/lockfiles, never a guess."""
-    names = {
-        "pyproject.toml", "uv.lock", "poetry.lock", "requirements.txt",
-        "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-        "Cargo.toml", "Cargo.lock", "go.mod", "go.sum",
-        "pom.xml", "build.gradle", "build.gradle.kts",
-        "CMakeLists.txt", "compile_commands.json",
-    }
-    inventory: dict[str, str] = {}
-    root = Path(root)
-    for name in sorted(names):
-        path = root / name
-        if path.is_file() and not path.is_symlink():
-            inventory[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    joined = "".join(f"{n}:{d}\n" for n, d in sorted(inventory.items()))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest(), inventory
-
-
-def check_service(spec: ServiceSpec) -> ServiceHealth:
-    """Probe a loopback service port; never opens an outbound connection."""
-    try:
-        with socket.create_connection((spec.host, spec.port), timeout=spec.timeout_seconds):
-            return ServiceHealth(spec.name, spec.host, spec.port, "HEALTHY", "loopback connect succeeded")
-    except OSError as exc:
-        return ServiceHealth(spec.name, spec.host, spec.port, "UNHEALTHY", f"{type(exc).__name__}: {exc}")
+def _parse_inventory(ecosystem: str, stdout: str) -> list[dict[str, str]]:
+    payload = json.loads(stdout)
+    packages: list[dict[str, str]] = []
+    if ecosystem == "python":
+        for item in payload:
+            packages.append({"name": str(item["name"]), "version": str(item["version"])})
+    elif ecosystem == "node":
+        dependencies = payload.get("dependencies") or {}
+        for name, item in dependencies.items():
+            version = str(item.get("version", "")) if isinstance(item, dict) else str(item)
+            packages.append({"name": str(name), "version": version})
+    elif ecosystem == "rust":
+        for item in payload.get("packages") or []:
+            packages.append({"name": str(item["name"]), "version": str(item["version"])})
+    else:  # pragma: no cover - guarded by _INVENTORY_COMMANDS
+        raise ValueError(f"no inventory parser for {ecosystem!r}")
+    packages.sort(key=lambda entry: (entry["name"], entry["version"]))
+    return packages
 
 
 class EnvironmentProvisioner:
-    """Execute an approved plan through the injected runtime and attest it."""
+    """Run one immutable spec inside one isolated runtime."""
 
     def __init__(
         self,
+        runtime: ProvisioningRuntime,
+        spec: EnvironmentSpec,
         *,
-        plan: ProvisioningPlan,
-        runtime: Any,
-        approved_purposes: frozenset[str] = frozenset(),
-        run_home: Path,
-        artifacts: Any | None = None,
-        image: str = "",
-        runtime_id: str = "",
-        services: tuple[ServiceSpec, ...] = (),
-        timeout_seconds: int = 600,
+        allow_network: bool = False,
+        timeout_seconds: int = 900,
+        log: Callable[[str], None] | None = None,
     ):
-        self.plan = plan
         self.runtime = runtime
-        self.approved_purposes = frozenset(approved_purposes)
-        self.run_home = Path(run_home)
-        self.artifacts = artifacts
-        self.image = image
-        self.runtime_id = runtime_id
-        self.services = services
-        self.timeout_seconds = timeout_seconds
+        self.spec = spec
+        self.allow_network = allow_network
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.log = log
+        self._log_chunks: list[str] = []
 
-    # -------------------------------------------------------------- execution
-    def provision(self) -> ProvisionReport:
-        import time
+    # ------------------------------------------------------------------ public
+    def run(self) -> EnvironmentRun:
+        profile = str(getattr(self.runtime, "trust_profile", ""))
+        if profile not in _ISOLATED_PROFILES:
+            raise PolicyError(
+                f"environment provisioning is refused for trust profile {profile!r}",
+                hint="Dependencies are installed only inside an isolated runtime; "
+                "LOCAL_TRUSTED is the user's own machine, not an environment.",
+            )
 
-        results: list[ProvisionStepResult] = []
-        for step in self.plan.steps:
-            results.append(self._run_step(step))
-        inventory_hash, inventory = package_inventory(Path(self.plan.root))
-        health = tuple(check_service(spec) for spec in self.services)
-        statuses = {item.outcome for item in results}
-        if "FAILED" in statuses:
-            status = "FAILED"
-        elif "BLOCKED" in statuses:
-            status = "BLOCKED"
-        elif statuses == {"PASSED"}:
-            status = "PROVISIONED"
+        results: list[StepResult] = []
+        status = "PASSED"
+        stopped = False
+        for step in self.spec.steps:
+            if stopped:
+                results.append(
+                    StepResult(
+                        step.purpose,
+                        list(step.argv),
+                        "SKIPPED",
+                        None,
+                        0,
+                        _digest(""),
+                        "",
+                        "an earlier step did not pass, so this step was not run",
+                    )
+                )
+                continue
+            if requires_network(step) and not self.allow_network:
+                detail = (
+                    f"`{step.purpose}` downloads packages and network access was not "
+                    "approved (allow_network=True)"
+                )
+                results.append(
+                    StepResult(
+                        step.purpose,
+                        list(step.argv),
+                        "BLOCKED",
+                        None,
+                        0,
+                        _digest(detail),
+                        "",
+                        detail,
+                    )
+                )
+                status = "BLOCKED"
+                stopped = True
+                continue
+            results.append(self._run_step(step.purpose, step.argv))
+            if results[-1].status != "PASSED":
+                status = "FAILED"
+                stopped = True
+
+        notes: list[str] = []
+        if status == "PASSED":
+            inventory = self._collect_inventory()
         else:
-            status = "PARTIAL"
-        notes = list(self.plan.notes)
-        if inventory:
-            notes.append(f"package inventory: {len(inventory)} descriptor/lockfile(s) hashed")
-        else:
-            notes.append("no lockfiles found; no dependencies were invented")
-        report = ProvisionReport(
-            schema_version=SCHEMA_VERSION,
-            plan_sha256=self.plan.plan_sha256,
-            fingerprint_sha256=self.plan.fingerprint_sha256,
-            runtime_id=self.runtime_id,
-            image=self.image,
+            inventory = {
+                "status": "skipped",
+                "reason": f"the environment run ended {status}, so no inventory was read",
+            }
+        if self.spec.services:
+            notes.append(
+                "Service lifecycle is not provided by this release; the declared "
+                "services were recorded but not started."
+            )
+        services = {
+            "status": "not_started",
+            "declared": [service.as_dict() for service in self.spec.services],
+            "reason": "service orchestration requires a retained runtime with local "
+            "port publishing; this release does not provide it",
+        }
+        try:
+            runtime_description = dict(self.runtime.describe())
+        except Exception as exc:  # noqa: BLE001 - evidence must not mask the outcome
+            runtime_description = {
+                "trust_profile": profile,
+                "describe_error": f"{type(exc).__name__}: {exc}"[:400],
+            }
+        cleanup = {
+            "kind": "runtime-owned",
+            "host_state_created": False,
+            "note": "the provisioner writes only inside the isolated runtime; the "
+            "runtime owner removes the tree and any container after the run",
+        }
+
+        payload = {
+            "spec_sha256": self.spec.spec_sha256,
+            "status": status,
+            "steps": [result.as_dict() for result in results],
+            "inventory": inventory,
+            "services": services,
+            "runtime": runtime_description,
+            "cleanup": cleanup,
+            "notes": notes,
+        }
+        return EnvironmentRun(
+            spec_sha256=self.spec.spec_sha256,
             status=status,
             steps=tuple(results),
-            services=health,
-            package_inventory_sha256=inventory_hash,
-            cleanup="attested",
+            inventory=inventory,
+            services=services,
+            runtime=runtime_description,
+            cleanup=cleanup,
             notes=tuple(notes),
+            run_sha256=_digest(payload),
         )
-        object.__setattr__(report, "canonical_sha256", canonical_sha256(report.as_dict()))
-        if self.artifacts is not None:
-            from mayaworkbench.domain.enums import ArtifactKind
 
-            self.artifacts.put_text(
-                json.dumps(report.as_dict(), indent=2, sort_keys=True),
-                kind=ArtifactKind.ENVIRONMENT_PROVISIONING_REPORT,
-                media_type="application/json",
-                created_by="provisioning",
-            )
-        return report
-
-    def _run_step(self, step: ProvisionStep) -> ProvisionStepResult:
-        import time
-
-        base = ProvisionStepResult(step.purpose, step.argv, "NOT_RUN")
-        if step.requires_approval and step.purpose not in self.approved_purposes:
-            return ProvisionStepResult(
-                step.purpose, step.argv, "BLOCKED",
-                blocked_reason=(
-                    f"step {step.purpose!r} requires an explicit provisioning approval "
-                    "that was not granted for this run"
-                ),
-            )
+    # ------------------------------------------------------------------- steps
+    def _run_step(self, purpose: str, argv: tuple[str, ...]) -> StepResult:
         started = time.monotonic()
+        detail = ""
+        result: CommandResult | None = None
         try:
-            if step.purpose in INSTALL_PURPOSES:
-                result = self.runtime.exec_install(
-                    list(step.argv), timeout_seconds=self.timeout_seconds,
-                    run_home=self.run_home,
-                )
-            else:
-                result = self.runtime.exec(
-                    list(step.argv), timeout_seconds=self.timeout_seconds,
-                    run_home=self.run_home,
-                )
-        except (MayaError, OSError) as exc:
-            return ProvisionStepResult(
-                step.purpose, step.argv, "BLOCKED",
-                duration_ms=int((time.monotonic() - started) * 1000),
-                blocked_reason=f"{type(exc).__name__}: {exc}",
+            result = self.runtime.exec(list(argv), timeout_seconds=self.timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 - a failed step is the outcome
+            detail = f"{type(exc).__name__}: {exc}"
+        duration = int((time.monotonic() - started) * 1000)
+        if result is None:
+            self._emit(f"$ {' '.join(argv)}\n{detail}\n")
+            return StepResult(
+                purpose, list(argv), "FAILED", None, duration, _digest(detail), detail,
+                detail,
             )
-        outcome = (
-            "PASSED"
-            if result.exit_code == 0 and not result.blocked and not result.timed_out
-            else "FAILED"
+        output = f"{result.stdout or ''}{result.stderr or ''}"
+        text = f"$ {' '.join(argv)}\n{output}"
+        self._emit(text if text.endswith("\n") else text + "\n")
+        if result.succeeded:
+            return StepResult(
+                purpose,
+                list(argv),
+                "PASSED",
+                result.exit_code,
+                result.duration_ms or duration,
+                hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                output.strip()[-_LOG_TAIL_CHARS:],
+            )
+        if result.blocked:
+            detail = result.blocked_reason or "the runtime blocked this step"
+        elif result.timed_out:
+            detail = f"the step exceeded {self.timeout_seconds}s"
+        else:
+            detail = f"the step exited {result.exit_code}"
+        return StepResult(
+            purpose,
+            list(argv),
+            "FAILED",
+            result.exit_code,
+            result.duration_ms or duration,
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            output.strip()[-_LOG_TAIL_CHARS:],
+            detail,
         )
-        return ProvisionStepResult(
-            step.purpose,
-            step.argv,
-            outcome,
-            exit_code=result.exit_code,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            blocked_reason=result.blocked_reason or "",
-            output_excerpt=_excerpt(result),
-        )
+
+    def _emit(self, text: str) -> None:
+        self._log_chunks.append(text)
+        if self.log is not None:
+            try:
+                self.log(text)
+            except Exception:  # noqa: BLE001 - a broken log sink must not fail a run
+                pass
+
+    # --------------------------------------------------------------- inventory
+    def _collect_inventory(self) -> dict[str, Any]:
+        collected: dict[str, Any] = {}
+        for ecosystem in sorted(self.spec.ecosystems):
+            command = _INVENTORY_COMMANDS.get(ecosystem)
+            if command is None:
+                collected[ecosystem] = {
+                    "status": "not_supported",
+                    "reason": "no bounded inventory command is implemented for this ecosystem",
+                }
+                continue
+            try:
+                result = self.runtime.exec(
+                    list(command), timeout_seconds=min(self.timeout_seconds, 120)
+                )
+            except Exception as exc:  # noqa: BLE001
+                collected[ecosystem] = {
+                    "status": "unavailable",
+                    "reason": f"{type(exc).__name__}: {exc}"[:400],
+                }
+                continue
+            if not result.succeeded:
+                collected[ecosystem] = {
+                    "status": "unavailable",
+                    "reason": f"`{' '.join(command)}` exited {result.exit_code}"
+                    + (" (timed out)" if result.timed_out else ""),
+                }
+                continue
+            try:
+                packages = _parse_inventory(ecosystem, result.stdout)
+            except (ValueError, KeyError, TypeError) as exc:
+                collected[ecosystem] = {
+                    "status": "unavailable",
+                    "reason": f"the inventory output could not be parsed: {exc}"[:400],
+                }
+                continue
+            collected[ecosystem] = {
+                "status": "collected",
+                "command": list(command),
+                "packages": packages[:_MAX_INVENTORY_PACKAGES],
+                "truncated": len(packages) > _MAX_INVENTORY_PACKAGES,
+            }
+        return collected
 
 
 __all__ = [
-    "SCHEMA_VERSION",
-    "ProvisioningError",
-    "ProvisionStepResult",
-    "ServiceSpec",
-    "ServiceHealth",
-    "ProvisionReport",
     "EnvironmentProvisioner",
-    "package_inventory",
-    "check_service",
-    "canonical_sha256",
+    "EnvironmentRun",
+    "ProvisioningRuntime",
+    "StepResult",
 ]

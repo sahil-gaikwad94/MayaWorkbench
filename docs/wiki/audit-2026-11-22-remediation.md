@@ -78,6 +78,8 @@ Historical record for the work package driven by the two 2026-11-21/22 audits:
   `--path`; `workspace create` requires `--slug` (no `--name`).
 - Models/connectors: no `tools`/`tool_calls`/`stream`/cache fields in
   `ModelRequest`/`ModelResponse`/`ModelCapabilities`; `streaming=False` hardcoded.
+  (Fixed on 2026-11-23: all three adapters implement buffered and incremental
+  streaming; see ADR 0017.)
   MCP adapter has no transport and no production caller. Advanced connector
   registry is CLI-only. Non-Python languages are regex/LOW/HEURISTIC; embeddings
   are hashing, reranking lexical, both off by default. Two same-named embedding

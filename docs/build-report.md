@@ -32,38 +32,31 @@ Truth table: IMPLEMENTATION_STATUS.md. Test matrix: docs/test-matrix.md.
 
 Verification numbers for this package are recorded in `docs/test-matrix.md`.
 
-## 2026-11-24 execution-trust + WP2–WP7 engineering release
+## 2026-11-23 — Trustworthy Runtime + Verification (second pass)
 
-WP0 (P0-01…05): sanitized immutable `/src` snapshot with a single canonical
-filter and policy fingerprint; live in-container capability probe of effective
-pids/memory/cpu plus network/secret/mount/cleanup canaries; one task runtime in
-in-loop checks; container-owned sessions with container teardown; equivalent
-isolated baseline/candidate runtimes with recorded parity evidence. CPU time,
-core quota and wall time are separate fields.
+- Sanitized immutable snapshot; the worktree is never mounted (`maya-sanitize-v3`).
+- Evidence-based in-container capability probe with per-limit requested/observed.
+- One runtime for file tools, commands, in-loop checks and sessions; baseline parity.
+- Container-owned sessions in a retained container with per-session termination.
+- Immutable environment spec plus an isolated, network-gated provisioner with
+  truthful inventory (`maya env spec`, `maya env provision`).
+- CPU time vs CPU quota split; local API request contract; hermetic tests.
+- Details: `docs/wiki/audit-2026-11-23-remediation.md`, ADR 0015, ADR 0016.
 
-WP1: chunk-stream framing contract, hermetic forced-missing torch tests,
-canonical JUnit report, local API host/origin/rate/redaction security contract.
+Verification numbers for this package are recorded in `docs/test-matrix.md` and
+`docs/reports/test-run-2026-11-23.json`.
 
-WP2: `EnvironmentProvisioner` executes approved plans through the injected
-runtime with an attested report; opt-in ENVIRONMENT_PROVISIONING workflow phase
-and implementation handoff; `maya env provision`. Isolated installs fail closed.
+## 2026-11-23 — model/provider hardening (follow-up)
 
-WP3: frozen provider profiles, same-model control arm, Wilson intervals,
-per-family rates, latency/traces, prompt-injection/connector safety corpus,
-`maya eval providers|safety|compare`.
-
-WP4: R2I held-out contract (two annotators + adjudication + kappa), grading
-guide, expanded development corpus, equation extraction, method adapters,
-read-only claim→code→obligation graph API and UI.
-
-WP5: change-impact analysis with resolved vs heuristic edges, 7-language gold
-manifests with precision/recall, retrieval evaluation with measured uplift.
-
-WP6: Jupyter, scholarly, container-service and DB-schema connectors with
-explicit scopes, grants, host allowlists and loopback-only service binding.
-
-WP7: X-ray, task DAG, searchable session trace, project report endpoints;
-keyboard navigation, focus-visible styling, responsive layout and aria labels.
-
-No live OCI/provider/expert result is claimed; those gates stay opt-in.
-Verification numbers live in `docs/test-matrix.md` and the canonical JUnit report.
+- OpenAI-compatible: strict-schema projection with three-step degradation, reasoning
+  model parameter adaptation, `stream_options.include_usage`, bounded `Retry-After`,
+  typed context-length/quota failures and incremental streaming.
+- Anthropic: GA `output_config.format`, message-level cache breakpoints, merged
+  `tool_result` turns, refusal stop reason and SSE streaming.
+- Gemini: projected `responseSchema`, function-response name resolution, safety blocks,
+  thought/cached token accounting and SSE streaming.
+- Gateway: provider-specific key resolution, keyless loopback endpoints, tool-schema-aware
+  input bound and actual-attempt accounting.
+- Details and evidence: ADR 0017, `docs/wiki/audit-2026-11-23-remediation.md`
+  (834 collected, 827 passed, 7 skipped, 0 failed) and `tests/test_provider_adapters.py`.
+  The live provider gate remains unrun without a key.

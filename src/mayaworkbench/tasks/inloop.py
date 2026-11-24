@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from mayaworkbench.domain.enums import CheckKind, CheckOutcome
+from mayaworkbench.domain.enums import CheckKind, CheckOutcome, ExecutionTrust
 from mayaworkbench.domain.models import CheckSpec, TaskContract
 from mayaworkbench.errors import MayaError
 from mayaworkbench.verification import execution
@@ -304,11 +304,21 @@ class DeclaredCheckRunner:
     """Execute only the checks the contract declares, through the command policy.
 
     There is no free-form command here: keys are matched against the immutable
-    contract, argv comes from the contract, and the same ``CommandRunner``
-    (allowlist, no shell, rlimits, network policy, timeout) is used as for
-    verification. ``authorized`` is decided by the caller from a consumed
-    ``COMMAND_EXECUTION`` approval, never by the model.
+    contract, argv comes from the contract, and the task's single injected
+    ``TaskExecutionRuntime`` executes it — the exact same boundary the
+    implementer used, so an isolated task runs its checks inside its container
+    rather than through a hidden host runner. ``authorized`` is decided by the
+    caller from a consumed ``COMMAND_EXECUTION`` approval, never by the model.
     """
+
+    #: Trust profiles that must never fall back to a host command runner.
+    ISOLATED_TRUST = frozenset(
+        {
+            ExecutionTrust.ROOTLESS_CONTAINER.value,
+            ExecutionTrust.REMOTE_MICROVM.value,
+            ExecutionTrust.GPU_RUNNER.value,
+        }
+    )
 
     def __init__(
         self,
@@ -319,17 +329,17 @@ class DeclaredCheckRunner:
         authorized: bool,
         declared: list[CheckSpec] | None = None,
         runtime: Any | None = None,
-        require_isolated_runtime: bool = False,
+        require_isolated_runtime: bool | None = None,
     ) -> None:
         self.contract = contract
         self.workspace = Path(workspace)
         self.run_home = Path(run_home)
         self.authorized = authorized
-        self._declared = list(declared if declared is not None else contract.verification_checks)
-        # P0-03: the SAME task runtime the implementer used must execute checks.
-        # No component may construct a hidden host runner for an isolated task.
         self.runtime = runtime
+        # Explicit override used by tests/callers that must prove no host
+        # fallback exists even when the contract's trust profile differs.
         self.require_isolated_runtime = require_isolated_runtime
+        self._declared = list(declared if declared is not None else contract.verification_checks)
 
     # ------------------------------------------------------------------ lookup
     @property
@@ -420,13 +430,12 @@ class DeclaredCheckRunner:
             base.infrastructure = True
             base.command = list(spec.argv or [])
             return base
-        if self.require_isolated_runtime and self.runtime is None:
-            # A trust profile that needs isolation must NEVER be silently
-            # downgraded to a host CommandRunner. Type the refusal so the run
-            # settles as a broken checker rather than executing on the host.
+        if self.runtime is None and (self.require_isolated_runtime or self.contract.constraints.execution_trust in self.ISOLATED_TRUST):
+            # Never construct a host runner for an isolated task: the check is
+            # blocked, and `maya verify run` executes it in a matched runtime.
             base.reason = (
-                "the task requires an isolated execution runtime, but no runtime was "
-                "injected into the in-loop check runner; the check was not executed"
+                "the task's isolated execution runtime was not supplied to the in-loop "
+                "check runner, so the check is blocked rather than executed on the host"
             )
             base.infrastructure = True
             base.command = list(spec.argv or [])

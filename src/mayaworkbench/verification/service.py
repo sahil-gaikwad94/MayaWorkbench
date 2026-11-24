@@ -27,13 +27,13 @@ from pathlib import Path
 from typing import Any
 
 def _rootless_backend_for_verification(
-    ref: Any, contract: Any, verified_limits: dict[str, dict[str, Any]] | None = None
+    ref: Any, contract: Any, *, evidence: Any | None = None
 ) -> Any:
-    """Rebuild the identical backend over an already-provisioned runtime ref.
+    """Rebuild the backend adapter over an already-provisioned runtime ref.
 
-    The live-readback evidence captured by the worker must travel with the
-    runtime; otherwise verification would report weaker limits than execution
-    and the two sides of a baseline/candidate comparison would not be comparable.
+    The evidence produced when the worker verified the runtime is carried
+    forward, so the per-check limits reported here are the limits that were
+    actually observed, not a fresh guess.
     """
     from dataclasses import replace
 
@@ -45,8 +45,7 @@ def _rootless_backend_for_verification(
         ref.overlay.parent.parent,
         replace(policy, trust_profile="LOCAL_TRUSTED"),
         image=ref.image,
-        verified=True,
-        verified_limits=verified_limits or {},
+        evidence=evidence,
     )
 
 
@@ -307,27 +306,34 @@ class VerificationService:
             )
             patch_text = self._patch_text(diff)
 
-            baseline_runtime = None
-            baseline_parity: dict[str, Any] = {}
             if declared:
                 baseline, baseline_error = self._create_baseline(
                     run, attempt, workspace
                 )
-                if baseline is not None:
-                    (
-                        baseline_runtime,
-                        baseline_runtime_error,
-                        baseline_parity,
-                    ) = self._baseline_runtime(
-                        run, contract, candidate_runtime, baseline, attempt
-                    )
-                    if baseline_runtime_error:
-                        baseline_error = (
-                            (baseline_error + "; " if baseline_error else "")
-                            + baseline_runtime_error
-                        )
             else:
                 baseline, baseline_error = None, None
+
+            baseline_runtime = None
+            baseline_parity: dict[str, Any] = {
+                "status": "not_required"
+                if candidate_runtime is None
+                else "unavailable"
+            }
+            if declared and candidate_runtime is not None:
+                if baseline is not None:
+                    baseline_runtime, baseline_parity = self._baseline_runtime(
+                        run=run,
+                        contract=contract,
+                        attempt=attempt,
+                        baseline=baseline,
+                        candidate_binding=(run.details or {}).get("runtime_binding") or {},
+                    )
+                else:
+                    baseline_parity = {
+                        "status": "unavailable",
+                        "reason": baseline_error or "the clean baseline tree could not be created",
+                    }
+                attempt.details["baseline_parity"] = baseline_parity
 
             if declared:
                 checks.extend(
@@ -561,11 +567,6 @@ class VerificationService:
                 hint="Recorded checks remain inspectable; re-run to create a new attempt.",
             ) from exc
         finally:
-            if baseline_runtime is not None:
-                try:
-                    baseline_runtime.stop(reason="verification complete")
-                except Exception:  # noqa: BLE001 - never mask the original result
-                    pass
             if baseline is not None:
                 baseline.remove()
 
@@ -1135,103 +1136,6 @@ class VerificationService:
                 )
         return out
 
-    # ----------------------------------------------------------- baseline runtime
-    def _baseline_runtime(
-        self,
-        run: WorkflowRun,
-        contract: TaskContract,
-        candidate_runtime: Any | None,
-        baseline: execution.BaselineWorkspace,
-        attempt: VerificationRun,
-    ) -> tuple[Any | None, str | None, dict[str, Any]]:
-        """Provision a SECOND isolated runtime for the clean baseline.
-
-        A host baseline is not comparable to an isolated candidate. For an
-        isolated profile the baseline must run in an equivalent task container:
-        same image, command policy, resource-limit evidence, network policy and
-        sanitized mount policy. Only the source tree differs. If parity cannot
-        be established, the caller records the comparison as inconclusive — it
-        never silently falls back to a host runner.
-        """
-        if candidate_runtime is None:
-            # Host tasks keep the existing host baseline/worktree path.
-            return None, None, {"mode": "host", "parity": "not_applicable"}
-        from dataclasses import replace
-
-        from mayaworkbench.domain.enums import ExecutionTrust
-        from mayaworkbench.workspace.backends import (
-            BackendCommandRunner,
-            CommandPolicy,
-            RootlessContainerBackend,
-        )
-        from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace
-        from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
-
-        trust = contract.constraints.execution_trust
-        if trust != ExecutionTrust.ROOTLESS_CONTAINER.value:
-            return None, (
-                f"baseline parity is not implemented for the {trust} profile; "
-                "the baseline/candidate comparison is inconclusive, not a host fallback"
-            ), {"mode": "isolated", "parity": "unsupported_profile"}
-        binding = (run.details or {}).get("runtime_binding", {})
-        candidate_ref = getattr(candidate_runtime.workspace, "runtime", None)
-        if candidate_ref is None:
-            return None, "the candidate runtime has no RuntimeRef", {"mode": "isolated", "parity": "unknown"}
-        policy = CommandPolicy.from_constraints(contract.constraints)
-        try:
-            backend = RootlessContainerBackend(
-                baseline.path,
-                self.home
-                / "verification"
-                / run.id
-                / f"attempt-{attempt.attempt}"
-                / "baseline-runtime",
-                replace(policy, trust_profile=ExecutionTrust.LOCAL_TRUSTED.value),
-                image=candidate_ref.image,
-                verified=True,
-                verified_limits=binding.get("verified_limits", {}),
-            )
-            ws = RuntimeWorkspace.for_container(backend, baseline.path)
-            runner = BackendCommandRunner(backend, runtime=ws.runtime)
-            baseline_runtime = CommandRunnerTaskRuntime(
-                workspace=ws, runner=runner, trust_profile=trust
-            )
-        except Exception as exc:  # noqa: BLE001 - fail closed, never downgrade
-            return None, (
-                f"an equivalent isolated baseline runtime could not be provisioned: "
-                f"{type(exc).__name__}: {exc}"
-            ), {"mode": "isolated", "parity": "failed"}
-
-        candidate_policy = getattr(getattr(candidate_runtime, "runner", None), "policy", None)
-        parity = {
-            "mode": "isolated",
-            "parity": "matched",
-            "candidate_runtime_id": candidate_ref.id,
-            "baseline_runtime_id": ws.runtime.id if ws.runtime else None,
-            "candidate_image": candidate_ref.image,
-            "baseline_image": ws.runtime.image if ws.runtime else None,
-            "candidate_mount_policy_sha256": getattr(candidate_ref, "mount_policy_sha256", ""),
-            "baseline_mount_policy_sha256": getattr(ws.runtime, "mount_policy_sha256", ""),
-            "candidate_policy": candidate_policy.describe() if candidate_policy else None,
-            "baseline_policy": policy.describe(),
-            "candidate_limits": binding.get("verified_limits", {}),
-            "baseline_limits": binding.get("verified_limits", {}),
-            "note": (
-                "Parity is asserted from identical image, command policy, limit "
-                "evidence and network/sanitization policy; only the source tree differs."
-            ),
-        }
-        if parity["candidate_image"] != parity["baseline_image"] or (
-            parity["candidate_mount_policy_sha256"] != parity["baseline_mount_policy_sha256"]
-            and parity["candidate_mount_policy_sha256"]
-        ):
-            parity["parity"] = "mismatch"
-            return baseline_runtime, (
-                "the isolated baseline runtime does not match the candidate runtime "
-                "image/mount policy; the comparison is inconclusive"
-            ), parity
-        return baseline_runtime, None, parity
-
     # -------------------------------------------------------------- declarations
     def _create_baseline(
         self,
@@ -1281,6 +1185,7 @@ class VerificationService:
         baseline_parity: dict[str, Any] | None = None,
     ) -> list[VerificationCheck]:
         out: list[VerificationCheck] = []
+        parity = dict(baseline_parity or {})
         workspace_path = Path(workspace.path) if workspace is not None else None
         workspace_removed = workspace is None or workspace.status.value == "REMOVED"
         command_approval = self._command_approval(run, contract)
@@ -1337,12 +1242,36 @@ class VerificationService:
             run_home = (
                 self.home / "verification" / run.id / f"attempt-{attempt.attempt}" / "home"
             )
-            baseline_result: CommandResult | None = None
-            if baseline is not None and (
-                baseline_runtime is not None or candidate_runtime is None
+            # An isolated candidate must be compared with an equally isolated
+            # baseline. If that environment could not be established, the check
+            # is BLOCKED: a host baseline is not a comparable measurement.
+            if candidate_runtime is not None and (
+                baseline is None
+                or baseline_runtime is None
+                or parity.get("status") != "matched"
             ):
-                # Host runs keep the host baseline; isolated runs require an
-                # equivalent isolated baseline_runtime (never a host runner).
+                reason = (
+                    "the clean baseline could not be executed in an isolated runtime "
+                    "matching the candidate, so this comparison is not interpretable"
+                )
+                detail_reason = parity.get("reason") or baseline_error
+                out.append(
+                    self._check_from_spec(
+                        run, task, contract, attempt, spec,
+                        _Outcome(
+                            outcome=CheckOutcome.BLOCKED,
+                            summary=reason + (f": {detail_reason}" if detail_reason else "."),
+                            command=argv,
+                            details={
+                                "baseline_parity": parity,
+                                "baseline_available": False,
+                            },
+                        ),
+                    )
+                )
+                continue
+            baseline_result: CommandResult | None = None
+            if baseline is not None:
                 try:
                     baseline_result = execution.execute_check(
                         owner="baseline",
@@ -1352,15 +1281,11 @@ class VerificationService:
                         argv=list(spec.argv or []) if script is None else None,
                         script=script,
                         timeout_seconds=spec.timeout_seconds,
-                        runtime=baseline_runtime if candidate_runtime is not None else None,
+                        runtime=baseline_runtime,
                     )
                 except (MayaError, OSError) as exc:
                     baseline_result = None
                     baseline_error = baseline_error or str(exc)
-            elif baseline is not None and candidate_runtime is not None:
-                # Isolated candidate with no equivalent baseline runtime: never
-                # run the baseline on the host. Record the reason below.
-                baseline_result = None
             try:
                 candidate_result = execution.execute_check(
                     owner="candidate",
@@ -1401,7 +1326,6 @@ class VerificationService:
                 "cleanup_succeeded": candidate_result.cleanup_succeeded,
                 "baseline_available": baseline_result is not None,
                 "baseline_error": baseline_error,
-                "baseline_parity": baseline_parity or {"mode": "host"},
             }
             findings: list[VerificationFinding] = []
             summary = (
@@ -1457,35 +1381,17 @@ class VerificationService:
                     details["baseline_output_truncated"] = True
             else:
                 details["baseline_outcome"] = "UNAVAILABLE"
-                isolated_without_baseline = (
-                    candidate_runtime is not None and baseline_runtime is None
-                )
                 findings.append(
                     VerificationFinding(
-                        severity=(
-                            FindingSeverity.ERROR
-                            if isolated_without_baseline
-                            else FindingSeverity.WARNING
-                        ),
-                        code=(
-                            "BASELINE_PARITY_MISSING"
-                            if isolated_without_baseline
-                            else "BASELINE_UNAVAILABLE"
-                        ),
+                        severity=FindingSeverity.WARNING,
+                        code="BASELINE_UNAVAILABLE",
                         message=(
-                            "The isolated candidate has no equivalent baseline runtime; "
-                            "this check is inconclusive, not a verified pass"
-                            if isolated_without_baseline
-                            else "The base revision could not be executed, so this result "
+                            "The base revision could not be executed, so this result "
                             "cannot be compared with the pre-change behavior"
-                        )
-                        + (f": {baseline_error}" if baseline_error else "."),
+                            + (f": {baseline_error}" if baseline_error else ".")
+                        ),
                     )
                 )
-                if isolated_without_baseline and outcome == CheckOutcome.PASSED:
-                    # P0-05: a passing candidate check is not a passing
-                    # verification when no comparable baseline could run.
-                    outcome = CheckOutcome.INCONCLUSIVE
             artifact = self._store_command_artifact(
                 spec.key, "candidate", candidate_result, summary
             )
@@ -1562,6 +1468,12 @@ class VerificationService:
         ref_data = binding.get("runtime_ref")
         if not ref_data:
             raise VerificationError("the retained runtime has no RuntimeRef")
+        evidence_data = binding.get("capability_evidence")
+        evidence = None
+        if evidence_data:
+            from mayaworkbench.workspace.backends import ContainerEvidence
+
+            evidence = ContainerEvidence.from_dict(evidence_data)
         ref = RuntimeRef.from_dict(ref_data)
         if not ref.overlay.exists():
             raise VerificationError(
@@ -1575,18 +1487,117 @@ class VerificationService:
             )
         if not ref.overlay.is_absolute() or not ref.source.resolve() == source:
             raise VerificationError("the retained runtime ref is inconsistent with this run")
+        # The immutable sanitized snapshot is the true pre-change manifest. The
+        # Git worktree may already contain the imported candidate, so deriving
+        # the source manifest from it would mislabel the baseline.
+        if ref.snapshot is not None and ref.snapshot.exists():
+            source_manifest = manifest(ref.snapshot)
+        else:  # pragma: no cover - retained snapshot missing after an interrupted run
+            source_manifest = manifest(source)
         ws = RuntimeWorkspace.resume(
-            _rootless_backend_for_verification(
-                ref, contract, binding.get("verified_limits", {})
-            ),
-            ref,
-            source,
-            source_manifest=manifest(source),
+            _rootless_backend_for_verification(ref, contract, evidence=evidence), ref, source,
+            source_manifest=source_manifest,
         )
         runner = BackendCommandRunner(ws.backend, runtime=ws.runtime)
         return CommandRunnerTaskRuntime(
             workspace=ws, runner=runner, trust_profile=trust
         )
+
+    def _baseline_runtime(
+        self,
+        *,
+        run: WorkflowRun,
+        contract: TaskContract,
+        attempt: VerificationRun,
+        baseline: execution.BaselineWorkspace,
+        candidate_binding: dict[str, Any],
+    ) -> tuple[Any | None, dict[str, Any]]:
+        """Provision a clean baseline in a runtime matched to the candidate.
+
+        Matching means the same image, mount policy, sanitizer policy and
+        resource policy; only the source content differs. The baseline tree is
+        the clean pinned snapshot, so it is compared with the candidate in an
+        equivalent isolated environment instead of on the host.
+        """
+        from dataclasses import replace
+
+        from mayaworkbench.workspace.backends import (
+            BackendCommandRunner,
+            RootlessContainerBackend,
+        )
+        from mayaworkbench.workspace.runner import CommandPolicy
+        from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace
+        from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
+
+        manifest_policy = candidate_binding.get("sanitize_policy_sha256")
+        parity: dict[str, Any] = {
+            "status": "unavailable",
+            "image": candidate_binding.get("image"),
+            "candidate_mount_policy": candidate_binding.get("mount_policy_sha256"),
+            "candidate_limit_policy": candidate_binding.get("limit_policy_sha256"),
+            "candidate_manifest": candidate_binding.get("source_manifest_sha256"),
+            "candidate_sanitize_policy": manifest_policy,
+        }
+        try:
+            policy = CommandPolicy.from_constraints(contract.constraints)
+            backend = RootlessContainerBackend(
+                baseline.path,
+                self.home
+                / "verification"
+                / run.id
+                / f"attempt-{attempt.attempt}"
+                / "baseline-runtime",
+                replace(policy, trust_profile="LOCAL_TRUSTED"),
+                image=str(candidate_binding.get("image") or "python:3.12-slim"),
+            )
+            ok, reasons = backend.prerequisites()
+            if not ok:
+                parity["reason"] = "; ".join(reasons)
+                return None, parity
+            evidence = backend.verify_capabilities()
+            parity["baseline_mount_policy"] = evidence.mount_policy_sha256
+            parity["baseline_probe"] = evidence.probe_status
+            if not evidence.available:
+                parity["reason"] = "; ".join(evidence.mandatory_failures)
+                return None, parity
+            workspace = RuntimeWorkspace.for_container(backend, baseline.path)
+            describe = workspace.describe()
+            parity["baseline_manifest"] = describe.get("source_manifest_sha256")
+            parity["baseline_sanitize_policy"] = describe.get("sanitize_policy_sha256")
+            parity["baseline_limit_policy"] = describe.get("limit_policy_sha256")
+            mismatches: list[str] = []
+            if evidence.mount_policy_sha256 != candidate_binding.get("mount_policy_sha256"):
+                mismatches.append("mount policy")
+            if describe.get("image") != candidate_binding.get("image"):
+                mismatches.append("image")
+            if describe.get("limit_policy_sha256") != candidate_binding.get(
+                "limit_policy_sha256"
+            ):
+                mismatches.append("resource policy")
+            if describe.get("sanitize_policy_sha256") != manifest_policy:
+                mismatches.append("sanitizer policy")
+            if describe.get("source_manifest_sha256") != candidate_binding.get(
+                "source_manifest_sha256"
+            ):
+                mismatches.append("pinned source manifest")
+            if mismatches:
+                parity["status"] = "mismatched"
+                parity["reason"] = "baseline/candidate parity differs for: " + ", ".join(
+                    mismatches
+                )
+                workspace.stop(reason="baseline parity mismatch")
+                return None, parity
+            parity["status"] = "matched"
+            runner = BackendCommandRunner(workspace.backend, runtime=workspace.runtime)
+            runtime = CommandRunnerTaskRuntime(
+                workspace=workspace,
+                runner=runner,
+                trust_profile=contract.constraints.execution_trust,
+            )
+            return runtime, parity
+        except Exception as exc:  # noqa: BLE001 - absence of parity is a result, not a crash
+            parity["reason"] = f"{type(exc).__name__}: {exc}"[:600]
+            return None, parity
 
     # ----------------------------------------------------------- patch integrity
     def _patch_reproducible(

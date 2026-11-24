@@ -6,13 +6,24 @@ output is bounded and sequenced, input is a typed operation, idle and absolute
 lifetimes are enforced, and cancellation kills the whole process group with an
 acknowledgement. Events can be replayed from a sequence number after reconnect.
 
-Execution boundary (P0-04): :class:`SessionManager` never calls
-``subprocess.Popen`` itself. A :class:`ProcessSessionBackend` owns process
-creation and teardown. ``LocalProcessSessionBackend`` is for explicitly trusted
-host execution; ``OciExecSessionBackend`` creates a task-owned long-lived OCI
-container and runs the session inside it with the same isolation flags, mounts
-and limits as every other task command. An unknown runner is refused with a
-typed capability error — there is no host fallback for an isolated profile.
+Output framing contract (MW-NEW-P1-02)
+---------------------------------------
+Session output is an arbitrary byte/text **chunk stream**. One event carries the
+bytes that were ready when it was read; a logical line, a word or a command's
+entire output may be split across several events, and one event may contain
+many lines. Consumers must concatenate events in ``seq`` order before making
+any line- or phrase-shaped assertion (``SessionManager.stream_text`` does this).
+Events are monotonically sequenced, ``seq`` is stable across replay, and a
+truncation notice is itself an event. There is no promise that one event equals
+one line.
+
+Isolation contract
+------------------
+Session processes are created by an injected :class:`SessionBackend`. The
+host-process backend is available **only** to ``LOCAL_TRUSTED``. An isolated
+runtime gets an :class:`UnavailableSessionBackend` whose ``spawn`` raises a
+typed :class:`PolicyError`: a container task never falls back to host
+``subprocess.Popen``, and the session tool is reported unavailable instead.
 """
 
 from __future__ import annotations
@@ -21,246 +32,17 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol
 
 from mayaworkbench.errors import PolicyError
-from mayaworkbench.workspace.runner import CommandResult, CommandRunner
+from mayaworkbench.workspace.runner import CommandRunner
 
 _OUTPUT_READ_CHUNK = 65_536
-
-
-@dataclass
-class _ProcessHandle:
-    """Backend-specific process state attached to one session."""
-
-    process: subprocess.Popen
-    master_fd: int | None = None
-    cwd: str = ""
-    container_name: str | None = None
-    backend: Any | None = None
-
-
-@runtime_checkable
-class ProcessSessionBackend(Protocol):
-    """The only component allowed to create or kill a session process."""
-
-    backend_id: str
-
-    def supports_pty(self) -> bool: ...
-
-    def open(
-        self, argv: list[str], *, use_pty: bool, timeout_seconds: int
-    ) -> _ProcessHandle: ...
-
-    def stop(self, handle: _ProcessHandle, *, reason: str) -> None: ...
-
-
-class LocalProcessSessionBackend:
-    """Explicitly trusted host execution (never an isolated profile)."""
-
-    backend_id = "local-process"
-
-    def __init__(self, workspace: Path, runner: CommandRunner):
-        self.workspace = Path(workspace).resolve()
-        self.runner = runner
-
-    def supports_pty(self) -> bool:
-        return True
-
-    def open(
-        self, argv: list[str], *, use_pty: bool, timeout_seconds: int
-    ) -> _ProcessHandle:
-        validated = self.runner.validate(argv, timeout_seconds=timeout_seconds)
-        resolved, _ = self.runner._resolve_argv(validated)
-        env = self.runner._environment()
-        master_fd: int | None = None
-        slave_fd: int | None = None
-        if use_pty:
-            try:
-                import pty as pty_module
-            except ImportError as exc:  # pragma: no cover - Windows
-                raise PolicyError("PTY sessions are not available on this platform") from exc
-            master_fd, slave_fd = pty_module.openpty()
-        preexec, limits_fd, _ = self.runner._limit_probe(
-            cpu_seconds=max(
-                1,
-                self.runner.policy.effective_cpu_time_seconds
-                or timeout_seconds + 5,
-            )
-        )
-        process: subprocess.Popen | None = None
-        try:
-            child_streams = (
-                {"stdin": slave_fd, "stdout": slave_fd, "stderr": slave_fd}
-                if slave_fd is not None
-                else {
-                    "stdin": subprocess.PIPE,
-                    "stdout": subprocess.PIPE,
-                    "stderr": subprocess.PIPE,
-                }
-            )
-            process = subprocess.Popen(
-                resolved,
-                cwd=str(self.workspace),
-                env=env,
-                shell=False,
-                start_new_session=True,
-                preexec_fn=preexec,
-                **child_streams,
-            )
-        except BaseException:
-            if master_fd is not None:
-                os.close(master_fd)
-            raise
-        finally:
-            try:
-                os.close(limits_fd)
-            except OSError:  # pragma: no cover
-                pass
-            if slave_fd is not None:
-                try:
-                    os.close(slave_fd)
-                except OSError:  # pragma: no cover
-                    pass
-        if process is None:  # pragma: no cover - defensive
-            if master_fd is not None:
-                os.close(master_fd)
-            raise PolicyError("session process could not be started")
-        return _ProcessHandle(process=process, master_fd=master_fd, cwd=str(self.workspace))
-
-    def stop(self, handle: _ProcessHandle, *, reason: str) -> None:
-        del reason
-        # Never signal a re-used PID: an already-exited process needs no kill.
-        if handle.process.poll() is None:
-            SessionManager._kill_pid(handle.process.pid)
-            try:
-                handle.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:  # pragma: no cover
-                SessionManager._kill_pid(handle.process.pid)
-                handle.process.wait(timeout=5)
-
-
-class OciExecSessionBackend:
-    """A task-owned long-lived OCI container with ``podman exec`` sessions.
-
-    The keepalive container is created with the exact same isolation flags,
-    sanitized mounts and resource limits as one-shot task commands. The exec'd
-    session inherits the container's cgroup, network namespace and mounts. A
-    session stop kills the whole container, so no descendant survives — there
-    is no host ``Popen`` and no host fallback.
-    """
-
-    backend_id = "rootless-container-session"
-
-    def __init__(self, backend: Any, runtime: Any):
-        self.backend = backend
-        self.runtime = runtime
-        self._tool, _ = backend._detect_tool()
-
-    def supports_pty(self) -> bool:
-        # ``podman exec -t`` allocates a TTY in the container, but the local
-        # pty fd plumbing would then be a second, host-owned PTY. Refuse PTY
-        # explicitly rather than pretend the boundary is equivalent.
-        return False
-
-    def open(
-        self, argv: list[str], *, use_pty: bool, timeout_seconds: int
-    ) -> _ProcessHandle:
-        if use_pty:
-            raise PolicyError(
-                "PTY sessions are not available in the ROOTLESS_CONTAINER profile; "
-                "use a piped session (the tool is unavailable, not a host fallback)"
-            )
-        if not self._tool:
-            raise PolicyError("the rootless OCI runtime is unavailable for sessions")
-        # The inner argv must pass the same allowlist as run_command. Validation
-        # never resolves to a host path: the argv is executed inside the container.
-        validator = CommandRunner(
-            self.runtime.overlay.parent,
-            policy=self.backend.policy,
-            run_home=self.backend.run_home,
-        )
-        validated = validator.validate(argv, timeout_seconds=timeout_seconds)
-        session_id = "maya-ses-" + uuid.uuid4().hex[:16]
-        keepalive_argv = self.backend._oci_argv(self.runtime, ["sleep", "infinity"])
-        # Replace the one-shot container name with a session-specific one and
-        # make the container detached so it stays alive for exec.
-        names = [
-            i for i, flag in enumerate(keepalive_argv) if flag == "--name"
-        ]
-        for i in names:
-            keepalive_argv[i + 1] = session_id
-        detached = [keepalive_argv[0], "run", "-d", *keepalive_argv[2:]]
-        start = self._run_oci(detached, timeout=timeout_seconds)
-        if start.exit_code != 0:
-            raise PolicyError(
-                f"the session container could not be started: {(start.stderr or start.stdout).strip()[:300]}"
-            )
-        child = [
-            self._tool, "exec", "-i", session_id, *validated,
-        ]
-        process = subprocess.Popen(
-            child,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            start_new_session=True,
-        )
-        return _ProcessHandle(
-            process=process,
-            cwd="/work",
-            container_name=session_id,
-            backend=self.backend,
-        )
-
-    def _run_oci(self, argv: list[str], *, timeout: int) -> CommandResult:
-        """Run a trusted OCI client argv through the bounded host runner."""
-        from mayaworkbench.workspace.backends import CommandPolicy
-
-        policy = CommandPolicy(
-            profile="CPU_SMOKE",
-            trust_profile="LOCAL_TRUSTED",
-            allow_absolute_args=True,
-            network_policy="ALLOW_WITH_APPROVAL",
-            dependency_policy="DENY",
-            allowed_executables=(Path(argv[0]).name,),
-            max_runtime_seconds=max(timeout, 60),
-        )
-        runner = CommandRunner(self.backend.run_home, policy=policy, run_home=self.backend.run_home)
-        return runner.run(argv, timeout_seconds=timeout)
-
-    def stop(self, handle: _ProcessHandle, *, reason: str) -> None:
-        del reason
-        if handle.process.poll() is None:
-            try:
-                SessionManager._kill_pid(handle.process.pid)
-                handle.process.wait(timeout=5)
-            except (subprocess.TimeoutExpired, ProcessLookupError):  # pragma: no cover
-                try:
-                    handle.process.kill()
-                except OSError:
-                    pass
-        # Killing the container kills every in-container descendant of the
-        # exec'd process. This is the session's authoritative teardown.
-        if handle.container_name:
-            try:
-                subprocess.run(
-                    [self._tool, "rm", "-f", handle.container_name],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=15,
-                    check=False,
-                )
-            except (OSError, subprocess.TimeoutExpired):  # pragma: no cover
-                pass
 
 
 @dataclass(frozen=True)
@@ -284,28 +66,204 @@ class SessionEvent:
         return {"seq": self.seq, "kind": self.kind, "data": self.data, "timestamp": self.timestamp}
 
 
-#: Chunk-stream framing contract for every session (P1-02).
-#:
-#: A session event is one ordered, arbitrary-length text chunk. ``seq`` is
-#: strictly increasing per session and is the only ordering guarantee. Clients
-#: MUST accumulate ``data`` across events and never assume one event is one
-#: line or one logical output unit: reads, writes and echoes can split or merge
-#: at kernel-buffer boundaries. Event *kinds* are ``status``, ``stdout``,
-#: ``stderr`` and ``exit``. Stream end is signalled by an ``exit`` event or by
-#: polling ``status()`` for a non-``RUNNING`` state.
-#:
-#: This is a raw byte/text chunk stream, not a line-oriented protocol. The
-#: ``truncated``/``output_truncated`` flags are authoritative when set.
+@dataclass(frozen=True)
+class SessionCapability:
+    """Whether this runtime can own a persistent session process."""
+
+    available: bool
+    reason: str = ""
+    kind: str = "host-process"
+
+    def as_dict(self) -> dict[str, object]:
+        return {"available": self.available, "reason": self.reason, "kind": self.kind}
 
 
-def accumulate_session_events(events) -> str:  # type: ignore[no-untyped-def]
-    """Concatenate ordered session event data into one text stream.
+@dataclass(frozen=True)
+class SessionCommand:
+    """The exact argv to launch, already translated for this runtime.
 
-    This is the client-side accumulation the framing contract requires. Use it
-    (or equivalent logic) before asserting on or displaying session output;
-    never assume a phrase arrives in one event.
+    ``argv`` is what the host-side client executes. For a container session that
+    is the OCI client (``podman exec``), never the user's command directly.
+    ``display_argv`` is the command the caller asked for; it is what appears in
+    the session reference, so evidence shows the command and not the plumbing.
     """
-    return "".join(event["data"] for event in events)
+
+    argv: list[str]
+    display_argv: list[str]
+    cwd: Path
+    env: dict[str, str]
+    use_pty: bool
+    env_sha256: str
+    session_id: str
+    timeout_seconds: int
+
+
+class SessionBackend(Protocol):
+    """The only place a session process is created.
+
+    A backend that cannot own a session process must report
+    ``capability.available is False`` and raise from ``build``/``spawn``; it must
+    never delegate to a host process.
+    """
+
+    @property
+    def capability(self) -> SessionCapability: ...
+
+    def build(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: int,
+        use_pty: bool,
+        session_id: str,
+    ) -> SessionCommand: ...
+
+    def spawn(self, command: SessionCommand) -> tuple[subprocess.Popen, int | None]: ...
+
+    def terminate(self, process: subprocess.Popen, *, session_id: str) -> None: ...
+
+
+def env_digest(env: dict[str, str]) -> str:
+    """Stable digest of the exact environment a session process receives."""
+
+    return hashlib.sha256(
+        json.dumps(env, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def kill_process_group(pid: int) -> None:
+    """SIGKILL a host session's whole process group."""
+
+    import signal
+
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:  # pragma: no cover
+            pass
+
+
+class UnavailableSessionBackend:
+    """Fail-closed backend for a runtime that cannot own sessions."""
+
+    def __init__(self, reason: str):
+        self._capability = SessionCapability(False, reason, "unavailable")
+
+    @property
+    def capability(self) -> SessionCapability:
+        return self._capability
+
+    def build(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: int,
+        use_pty: bool,
+        session_id: str,
+    ) -> SessionCommand:
+        del argv, timeout_seconds, use_pty, session_id
+        raise PolicyError(self._capability.reason)
+
+    def spawn(self, command: SessionCommand) -> tuple[subprocess.Popen, int | None]:
+        del command
+        raise PolicyError(self._capability.reason)
+
+    def terminate(self, process: subprocess.Popen, *, session_id: str) -> None:
+        del process, session_id
+
+
+class LocalProcessSessionBackend:
+    """Host-process sessions. Only valid for an explicitly trusted profile."""
+
+    def __init__(self, runner: CommandRunner, workspace: Path):
+        self.runner = runner
+        self.workspace = Path(workspace).resolve()
+        self._capability = SessionCapability(
+            True, "host process with the user's OS privileges; not a sandbox", "host-process"
+        )
+
+    @property
+    def capability(self) -> SessionCapability:
+        return self._capability
+
+    def build(
+        self,
+        argv: list[str],
+        *,
+        timeout_seconds: int,
+        use_pty: bool,
+        session_id: str,
+    ) -> SessionCommand:
+        validated = self.runner.validate(argv, timeout_seconds=timeout_seconds)
+        resolved, _ = self.runner._resolve_argv(validated)
+        env = self.runner._environment()
+        return SessionCommand(
+            argv=list(resolved),
+            display_argv=list(validated),
+            cwd=self.workspace,
+            env=env,
+            use_pty=use_pty,
+            env_sha256=env_digest(env),
+            session_id=session_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def spawn(self, command: SessionCommand) -> tuple[subprocess.Popen, int | None]:
+        master_fd: int | None = None
+        slave_fd: int | None = None
+        if command.use_pty:
+            try:
+                import pty as pty_module
+            except ImportError as exc:  # pragma: no cover - Windows
+                raise PolicyError("PTY sessions are not available on this platform") from exc
+            master_fd, slave_fd = pty_module.openpty()
+        child_streams: dict[str, object] = (
+            {"stdin": slave_fd, "stdout": slave_fd, "stderr": slave_fd}
+            if slave_fd is not None
+            else {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            }
+        )
+        preexec, limits_fd, _ = self.runner._limit_probe(
+            cpu_time_seconds=max(
+                1, self.runner.policy.cpu_time_seconds or command.timeout_seconds + 5
+            )
+        )
+        try:
+            process = subprocess.Popen(
+                command.argv,
+                cwd=str(command.cwd),
+                env=command.env,
+                shell=False,
+                start_new_session=True,
+                preexec_fn=preexec,
+                **child_streams,
+            )
+        except BaseException:
+            if master_fd is not None:
+                os.close(master_fd)
+            raise
+        finally:
+            try:
+                os.close(limits_fd)
+            except OSError:  # pragma: no cover
+                pass
+            if slave_fd is not None:
+                # The child owns duplicates of the slave fd; the parent must not
+                # keep it open, or PTY EOF/EIO would never be observed.
+                try:
+                    os.close(slave_fd)
+                except OSError:  # pragma: no cover
+                    pass
+        return process, master_fd
+
+    def terminate(self, process: subprocess.Popen, *, session_id: str) -> None:
+        del session_id
+        kill_process_group(process.pid)
 
 
 @dataclass
@@ -325,7 +283,6 @@ class _Session:
     exit_code: int | None = None
     cleanup_succeeded: bool = True
     master_fd: int | None = None
-    handle: _ProcessHandle | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -340,30 +297,24 @@ class SessionManager:
         max_sessions: int = 8,
         max_event_bytes: int = 200_000,
         redactor: Callable[[str], str] | None = None,
-        backend: ProcessSessionBackend | None = None,
+        backend: SessionBackend | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self.runner = runner
         self.max_sessions = max_sessions
         self.max_event_bytes = max_event_bytes
         self.redactor = redactor or (lambda value: value)
+        self.backend: SessionBackend = backend or LocalProcessSessionBackend(
+            runner, self.workspace
+        )
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.RLock()
-        if backend is not None:
-            self.backend = backend
-        elif self._is_isolated_runner(runner):
-            # P0-04: a container-backed runner NEVER gets host Popen sessions.
-            self.backend = OciExecSessionBackend(runner.backend, runner.runtime)
-        else:
-            self.backend = LocalProcessSessionBackend(self.workspace, runner)
 
-    @staticmethod
-    def _is_isolated_runner(runner: Any) -> bool:
-        from mayaworkbench.workspace.backends import BackendCommandRunner
+    @property
+    def capability(self) -> SessionCapability:
+        """Whether this runtime can own sessions at all."""
 
-        if not isinstance(runner, BackendCommandRunner):
-            return False
-        return getattr(runner.backend, "backend_id", "") == "rootless-container"
+        return self.backend.capability
 
     # ------------------------------------------------------------------ open
     def open(
@@ -377,40 +328,40 @@ class SessionManager:
         use_pty: bool = False,
     ) -> SessionRef:
         del cancel_requested  # sessions are bounded by idle/absolute lifetime instead
-        if use_pty and not self.backend.supports_pty():
+        capability = self.backend.capability
+        if not capability.available:
+            # Fail closed: an isolated runtime never falls back to host Popen.
             raise PolicyError(
-                f"PTY sessions are unavailable in the {self.backend.backend_id} profile; "
-                "the tool is refused, not downgraded to host execution"
+                capability.reason,
+                hint="Process sessions are unavailable under this execution trust "
+                "profile; run the command with `run_command` instead.",
             )
-        handle = self.backend.open(argv, use_pty=use_pty, timeout_seconds=timeout_seconds)
-        process = handle.process
-        master_fd = handle.master_fd
         with self._lock:
             if len(self._sessions) >= self.max_sessions:
-                self.backend.stop(handle, reason="session limit reached")
-                if master_fd is not None:
-                    try:
-                        os.close(master_fd)
-                    except OSError:  # pragma: no cover
-                        pass
                 raise PolicyError(f"session limit of {self.max_sessions} reached")
-            session_id = "ses_" + uuid.uuid4().hex
-            env = (
-                self.runner._environment()
-                if isinstance(self.backend, LocalProcessSessionBackend)
-                else {"container": handle.container_name or ""}
-            )
-            env_hash = hashlib.sha256(
-                json.dumps(env, sort_keys=True, ensure_ascii=False).encode("utf-8")
-            ).hexdigest()
+        # The id exists before the process: a container backend embeds it in the
+        # exec environment so termination can target exactly this session.
+        session_id = "ses_" + uuid.uuid4().hex
+        command = self.backend.build(
+            argv,
+            timeout_seconds=timeout_seconds,
+            use_pty=use_pty,
+            session_id=session_id,
+        )
+        process, master_fd = self.backend.spawn(command)
+        if process is None:  # pragma: no cover - defensive
+            if master_fd is not None:
+                os.close(master_fd)
+            raise PolicyError("session process could not be started")
+        with self._lock:
             session = _Session(
                 ref=SessionRef(
                     id=session_id,
-                    argv=list(argv),
-                    cwd=handle.cwd,
-                    env_sha256=env_hash,
+                    argv=list(command.display_argv),
+                    cwd=str(command.cwd),
+                    env_sha256=command.env_sha256,
                     started_at=time.monotonic(),
-                    pty=use_pty,
+                    pty=command.use_pty,
                 ),
                 process=process,
                 master_fd=master_fd,
@@ -418,7 +369,6 @@ class SessionManager:
                 idle_timeout=max(1, idle_timeout),
                 max_lifetime=max(idle_timeout + 1, max_lifetime),
                 redact=self.redactor,
-                handle=handle,
             )
             self._sessions[session_id] = session
         if master_fd is not None:
@@ -546,6 +496,22 @@ class SessionManager:
         with session.lock:
             return [event.as_dict() for event in session.events if event.seq > after_seq]
 
+    def stream_text(
+        self, session_id: str, *, after_seq: int = 0, kinds: tuple[str, ...] = ("stdout",)
+    ) -> str:
+        """Concatenate ordered chunks into the text a consumer should assert on.
+
+        Output is a chunk stream, not a line stream (see the module docstring),
+        so any phrase-shaped check must accumulate events first. This helper is
+        the supported way to do that.
+        """
+
+        return "".join(
+            event["data"]
+            for event in self.stream(session_id, after_seq=after_seq)
+            if event["kind"] in kinds
+        )
+
     def send_input(self, session_id: str, data: str) -> None:
         session = self._get(session_id)
         with session.lock:
@@ -588,25 +554,20 @@ class SessionManager:
     def stop(self, session_id: str, *, reason: str) -> dict:
         session = self._get(session_id)
         with session.lock:
-            already_finished = session.state in {"STOPPED", "EXITED"}
+            if session.state in {"STOPPED", "EXITED"}:
+                return {"stopped": True, "reason": reason, "already_finished": True}
             session.state = "STOPPED"
-        # Even an already-exited session can still own an OCI keepalive
-        # container. The backend stop is idempotent and MUST run so no
-        # in-container process or container survives task cleanup.
-        if session.handle is not None:
-            self.backend.stop(session.handle, reason=reason)
-        else:  # pragma: no cover - defensive for records without a handle
-            self._kill_pid(session.process.pid)
-            try:
-                session.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._kill_pid(session.process.pid)
-                session.process.wait(timeout=5)
-        if already_finished:
-            return {
-                "stopped": True, "reason": reason, "already_finished": True,
-                "backend": self.backend.backend_id,
-            }
+        # The backend owns termination so a container session is signalled
+        # inside its container rather than only closing the host-side client.
+        try:
+            self.backend.terminate(session.process, session_id=session.ref.id)
+        except Exception:  # noqa: BLE001 - the fallback kill below still runs
+            kill_process_group(session.process.pid)
+        try:
+            session.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover
+            kill_process_group(session.process.pid)
+            session.process.wait(timeout=5)
         self._append(session, "status", f"stopped: {reason}")
         if session.master_fd is not None:
             try:
@@ -620,7 +581,6 @@ class SessionManager:
                 "reason": reason,
                 "exit_code": session.process.returncode,
                 "cleanup_succeeded": session.cleanup_succeeded,
-                "backend": self.backend.backend_id,
             }
 
     def stop_all(self, *, reason: str) -> list[dict]:
@@ -682,28 +642,152 @@ class SessionManager:
             raise PolicyError(f"unknown session: {session_id}")
         return session
 
-    @staticmethod
-    def _kill_pid(pid: int) -> None:
-        import signal
-
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:  # pragma: no cover
-                pass
-
-    # Backwards-compatible alias used by older callers/tests.
-    _kill = _kill_pid
-
-
 __all__ = [
+    "LocalProcessSessionBackend",
+    "SessionBackend",
+    "SessionCapability",
+    "SessionCommand",
+    "SessionEvent",
+    "ProcessSessionBackend",
+    "OciExecSessionBackend",
+    "accumulate_session_events",
     "SessionManager",
     "SessionRef",
-    "SessionEvent",
-    "accumulate_session_events",
-    "ProcessSessionBackend",
-    "LocalProcessSessionBackend",
-    "OciExecSessionBackend",
+    "UnavailableSessionBackend",
+    "env_digest",
+    "kill_process_group",
 ]
+
+
+@dataclass
+class _ProcessHandle:
+    process: subprocess.Popen
+    master_fd: int | None = None
+    cwd: str = ""
+    container_name: str | None = None
+    backend: Any | None = None
+
+
+class OciExecSessionBackend:
+    """A task-owned long-lived OCI container with ``podman exec`` sessions.
+
+    The keepalive container is created with the exact same isolation flags,
+    sanitized mounts and resource limits as one-shot task commands. The exec'd
+    session inherits the container's cgroup, network namespace and mounts. A
+    session stop kills the whole container, so no descendant survives — there
+    is no host ``Popen`` and no host fallback.
+    """
+
+    backend_id = "rootless-container-session"
+
+    def __init__(self, backend: Any, runtime: Any):
+        self.backend = backend
+        self.runtime = runtime
+        self._tool, _ = backend._detect_tool()
+
+    def supports_pty(self) -> bool:
+        # ``podman exec -t`` allocates a TTY in the container, but the local
+        # pty fd plumbing would then be a second, host-owned PTY. Refuse PTY
+        # explicitly rather than pretend the boundary is equivalent.
+        return False
+
+    def open(
+        self, argv: list[str], *, use_pty: bool, timeout_seconds: int
+    ) -> _ProcessHandle:
+        if use_pty:
+            raise PolicyError(
+                "PTY sessions are not available in the ROOTLESS_CONTAINER profile; "
+                "use a piped session (the tool is unavailable, not a host fallback)"
+            )
+        if not self._tool:
+            raise PolicyError("the rootless OCI runtime is unavailable for sessions")
+        # The inner argv must pass the same allowlist as run_command. Validation
+        # never resolves to a host path: the argv is executed inside the container.
+        validator = CommandRunner(
+            self.runtime.overlay.parent,
+            policy=self.backend.policy,
+            run_home=self.backend.run_home,
+        )
+        validated = validator.validate(argv, timeout_seconds=timeout_seconds)
+        session_id = "maya-ses-" + uuid.uuid4().hex[:16]
+        keepalive_argv = self.backend._oci_argv(self.runtime, ["sleep", "infinity"])
+        # Replace the one-shot container name with a session-specific one and
+        # make the container detached so it stays alive for exec.
+        names = [
+            i for i, flag in enumerate(keepalive_argv) if flag == "--name"
+        ]
+        for i in names:
+            keepalive_argv[i + 1] = session_id
+        detached = [keepalive_argv[0], "run", "-d", *keepalive_argv[2:]]
+        start = self._run_oci(detached, timeout=timeout_seconds)
+        if start.exit_code != 0:
+            raise PolicyError(
+                f"the session container could not be started: {(start.stderr or start.stdout).strip()[:300]}"
+            )
+        child = [
+            self._tool, "exec", "-i", session_id, *validated,
+        ]
+        process = subprocess.Popen(
+            child,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+        )
+        return _ProcessHandle(
+            process=process,
+            cwd="/work",
+            container_name=session_id,
+            backend=self.backend,
+        )
+
+    def _run_oci(self, argv: list[str], *, timeout: int) -> CommandResult:
+        """Run a trusted OCI client argv through the bounded host runner."""
+        from mayaworkbench.workspace.backends import CommandPolicy
+
+        policy = CommandPolicy(
+            profile="CPU_SMOKE",
+            trust_profile="LOCAL_TRUSTED",
+            allow_absolute_args=True,
+            network_policy="ALLOW_WITH_APPROVAL",
+            dependency_policy="DENY",
+            allowed_executables=(Path(argv[0]).name,),
+            max_runtime_seconds=max(timeout, 60),
+        )
+        runner = CommandRunner(self.backend.run_home, policy=policy, run_home=self.backend.run_home)
+        return runner.run(argv, timeout_seconds=timeout)
+
+    def stop(self, handle: _ProcessHandle, *, reason: str) -> None:
+        del reason
+        if handle.process.poll() is None:
+            try:
+                SessionManager._kill_pid(handle.process.pid)
+                handle.process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, ProcessLookupError):  # pragma: no cover
+                try:
+                    handle.process.kill()
+                except OSError:
+                    pass
+        # Killing the container kills every in-container descendant of the
+        # exec'd process. This is the session's authoritative teardown.
+        if handle.container_name:
+            try:
+                subprocess.run(
+                    [self._tool, "rm", "-f", handle.container_name],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):  # pragma: no cover
+                pass
+
+
+ProcessSessionBackend = SessionBackend  # additive compatibility alias
+
+
+def accumulate_session_events(events) -> str:
+    """Concatenate ordered session event chunks (chunk framing contract)."""
+    return "".join(event["data"] for event in events)

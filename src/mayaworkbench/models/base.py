@@ -36,6 +36,11 @@ class ChatMessage(BaseModel):
     role: Role
     content: str
     tool_call_id: str | None = None
+    #: Name of the function a ``tool`` message answers. OpenAI-compatible
+    #: providers correlate by ``tool_call_id``; Gemini correlates by function
+    #: name. Adapters that can derive the name from earlier messages may leave
+    #: this unset, but callers should set it when they know it.
+    tool_name: str | None = None
     tool_calls: list[ToolCall] | None = None
 
 
@@ -63,6 +68,10 @@ class ModelUsage(BaseModel):
     total_tokens: int | None = None
     cost_usd: float | None = None
     cost_basis: str | None = None
+    #: Prompt tokens served from a provider cache (a subset of prompt_tokens).
+    cached_prompt_tokens: int | None = None
+    #: Output tokens spent on provider-side reasoning, when reported.
+    reasoning_tokens: int | None = None
 
 
 class ModelResponse(BaseModel):
@@ -78,6 +87,9 @@ class ModelResponse(BaseModel):
     retry_count: int = 0
     used_structured_output: bool = False
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    #: True only on the terminal value of :meth:`StreamingModelProvider.stream`;
+    #: intermediate values carry an incremental ``text`` delta.
+    is_final: bool = False
 
 
 class ModelCapabilities(BaseModel):
@@ -105,10 +117,16 @@ class StreamingModelProvider(Protocol):
     """Incremental streaming contract, separate from buffered SSE assembly.
 
     Adapters that implement this protocol yield one or more ``ModelResponse``
-    values as tokens arrive. Adapters that handle ``request.stream=True`` inside
-    :meth:`ModelProvider.generate` and return a single assembled response do not
-    implement it; callers must check ``capabilities().streaming`` and the presence
-    of ``stream`` before relying on incremental delivery.
+    values as text arrives. Every intermediate value carries exactly one
+    incremental ``text`` delta and ``is_final=False``. The last value has
+    ``is_final=True`` and carries the assembled ``usage``, ``tool_calls`` and
+    request metadata; its ``text`` is empty because the deltas were already
+    delivered. An error is raised rather than yielded, so a caller never has to
+    guess whether a returned value is a failure.
+
+    ``generate(request.stream=True)`` is a different contract: it returns one
+    fully assembled response. Callers must check ``capabilities().streaming``
+    and the presence of ``stream`` before relying on incremental delivery.
     """
 
     name: str

@@ -47,12 +47,15 @@ def test_address_space_limit_stops_a_memory_hog(tmp_path):
 
 
 def test_cpu_limit_terminates_a_cpu_spin(tmp_path):
-    runner = _runner(tmp_path, cpu_seconds=1)
+    runner = _runner(tmp_path, cpu_time_seconds=1)
     result = runner.run(
         ["python", "-c", "while True: pass"],
         timeout_seconds=20,
     )
-    assert result.limits["cpu"].status == "enforced"
+    assert result.limits["cpu_time"].status == "enforced"
+    # CPU concurrency is a different control and is never claimed by the host
+    # runner just because RLIMIT_CPU was applied.
+    assert result.limits["cpu_quota"].status == "unsupported"
     assert not result.timed_out, "the wall clock, not RLIMIT_CPU, ended the command"
     assert result.exit_code is not None and result.exit_code != 0
     assert result.duration_ms < 10_000
@@ -208,35 +211,31 @@ def test_deny_by_default_requires_positive_namespace_proof(tmp_path):
 
 
 def test_cpu_time_and_core_quota_are_recorded_separately(tmp_path):
-    """P1-01: a 'cpu' number must never be interpreted as both budgets."""
+    """Merged contract: CPU time and core quota are distinct dimensions."""
     from mayaworkbench.domain.models import TaskConstraints
 
     policy = CommandPolicy(
         profile="CPU_SMOKE",
         network_policy="ALLOW_WITH_APPROVAL",
         dependency_policy="DENY",
-        cpu_seconds=30,  # legacy alias, still reported
-        cpu_cores=4,
+        cpu_time_seconds=30,
+        cpu_quota=2.0,
         wall_time_seconds=120,
     )
     described = policy.describe()
     assert described["cpu_time_seconds"] == 30   # cumulative CPU TIME budget
-    assert described["cpu_cores"] == 4           # concurrency QUOTA
+    assert described["cpu_quota"] == 2.0          # concurrency QUOTA
     assert described["wall_time_seconds"] == 120
     assert policy.effective_cpu_time_seconds == 30
-    # The legacy alias still reports for old callers but is not the authority.
-    assert policy.cpu_seconds == 30
+    assert policy.cpu_cores == 2.0  # additive alias over their cpu_quota field
 
     constraints = TaskConstraints(
         cpu_time_seconds=5,
-        cpu_cores=2,
         max_runtime_seconds=90,
         compute_profile="CPU_SMOKE",
     )
     mapped = CommandPolicy.from_constraints(constraints)
     assert mapped.cpu_time_seconds == 5
-    assert mapped.cpu_cores == 2
-    assert mapped.wall_time_seconds == 90
 
 
 def test_command_result_records_each_cpu_dimension_independently(tmp_path):
@@ -244,13 +243,10 @@ def test_command_result_records_each_cpu_dimension_independently(tmp_path):
         profile="CPU_SMOKE",
         network_policy="ALLOW_WITH_APPROVAL",
         dependency_policy="DENY",
-        cpu_cores=2,
         cpu_time_seconds=15,
         max_runtime_seconds=60,
     )
     runner = CommandRunner(tmp_path, policy=policy, run_home=tmp_path / "home")
     result = runner.run(["python", "-c", "print('x')"], timeout_seconds=10)
-    assert result.cpu_cores == 2
     assert result.cpu_time_seconds == 15
-    # The wall deadline is the observed supervisor timeout, recorded separately.
     assert result.wall_time_seconds == 10

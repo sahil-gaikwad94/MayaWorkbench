@@ -9,6 +9,7 @@ the result (or an NDJSON stream) back to the caller.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 import traceback
@@ -19,12 +20,13 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from mayaworkbench.api.app import ControlPlane, StreamSpec
 from mayaworkbench.api.errors import ApiError, internal_error, map_maya_error
 from mayaworkbench.api.validation import (
+    LOOPBACK_HOSTS,
     MAX_BODY_BYTES,
     ensure_safe_path,
+    guard_local_request,
     guard_request_path,
     parse_body,
-    check_host_header,
-    check_origin,
+    guard_local_request,
     compute_allowed_hosts,
     compute_allowed_origins,
     scrub_secrets,
@@ -90,6 +92,13 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._check_boundary(method)
             parsed = urlsplit(self.path)
             guard_request_path(parsed)
+            guard_local_request(
+                method=method,
+                host_header=self.headers.get("Host"),
+                origin=self.headers.get("Origin"),
+                referer=self.headers.get("Referer"),
+                sec_fetch_site=self.headers.get("Sec-Fetch-Site"),
+            )
             path = ensure_safe_path(unquote(parsed.path))
             if method == "GET" and path == "/":
                 self._send_html(UI_HTML)
@@ -120,10 +129,15 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def _check_boundary(self, method: str) -> None:
         server = self.server
-        allowed_hosts = getattr(server, "allowed_hosts", set())
-        check_host_header(self.headers.get("Host"), expected_hosts=allowed_hosts)
-        if method == "POST":
-            check_origin(self.headers.get("Origin"), allowed_origins=getattr(server, "allowed_origins", set()))
+        # Use the canonical local-request guard from the merged validation
+        # module (DNS rebinding / cross-origin / cross-site / referer).
+        guard_local_request(
+            method=method,
+            host_header=self.headers.get("Host"),
+            origin=self.headers.get("Origin"),
+            referer=self.headers.get("Referer"),
+            sec_fetch_site=self.headers.get("Sec-Fetch-Site"),
+        )
         ip = self.client_address[0] if self.client_address else "127.0.0.1"
         limiter = getattr(server, "_rate_limiter", None)
         if limiter is not None and not limiter.hit(ip):
@@ -169,6 +183,9 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(data)
 
@@ -190,6 +207,9 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(data)
 
@@ -221,7 +241,21 @@ def create_server(
 
     ``port=0`` asks the OS for an ephemeral port, which is what the tests use.
     The returned server carries ``app`` for request dispatch.
+
+    This is a single-user, *local* control plane: it has no authentication,
+    so a non-loopback bind is refused unless the operator explicitly opts in
+    with ``MAYA_API_ALLOW_REMOTE=1``. A remote deployment needs its own auth,
+    session isolation and rate limits, which this release does not provide.
     """
+
+    if host not in LOOPBACK_HOSTS and os.environ.get(
+        "MAYA_API_ALLOW_REMOTE", ""
+    ).lower() not in {"1", "true", "yes"}:
+        raise ValueError(
+            f"refusing to bind the local control plane to {host!r}: it has no "
+            "authentication. Use 127.0.0.1, or set MAYA_API_ALLOW_REMOTE=1 to "
+            "accept full responsibility for a remote bind."
+        )
 
     server = ThreadingHTTPServer((host, port), ControlPlaneHandler)
     server.app = ControlPlane(services)  # type: ignore[attr-defined]

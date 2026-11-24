@@ -40,18 +40,47 @@ def register_environment_commands(sub: argparse._SubParsersAction) -> None:  # t
     _add_path_arguments(doctor)
     doctor.set_defaults(func=cmd_env_doctor)
 
+    spec = subcommands.add_parser(
+        "spec", help="Resolve an immutable environment spec (no execution)"
+    )
+    _add_path_arguments(spec)
+    spec.add_argument("--runtime", default="ROOTLESS_CONTAINER")
+    spec.add_argument("--image", default="python:3.12-slim")
+    spec.add_argument("--image-digest", dest="image_digest", default="")
+    spec.add_argument(
+        "--secret-ref", dest="secret_refs", action="append", default=[], metavar="NAME",
+        help="Environment variable supplied by secret reference (never a value).",
+    )
+    spec.add_argument(
+        "--service", dest="services", action="append", default=[], metavar="NAME:PORT",
+        help="Service the environment depends on (declared, not started).",
+    )
+    spec.set_defaults(func=cmd_env_spec)
+
     provision = subcommands.add_parser(
-        "provision", help="Execute an approved plan through the task runtime and attest it"
+        "provision", help="Provision the resolved spec inside the isolated runtime"
     )
     _add_path_arguments(provision)
-    provision.add_argument("--runtime", default="LOCAL_TRUSTED")
+    provision.add_argument("--runtime", default="ROOTLESS_CONTAINER")
+    provision.add_argument("--image", default="python:3.12-slim")
     provision.add_argument(
-        "--approve-install", action="store_true",
-        help="Explicit consent for dependency-install steps in this plan",
+        "--execute", action="store_true",
+        help="Run the steps. Without this flag the spec is reported and nothing runs.",
     )
-    provision.add_argument("--service", action="append", default=[], metavar="NAME:PORT",
-                           help="Loopback service to health-check, e.g. api:8000")
-    provision.add_argument("--out", default=None, help="Write the provision report JSON here")
+    provision.add_argument(
+        "--allow-network", dest="allow_network", action="store_true",
+        help="Approve package downloads; without it those steps are BLOCKED.",
+    )
+    provision.add_argument("--timeout", type=int, default=900)
+    # The provision run must accept the same spec inputs as `env spec`, or it
+    # would execute a different digest from the one a reviewer saw.
+    provision.add_argument("--image-digest", dest="image_digest", default="")
+    provision.add_argument(
+        "--secret-ref", dest="secret_refs", action="append", default=[], metavar="NAME"
+    )
+    provision.add_argument(
+        "--service", dest="services", action="append", default=[], metavar="NAME:PORT"
+    )
     provision.set_defaults(func=cmd_env_provision)
 
 
@@ -91,56 +120,125 @@ def cmd_env_doctor(args: argparse.Namespace) -> int:
     return 0 if payload["runtime_available"] else 1
 
 
-def cmd_env_provision(args: argparse.Namespace) -> int:
-    """Execute a plan with an explicit, local consent gate."""
-    from pathlib import Path
+def _services(values: list[str]) -> tuple:
+    """Parse ``NAME:PORT`` service declarations (no values, no guessing)."""
 
-    from mayaworkbench.errors import PolicyError
-    from mayaworkbench.workspace.environments import build_plan
-    from mayaworkbench.workspace.provisioning import (
-        EnvironmentProvisioner,
-        ServiceSpec,
+    from mayaworkbench.workspace.environments import ServiceSpec
+
+    services = []
+    for value in values:
+        name, _, port = value.rpartition(":")
+        if not name or not port.isdigit():
+            raise SystemExit(
+                f"invalid --service {value!r}: expected NAME:PORT (for example db:5432)"
+            )
+        services.append(ServiceSpec(name=name, port=int(port)))
+    return tuple(services)
+
+
+def _resolved_spec(args: argparse.Namespace):
+    from mayaworkbench.workspace.environments import resolve_spec
+
+    return resolve_spec(
+        Path(_resolve_path(args)),
+        runtime=args.runtime,
+        image=args.image,
+        image_digest=getattr(args, "image_digest", ""),
+        services=_services(getattr(args, "services", [])),
+        secret_refs=tuple(getattr(args, "secret_refs", [])),
     )
-    from mayaworkbench.workspace.runner import CommandPolicy, CommandRunner
+
+
+def cmd_env_spec(args: argparse.Namespace) -> int:
+    console = args.console
+    payload = _resolved_spec(args).as_dict()
+    console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_env_provision(args: argparse.Namespace) -> int:
+    console = args.console
+    spec = _resolved_spec(args)
+    if not args.execute:
+        payload = {
+            "executed": False,
+            "spec": spec.as_dict(),
+            "network_gated_steps": list(spec.network_gated_steps),
+            "note": "No step ran. Re-run with --execute; steps that download "
+            "packages also require --allow-network.",
+        }
+        console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+        return 0
+
+    from mayaworkbench.domain.enums import ExecutionTrust
+    from mayaworkbench.workspace.backends import (
+        BackendCommandRunner,
+        RootlessContainerBackend,
+    )
+    from mayaworkbench.workspace.provisioning import EnvironmentProvisioner
+    from mayaworkbench.workspace.runner import CommandPolicy
     from mayaworkbench.workspace.runtime_workspace import RuntimeWorkspace
     from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
 
-    console = args.console
-    root = Path(_resolve_path(args)).resolve()
-    plan = build_plan(root, runtime=args.runtime)
-    approved = frozenset({"install", "install-build", "install-runtime"}) if args.approve_install else frozenset()
-    services: list[ServiceSpec] = []
-    for entry in args.service:
-        try:
-            name, port = entry.rsplit(":", 1)
-            services.append(ServiceSpec(name=name, port=int(port)))
-        except (ValueError, PolicyError) as exc:
-            raise PolicyError(f"invalid --service {entry!r}: {exc}") from exc
+    if spec.runtime != ExecutionTrust.ROOTLESS_CONTAINER.value:
+        payload = {
+            "executed": False,
+            "blocked": True,
+            "spec_sha256": spec.spec_sha256,
+            "reasons": [
+                f"provisioning is implemented only for ROOTLESS_CONTAINER, not {spec.runtime!r}"
+            ],
+        }
+        console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+        return 2
 
-    ws = RuntimeWorkspace.for_host(root)
+    home = Path(args.home).expanduser() if args.home else Path.home() / ".mayaworkbench"
     policy = CommandPolicy(
-        profile="USER_APPROVED_LOCAL",
-        network_policy="ALLOW_WITH_APPROVAL",
-        dependency_policy="APPROVAL_REQUIRED",
-        max_runtime_seconds=1800,
+        profile="CPU_SMOKE",
+        network_policy="ALLOW_WITH_APPROVAL" if args.allow_network else "DENY_BY_DEFAULT",
+        dependency_policy="ALLOW_WITH_APPROVAL" if args.allow_network else "DENY",
     )
-    runner = CommandRunner(ws.path, policy=policy, run_home=root / ".maya-provision-home")
+    backend = RootlessContainerBackend(
+        Path(spec.root),
+        home / "env-runs" / spec.spec_sha256[:12],
+        policy,
+        image=spec.image,
+    )
+    evidence = backend.verify_capabilities()
+    if not evidence.available:
+        payload = {
+            "executed": False,
+            "blocked": True,
+            "spec_sha256": spec.spec_sha256,
+            "reasons": evidence.mandatory_failures
+            or list(backend.capabilities().reasons),
+            "note": "The environment was not provisioned. ROOTLESS_CONTAINER is "
+            "unavailable on this host, and a host install is never substituted.",
+        }
+        console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+        return 2
+
+    workspace = RuntimeWorkspace.for_container(
+        backend, Path(spec.root), snapshot_id="env-" + spec.spec_sha256[:12]
+    )
+    runner = BackendCommandRunner(backend, runtime=workspace.runtime)
     runtime = CommandRunnerTaskRuntime(
-        workspace=ws, runner=runner, trust_profile="LOCAL_TRUSTED",
-        install_authorized=bool(args.approve_install),
+        workspace=workspace,
+        runner=runner,
+        trust_profile=ExecutionTrust.ROOTLESS_CONTAINER.value,
     )
-    report = EnvironmentProvisioner(
-        plan=plan,
-        runtime=runtime,
-        approved_purposes=approved,
-        run_home=root / ".maya-provision-home",
-        services=tuple(services),
-    ).provision()
-    payload = report.as_dict()
-    if args.out:
-        Path(args.out).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        run = EnvironmentProvisioner(
+            runtime,
+            spec,
+            allow_network=args.allow_network,
+            timeout_seconds=args.timeout,
+        ).run()
+    finally:
+        runtime.stop(reason="environment provisioning finished")
+    payload = {"executed": True, **run.as_dict()}
     console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
-    return 0 if report.status in {"PROVISIONED", "PARTIAL"} else 1
+    return 0 if run.succeeded else 1
 
 
 __all__ = ["register_environment_commands"]

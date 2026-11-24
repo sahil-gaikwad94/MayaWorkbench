@@ -119,7 +119,7 @@ def test_cross_origin_post_is_refused(tmp_path):
             base, "POST", "/anything", headers={"Origin": "http://evil.example"}, body={}
         )
         assert status == 403
-        assert payload["code"] == "ORIGIN_FORBIDDEN"
+        assert payload["code"] == "CROSS_ORIGIN_REQUEST"
     finally:
         server.shutdown()
         server.server_close()
@@ -160,17 +160,22 @@ def test_rate_limit_returns_429(tmp_path):
         thread.join(timeout=5)
 
 
-def test_non_loopback_bind_carries_an_explicit_warning(tmp_path):
-    """P1-09: the server advertises when it is exposed beyond loopback."""
-    from mayaworkbench.api import create_server
+def test_non_loopback_bind_is_refused_unless_remote_is_explicitly_enabled(tmp_path, monkeypatch):
+    """Merged contract: remote bind is refused, or needs MAYA_API_ALLOW_REMOTE=1."""
+    import os
 
+    from mayaworkbench.api import create_server
+    from mayaworkbench.api.errors import ApiError
+
+    monkeypatch.delenv("MAYA_API_ALLOW_REMOTE", raising=False)
+    with pytest.raises(ValueError, match="refusing to bind the local control plane"):
+        server = create_server(_services_for(tmp_path), host="0.0.0.0", port=0)
+        server.server_close()
+    monkeypatch.setenv("MAYA_API_ALLOW_REMOTE", "1")
     server = create_server(_services_for(tmp_path), host="0.0.0.0", port=0)
-    server.server_close()
     notes = getattr(server, "security_notes", "")
-    assert notes and "WARNING" in notes and "loopback" in notes
-    local = create_server(_services_for(tmp_path), host="127.0.0.1", port=0)
-    local.server_close()
-    assert not getattr(local, "security_notes", "")
+    assert notes and "non-loopback" in notes.lower()
+    server.server_close()
 
 
 def test_response_scrubber_removes_secrets_from_nested_payloads():

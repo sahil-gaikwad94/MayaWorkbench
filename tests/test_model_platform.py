@@ -740,9 +740,20 @@ def test_openai_payload_keeps_strict_json_schema_with_tools() -> None:
         _openai_request(json_schema=schema, schema_name="answer", tools=[ToolDefinition(name="x")]),
         repair_notice=None,
     )
+    # Strict mode requires a closed object with every property required; the
+    # adapter projects the caller's schema instead of sending it verbatim.
     assert payload["response_format"] == {
         "type": "json_schema",
-        "json_schema": {"name": "answer", "strict": True, "schema": schema},
+        "json_schema": {
+            "name": "answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+        },
     }
 
 
@@ -896,23 +907,25 @@ def test_capability_manifests_report_only_implemented_features() -> None:
     assert caps.tool_calling is True
     assert caps.parallel_tool_calls is True
     assert caps.provider_family == "openai_compatible"
-    # Buffered SSE via generate(stream=True) is not the incremental-chunk protocol.
-    assert not hasattr(openai, "stream")
+    # The adapter now implements the incremental protocol as well.
+    assert callable(openai.stream)
 
     anthropic = AnthropicProvider(model="claude-test", api_key="fake-anthropic-key")
     anthropic_caps = anthropic.capabilities()
     assert anthropic_caps.tool_calling is True
     assert anthropic_caps.prompt_caching is True
-    assert anthropic_caps.streaming is False
+    assert anthropic_caps.streaming is True
     assert anthropic_caps.parallel_tool_calls is False
     assert anthropic_caps.provider_family == "anthropic"
+    assert callable(anthropic.stream)
 
     gemini = GeminiProvider(model="gemini-test", api_key="fake-gemini-key")
     gemini_caps = gemini.capabilities()
     assert gemini_caps.tool_calling is True
-    assert gemini_caps.streaming is False
+    assert gemini_caps.streaming is True
     assert gemini_caps.prompt_caching is False
     assert gemini_caps.provider_family == "gemini"
+    assert callable(gemini.stream)
 
 
 def test_anthropic_tool_use_and_cache_control(monkeypatch) -> None:
@@ -983,13 +996,29 @@ def test_anthropic_tool_use_and_cache_control(monkeypatch) -> None:
     assert plain["system"] == "sys"
 
 
-def test_anthropic_stream_request_is_refused_not_downgraded(monkeypatch) -> None:
+def test_anthropic_stream_request_uses_sse_and_assembles(monkeypatch) -> None:
+    lines = [
+        b'event: message_start\n',
+        b'data: {"type":"message_start","message":{"id":"msg_1","model":"claude-test","usage":{"input_tokens":3}}}\n\n',
+        b'event: content_block_start\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'event: content_block_delta\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}\n\n',
+        b'event: message_delta\n',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+        b'event: message_stop\n',
+        b'data: {"type":"message_stop"}\n\n',
+    ]
+    calls = _fake_urlopen(monkeypatch, lines=lines)
     provider = AnthropicProvider(model="claude-test", api_key="fake")
-    calls = _fake_urlopen(monkeypatch, body=_json_body({"content": []}))
-    with pytest.raises(ModelError) as raised:
-        provider.generate(_openai_request(stream=True))
-    assert raised.value.error_class == "unsupported"
-    assert calls == []
+    response = provider.generate(_openai_request(stream=True))
+    assert response.text == "Hi"
+    assert response.usage.prompt_tokens == 3
+    assert response.usage.completion_tokens == 1
+    assert response.provider_request_id == "msg_1"
+    sent = json.loads(calls[0].data.decode("utf-8"))
+    assert sent["stream"] is True
+    assert calls[0].get_header("Accept") == "text/event-stream"
 
 
 def test_gemini_function_call_parsing(monkeypatch) -> None:
@@ -1041,7 +1070,8 @@ def test_gemini_function_call_parsing(monkeypatch) -> None:
                 {
                     "name": "lookup",
                     "description": "look up",
-                    "parameters": {"type": "object"},
+                    # Gemini tool schemas use its upper-case OpenAPI subset.
+                    "parameters": {"type": "OBJECT"},
                 }
             ]
         }
@@ -1053,13 +1083,44 @@ def test_gemini_function_call_parsing(monkeypatch) -> None:
 def test_gemini_unimplemented_options_are_refused(monkeypatch) -> None:
     provider = GeminiProvider(model="gemini-test", api_key="fake")
     calls = _fake_urlopen(monkeypatch, body=_json_body({"candidates": []}))
-    with pytest.raises(ModelError) as streamed:
-        provider.generate(_openai_request(stream=True))
-    assert streamed.value.error_class == "unsupported"
     with pytest.raises(ModelError) as cached:
         provider.generate(_openai_request(cache_breakpoints=[0]))
     assert cached.value.error_class == "unsupported"
     assert calls == []
+
+
+def test_gemini_stream_request_uses_sse_and_assembles(monkeypatch) -> None:
+    lines = _sse(
+        {
+            "candidates": [
+                {"content": {"parts": [{"text": "Hel"}], "role": "model"}, "index": 0}
+            ]
+        },
+        {
+            "candidates": [
+                {"content": {"parts": [{"text": "lo"}], "role": "model"}, "index": 0}
+            ],
+            "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 2},
+            "modelVersion": "gemini-test",
+        },
+        {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": ""}], "role": "model"},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ]
+        },
+    )
+    calls = _fake_urlopen(monkeypatch, lines=lines)
+    provider = GeminiProvider(model="gemini-test", api_key="fake")
+    response = provider.generate(_openai_request(stream=True))
+    assert response.text == "Hello"
+    assert response.usage.prompt_tokens == 4
+    assert response.usage.completion_tokens == 2
+    assert ":streamGenerateContent" in calls[0].full_url
+    assert "alt=sse" in calls[0].full_url
 
 
 def test_cli_manifest_reports_capability_values_not_placeholders(tmp_path: Path, monkeypatch) -> None:

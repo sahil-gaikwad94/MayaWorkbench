@@ -85,7 +85,16 @@ def discover_cgroup_root() -> Path | None:
             continue
         own = parts[2].strip("/")
         root = mount if not own else mount / own
-        if root.is_dir() and os.access(root, os.W_OK):
+        # A delegated-but-unreadable cgroup path raises PermissionError from
+        # stat() on some kernels (and from is_dir() on Python 3.12). That is
+        # "no usable delegation", not an application error: the caller must
+        # keep reporting process_count as unsupported rather than crash every
+        # command, `runner doctor` and `env doctor`.
+        try:
+            usable = root.is_dir() and os.access(root, os.W_OK)
+        except OSError:
+            continue
+        if usable:
             return root
     return None
 

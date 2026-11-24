@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover - exercised only on Windows
     resource = None  # type: ignore[assignment]
 
 DEFAULT_EXECUTABLES = ("python", "python3", "pytest", "ruff", "mypy")
-#: Only the dedicated provisioning runner may use this closed allowlist.
+#: Closed allowlist used ONLY by the approval-gated provisioning install runner.
 INSTALL_EXECUTABLES = (
     "python", "python3", "pip", "pip3", "uv", "poetry",
     "npm", "pnpm", "yarn", "cargo", "go", "mvn", "gradle",
@@ -76,9 +76,13 @@ OUTPUT_READ_CHUNK = 65_536
 
 #: Limit names reported in ``CommandResult.limits``. The set is fixed so a
 #: consumer can distinguish "not checked" from "checked and unsupported".
+#: ``cpu_time`` is the cumulative CPU-seconds budget (RLIMIT_CPU);
+#: ``cpu_quota`` is CPU concurrency (a core quota, cgroup ``cpu.max`` in the OCI
+#: backend). They are different controls and are never reported as each other.
 LIMIT_NAMES = (
     "wall_time",
-    "cpu",
+    "cpu_time",
+    "cpu_quota",
     "memory",
     "process_count",
     "file_size",
@@ -92,14 +96,25 @@ class LimitEnforcement:
 
     ``status`` is one of ``enforced``, ``unsupported``, ``not_applied``.
     ``mechanism`` is only set when enforcement was actually observed.
+    ``requested`` and ``observed`` carry the values read back from the runtime,
+    so a report can show what the kernel actually applied instead of repeating
+    the policy.
     """
 
     status: str
     mechanism: str | None = None
     detail: str = ""
+    requested: str | None = None
+    observed: str | None = None
 
     def as_dict(self) -> dict[str, str | None]:
-        return {"status": self.status, "mechanism": self.mechanism, "detail": self.detail}
+        return {
+            "status": self.status,
+            "mechanism": self.mechanism,
+            "detail": self.detail,
+            "requested": self.requested,
+            "observed": self.observed,
+        }
 
 
 def summarize_limits(limits: dict[str, LimitEnforcement]) -> str:
@@ -158,6 +173,11 @@ class CommandPolicy:
     #: Only an isolated-runtime backend may enable this, and only for the
     #: trusted OCI client argv it constructs. Project/task argv never uses it.
     allow_absolute_args: bool = False
+    #: ONLY the approval-gated provisioning runner may set this. The normal
+    #: task command policy never permits dependency installation commands.
+    allow_dependency_install: bool = False
+    #: Wall-clock supervisor deadline (distinct from CPU time and core quota).
+    wall_time_seconds: int | None = None
     allowed_executables: tuple[str, ...] = DEFAULT_EXECUTABLES
     max_runtime_seconds: int = 1800
     max_output_bytes: int = 200_000
@@ -165,20 +185,21 @@ class CommandPolicy:
     max_processes: int = 128
     max_open_files: int = 1024
     max_file_size_mb: int = 256
-    #: DEPRECATED alias for ``cpu_time_seconds``. Kept so older contracts and
-    #: tests keep working, but it is NEVER interpreted as a CPU-core quota.
-    cpu_seconds: int | None = None
-    #: Cumulative CPU-time ceiling enforced by RLIMIT_CPU in the child. This is
-    #: a TIME budget: a wall-clock sleep consumes almost none of it.
+    #: Cumulative CPU-time budget in seconds (RLIMIT_CPU). ``None`` derives it
+    #: from the wall timeout so the CPU guard is a backstop for a wall-clock
+    #: failure, not the primary limit. This is NOT a CPU-core quota.
     cpu_time_seconds: int | None = None
-    #: ONLY set on a dedicated, explicitly approved provisioning runner. The
-    #: ordinary task runner never permits dependency installation commands.
-    allow_dependency_install: bool = False
-    #: CPU concurrency/quota (OCI ``--cpus``). Independent of CPU time and of
-    #: wall time. ``None`` means the default single core.
-    cpu_cores: int | None = None
-    #: External wall-clock deadline enforced by the supervisor.
-    wall_time_seconds: int | None = None
+    #: CPU concurrency ceiling (cores). Only a container backend can enforce
+    #: this (cgroup ``cpu.max``); the host runner reports it as unsupported.
+    cpu_quota: float = 1.0
+    #: Per-argument and total size bounds. These are raised only for the
+    #: trusted OCI *client* argv (never for project argv).
+    max_arg_length: int = MAX_ARG_LENGTH
+    max_total_arg_bytes: int = MAX_TOTAL_ARG_BYTES
+    #: A generated invariant/probe script is a single trusted argument and may
+    #: legitimately contain newlines. Only the OCI client policy enables this;
+    #: project argv never may.
+    allow_multiline_args: bool = False
     #: Extra non-secret environment entries for one job (an experiment seed, for
     #: example). The runner's allowlist is the base; these are merged on top and
     #: their names are reported in ``env_names`` so provenance stays visible.
@@ -194,19 +215,17 @@ class CommandPolicy:
             max_runtime_seconds=constraints.max_runtime_seconds,
             max_output_bytes=constraints.max_output_bytes,
             max_processes=constraints.max_processes,
-            cpu_time_seconds=constraints.cpu_time_seconds,
-            cpu_cores=constraints.cpu_cores,
+            cpu_time_seconds=getattr(constraints, "cpu_time_seconds", None),
             wall_time_seconds=constraints.max_runtime_seconds,
         )
 
     @property
     def effective_cpu_time_seconds(self) -> int | None:
-        """The cumulative CPU-time budget, with the legacy alias as fallback."""
-        return (
-            self.cpu_time_seconds
-            if self.cpu_time_seconds is not None
-            else self.cpu_seconds
-        )
+        return self.cpu_time_seconds
+
+    @property
+    def cpu_cores(self) -> float:
+        return getattr(self, "cpu_quota", 1.0)
 
     def describe(self) -> dict:
         return {
@@ -222,11 +241,11 @@ class CommandPolicy:
             "max_processes": self.max_processes,
             "max_open_files": self.max_open_files,
             "max_file_size_mb": self.max_file_size_mb,
-            "allow_dependency_install": self.allow_dependency_install,
-            "cpu_seconds": self.cpu_seconds,
-            "cpu_time_seconds": self.effective_cpu_time_seconds,
-            "cpu_cores": self.cpu_cores,
+            "cpu_time_seconds": self.cpu_time_seconds,
+            "cpu_quota": self.cpu_quota,
             "wall_time_seconds": self.wall_time_seconds or self.max_runtime_seconds,
+            "max_arg_length": self.max_arg_length,
+            "allow_multiline_args": self.allow_multiline_args,
             "shell": False,
         }
 
@@ -253,10 +272,10 @@ class CommandResult:
     cleanup_succeeded: bool = True
     env_names: list[str] = field(default_factory=list)
     cwd: str = ""
-    #: Distinct budget dimensions (P1-01). A CPU-time budget is NOT a core quota
-    #: and neither is a wall-clock deadline; each is recorded on its own.
+    #: Distinct budget dimensions (P1-01): a CPU-time budget is not a core
+    #: quota and neither is a wall-clock deadline; each is recorded separately.
     cpu_time_seconds: int | None = None
-    cpu_cores: int | None = None
+    cpu_cores: float | None = None
     wall_time_seconds: int | None = None
 
     @property
@@ -334,9 +353,11 @@ class CommandRunner:
             raise PolicyError(f"argv has more than {MAX_ARGS} entries")
         if any("\x00" in arg for arg in argv):
             raise PolicyError("argv contains a null byte")
-        if any(len(arg) > MAX_ARG_LENGTH for arg in argv):
-            raise PolicyError(f"an argv entry exceeds {MAX_ARG_LENGTH} characters")
-        if sum(len(arg.encode("utf-8")) for arg in argv) > MAX_TOTAL_ARG_BYTES:
+        if any(len(arg) > self.policy.max_arg_length for arg in argv):
+            raise PolicyError(
+                f"an argv entry exceeds {self.policy.max_arg_length} characters"
+            )
+        if sum(len(arg.encode("utf-8")) for arg in argv) > self.policy.max_total_arg_bytes:
             raise PolicyError("argv is too large")
         if timeout_seconds < 1 or timeout_seconds > self.policy.max_runtime_seconds:
             raise PolicyError(
@@ -348,14 +369,12 @@ class CommandRunner:
                 f"executable is not allowed by this task: {executable}",
                 hint=f"Allowed: {', '.join(self.policy.allowed_executables)}",
             )
-        install_command = any(
+        if any(
             arg in {"pip", "pip3", "poetry", "uv", "conda"} for arg in argv[1:3]
-        ) or (len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pip", "ensurepip"})
-        if install_command and not self.policy.allow_dependency_install:
-            raise PolicyError(
-                "dependency installation is not permitted in this task; "
-                "it requires an explicitly approved provisioning step"
-            )
+        ):
+            raise PolicyError("dependency installation is not permitted in this task")
+        if len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pip", "ensurepip"}:
+            raise PolicyError("dependency installation is not permitted in this task")
         for arg in argv[1:]:
             if (
                 not self.policy.allow_absolute_args
@@ -368,7 +387,7 @@ class CommandRunner:
                     )
             if ".." in Path(arg).parts:
                 raise PolicyError(f"path argument may not contain '..': {arg}")
-            if "\n" in arg or "\r" in arg:
+            if ("\n" in arg or "\r" in arg) and not self.policy.allow_multiline_args:
                 raise PolicyError("argv entries may not contain newlines")
         return list(argv)
 
@@ -506,7 +525,7 @@ class CommandRunner:
             and hasattr(resource, "setrlimit")
         )
 
-    def _limit_probe(self, *, cpu_seconds: int) -> tuple[Callable[[], None], int, Path]:
+    def _limit_probe(self, *, cpu_time_seconds: int) -> tuple[Callable[[], None], int, Path]:
         """Build a child-side rlimit probe with a parent-readable evidence file.
 
         Each ``setrlimit`` is followed by a ``getrlimit`` readback inside the
@@ -517,7 +536,7 @@ class CommandRunner:
         evidence = self.run_home / f"limits-{uuid.uuid4().hex}.jsonl"
         limits_fd = os.open(evidence, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         specs = [
-            ("cpu", getattr(resource, "RLIMIT_CPU", None), cpu_seconds),
+            ("cpu_time", getattr(resource, "RLIMIT_CPU", None), cpu_time_seconds),
             (
                 "memory",
                 getattr(resource, "RLIMIT_AS", None),
@@ -594,6 +613,13 @@ class CommandRunner:
                     "RLIMIT_NPROC is a per-UID ceiling that the kernel does not enforce "
                     "for privileged processes, and its headroom calculation can block "
                     "legitimate children; no cgroup/container backend is available",
+                )
+            elif name == "cpu_quota":
+                limits[name] = LimitEnforcement(
+                    "unsupported",
+                    None,
+                    "a host process has no per-task CPU-concurrency quota; the OCI "
+                    "backend reports a verified cgroup cpu.max instead",
                 )
             else:
                 limits[name] = observed.get(
@@ -708,10 +734,10 @@ class CommandRunner:
                     scope = None
 
         preexec, limits_fd, evidence = self._limit_probe(
-            cpu_seconds=max(
+            cpu_time_seconds=max(
                 1,
-                self.policy.effective_cpu_time_seconds
-                if self.policy.effective_cpu_time_seconds is not None
+                self.policy.cpu_time_seconds
+                if self.policy.cpu_time_seconds is not None
                 else int(timeout_seconds) + 5,
             )
         )
@@ -820,7 +846,11 @@ class CommandRunner:
         limits = self._complete_limits(self._read_limit_probe(evidence))
         if cgroup_active:
             limits["process_count"] = LimitEnforcement(
-                "enforced", "cgroup-v2", f"pids.max={self.policy.max_processes}"
+                "enforced",
+                "cgroup-v2",
+                f"pids.max={self.policy.max_processes}",
+                str(self.policy.max_processes),
+                str(self.policy.max_processes),
             )
         for stream in (process.stdout, process.stderr):
             try:
@@ -846,8 +876,8 @@ class CommandRunner:
             env_names=sorted(env),
             cwd=str(self.workspace),
             cpu_time_seconds=self.policy.effective_cpu_time_seconds,
-            cpu_cores=self.policy.cpu_cores,
-            wall_time_seconds=self.policy.wall_time_seconds or timeout_seconds,
+            cpu_cores=getattr(self.policy, "cpu_quota", None),
+            wall_time_seconds=timeout_seconds,
         )
 
     def _blocked_result(
@@ -880,6 +910,9 @@ class CommandRunner:
             limits=blocked_limits,
             env_names=sorted(env),
             cwd=str(self.workspace),
+            cpu_time_seconds=self.policy.effective_cpu_time_seconds,
+            cpu_cores=getattr(self.policy, "cpu_quota", None),
+            wall_time_seconds=self.policy.wall_time_seconds or self.policy.max_runtime_seconds,
         )
 
     # ------------------------------------------------------------- lifecycle
@@ -994,7 +1027,6 @@ __all__ = [
     "CommandResult",
     "CommandRunner",
     "DEFAULT_EXECUTABLES",
-    "INSTALL_EXECUTABLES",
     "LimitEnforcement",
     "LIMIT_NAMES",
     "summarize_limits",

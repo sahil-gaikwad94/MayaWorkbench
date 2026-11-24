@@ -26,9 +26,9 @@ def fixture_paths() -> dict[str, tuple[Path, ...]]:
     if not FIXTURES_ROOT.is_dir():
         return {}
     return {
-        directory.name: tuple(sorted(path for path in directory.rglob("*") if path.is_file()))
+        directory.name: tuple(sorted(path for path in directory.rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"))
         for directory in sorted(FIXTURES_ROOT.iterdir())
-        if directory.is_dir()
+        if directory.is_dir() and directory.name != "__pycache__"
     }
 
 

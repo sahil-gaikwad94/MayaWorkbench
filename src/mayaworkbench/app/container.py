@@ -18,6 +18,7 @@ from mayaworkbench.errors import ConflictError, UsageError
 from mayaworkbench.ids import new_ulid
 from mayaworkbench.experiments.service import ExperimentService
 from mayaworkbench.indexing.indexer import Indexer
+from mayaworkbench.indexing.impact import ImpactAnalyzer
 from mayaworkbench.indexing.map import RepositoryMapService
 from mayaworkbench.memory.service import MemoryService
 from mayaworkbench.skills.service import SkillsService
@@ -105,6 +106,7 @@ class Services:
     gateway: ModelGateway
     ask: AskService
     maps: RepositoryMapService
+    impact: "ImpactAnalyzer"
     documents: ResearchDocumentStore
     passages: SourcePassageStore
     claims: ResearchClaimStore
@@ -211,6 +213,7 @@ class Services:
             symbols=symbols,
             issues=issues,
         )
+        impact = ImpactAnalyzer(files=files, symbols=symbols)
         documents = ResearchDocumentStore(db)
         passages = SourcePassageStore(db)
         claims = ResearchClaimStore(db)
@@ -445,6 +448,7 @@ class Services:
             gateway=gateway,
             ask=ask,
             maps=maps,
+            impact=impact,
             documents=documents,
             passages=passages,
             claims=claims,
