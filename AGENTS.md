@@ -11,9 +11,17 @@
 - Install (editable — required for the separate worker process):
   `python -m pip install -e ".[dev]"` plus `pypdf` for PDF tests.
 - Full suite: `python -m pytest -q`
+- On a low-memory host the full suite OOMs in one process; run it in batches of
+  ~4-6 test files and sum the counts instead of raising the timeout.
 - Compile: `python -m compileall -q src`
 - Capability report: `python -m mayaworkbench.cli.main --json runner doctor` (global
   `--json` must precede the subcommand)
+
+## Git
+- Upstream: `https://github.com/sahil-gaikwad94/MayaWorkbench`, default branch `main`.
+- Push with the PAT inline in the push URL; never persist it in `.git/config`.
+- `.base/` and `.polydev/` are local tooling snapshots of the tree: gitignored,
+  never commit them.
 
 ## Code conventions
 - `domain/` has no I/O; `storage/stores.py` owns all SQL; CLI handlers call services only.
