@@ -329,12 +329,16 @@ class DeclaredCheckRunner:
         authorized: bool,
         declared: list[CheckSpec] | None = None,
         runtime: Any | None = None,
+        require_isolated_runtime: bool | None = None,
     ) -> None:
         self.contract = contract
         self.workspace = Path(workspace)
         self.run_home = Path(run_home)
         self.authorized = authorized
         self.runtime = runtime
+        # Explicit override used by tests/callers that must prove no host
+        # fallback exists even when the contract's trust profile differs.
+        self.require_isolated_runtime = require_isolated_runtime
         self._declared = list(declared if declared is not None else contract.verification_checks)
 
     # ------------------------------------------------------------------ lookup
@@ -426,7 +430,7 @@ class DeclaredCheckRunner:
             base.infrastructure = True
             base.command = list(spec.argv or [])
             return base
-        if self.runtime is None and self.contract.constraints.execution_trust in self.ISOLATED_TRUST:
+        if self.runtime is None and (self.require_isolated_runtime or self.contract.constraints.execution_trust in self.ISOLATED_TRUST):
             # Never construct a host runner for an isolated task: the check is
             # blocked, and `maya verify run` executes it in a matched runtime.
             base.reason = (

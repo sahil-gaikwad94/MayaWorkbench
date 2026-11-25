@@ -572,7 +572,14 @@ class TaskService:
         return self.approval_service.list_for_run(run_id)
 
     # ----------------------------------------------------------------- execution
-    def prepare_execution(self, run_id: str) -> RunResult:
+    def prepare_execution(self, run_id: str, *, provision: bool = False) -> RunResult:
+        """Prepare a run, optionally routing it through ENVIRONMENT_PROVISIONING.
+
+        Provisioning is an explicit, opt-in phase. When requested, the run parks
+        in ``ENVIRONMENT_PROVISIONING`` and the worker executes the approved
+        environment plan before enqueuing the implementation job. Without it the
+        historical direct AWAITING_APPROVAL -> IMPLEMENTING path is unchanged.
+        """
         run = self.runs.get(run_id)
         if run.state != WorkflowState.AWAITING_APPROVAL:
             raise TaskError(
@@ -593,9 +600,15 @@ class TaskService:
         repository = self.repositories.get(run.repository_id)
         self.workflow.transition(
             run.id,
-            WorkflowState.IMPLEMENTING,
-            reason="approved; creating isolated workspace",
-            payload={"workspace": "pending"},
+            WorkflowState.ENVIRONMENT_PROVISIONING
+            if provision
+            else WorkflowState.IMPLEMENTING,
+            reason=(
+                "approved; creating isolated workspace for environment provisioning"
+                if provision
+                else "approved; creating isolated workspace"
+            ),
+            payload={"workspace": "pending", "provisioning_requested": provision},
         )
         try:
             workspace = self.worktrees.create(
@@ -658,6 +671,7 @@ class TaskService:
                 run_id=run.id,
                 task_id=run.task_id,
                 project_id=run.project_id,
+                details={"kind": "provision"} if provision else {},
             )
         )
         return RunResult(

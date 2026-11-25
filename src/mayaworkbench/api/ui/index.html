@@ -18,26 +18,34 @@ input{background:#0c0e12;color:var(--fg);border:1px solid var(--border);border-r
 .ok{color:#7ee787}.warn{color:#ffd479}.bad{color:#ff7b72}
 .badge{display:inline-block;background:#232936;color:var(--accent);border-radius:3px;padding:0 6px;margin-right:6px;font-size:11px}
 ul{margin:2px 0 8px;padding-left:18px}li{margin:1px 0}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+section:target{border-color:var(--accent)}
+@media(max-width:720px){main{grid-template-columns:1fr;padding:10px}input{width:100%}header{padding:12px}}
 </style>
 </head>
 <body>
 <header><h1>MayaWorkbench — local control plane</h1><div class="muted">Evidence-first engineering workspace · loopback only · no auth in this local alpha</div></header>
 <main>
-<section><h2>Load run (all panels)</h2><div class="row"><input id="runLoadId" placeholder="run id"><button onclick="loadRun()">Load run</button></div><div class="muted">Loads the run view, plan, timeline and evidence together. Each panel below also has its own loader.</div></section>
+<section><h2>Load run (all panels)</h2><div class="row"><input id="runLoadId" aria-label="Run id" placeholder="run id"><button onclick="loadRun()">Load run</button></div><div class="muted">Loads the run view, plan, timeline and evidence together. Each panel below also has its own loader.</div></section>
 <section><h2>Workspace</h2><div class="row"><button onclick="refreshProjectsSummary()">Refresh projects</button></div><div id="workspacePanel" class="muted">Load a run to see its workspace.</div><pre id="workspaceProjects" class="muted"></pre></section>
 <section><h2>Task overview</h2><div id="taskOverviewPanel" class="muted">Load a run to see its objective, criteria, budget and trust profile.</div></section>
 <section><h2>Plan &amp; approvals</h2><div id="planPanel" class="muted">Load a run to see its plan and approvals.</div><pre id="planApprovalStatus" class="muted"></pre></section>
 <section><h2>Execution timeline</h2><div id="timelinePanel" class="muted">Load a run to see its execution timeline.</div></section>
 <section><h2>Evidence graph</h2><div id="evidenceGraphPanel" class="muted">Load a run to see its verification and evidence graph.</div></section>
-<section><h2>Experiment comparator</h2><div class="row"><input id="comparisonId" placeholder="comparison id"><button onclick="loadComparison()">Load comparison</button></div><div id="comparisonPanel" class="muted">Enter a comparison id to inspect its metrics.</div></section>
+<section id="xray"><h2>Project X-ray</h2><div class="row"><input id="xrayProjectId" aria-label="Project id for X-ray" placeholder="project id"><button onclick="loadXray()">Load X-ray</button></div><div id="xrayPanel" class="muted">Parser coverage and key symbols for the pinned snapshot. Coverage is not a proof of semantic understanding.</div></section>
+<section id="dag"><h2>Task DAG</h2><div id="dagPanel" class="muted">Load a run to see planned steps and recorded state transitions.</div></section>
+<section id="trace"><h2>Session trace (searchable)</h2><div class="row"><input id="traceFilter" aria-label="Filter session events" placeholder="filter events" oninput="renderTrace()"><button onclick="loadTrace()">Reload trace</button></div><div id="tracePanel" class="muted">Load a run to see its durable session/event record.</div></section>
+<section id="report"><h2>Project report</h2><div class="row"><input id="reportProjectId" aria-label="Project id for report" placeholder="project id"><button onclick="loadProjectReport()">Build report</button></div><div id="reportPanel" class="muted">A read-only, exportable report built from stored records.</div></section>
+<section><h2>Research matrix (claim → code → obligation)</h2><div class="row"><input id="r2iProjectId" aria-label="Project id for R2I graph" placeholder="project id"><button onclick="loadR2IGraph()">Load R2I graph</button></div><div id="r2iGraphPanel" class="muted">Enter a project id to inspect claim-to-code-to-obligation links. This is a read-only derived view; a mapping status is not a proof.</div></section>
+<section><h2>Experiment comparator</h2><div class="row"><input id="comparisonId" aria-label="Comparison id" placeholder="comparison id"><button onclick="loadComparison()">Load comparison</button></div><div id="comparisonPanel" class="muted">Enter a comparison id to inspect its metrics.</div></section>
 <section><h2>Health</h2><pre id="health">loading…</pre></section>
 <section><h2>Projects / workspaces</h2><button onclick="refresh()">Refresh</button><pre id="projects"></pre></section>
-<section><h2>Tasks</h2><div class="row"><input id="taskId" placeholder="task id"><button onclick="loadTask()">Load</button></div><pre id="task"></pre></section>
+<section><h2>Tasks</h2><div class="row"><input id="taskId" aria-label="Task id" placeholder="task id"><button onclick="loadTask()">Load</button></div><pre id="task"></pre></section>
 <section><h2>Approvals</h2><div id="approvals" class="muted">Select a task to inspect its approvals.</div><pre id="approvalStatus" class="muted"></pre></section>
-<section><h2>Live events (durable cursor)</h2><div class="row"><input id="after" value="0" placeholder="after seq"><button onclick="connect()">Connect</button><button onclick="disconnect()">Disconnect</button></div><pre id="events"></pre></section>
-<section><h2>Source diff</h2><div class="row"><input id="diffRunId" placeholder="run id"><button onclick="loadDiff()">Load captured patch</button></div><div class="muted">The exact patch stored by the worker, with its SHA-256 and file list. Text is rendered literally, never as HTML.</div><pre id="diff"></pre></section>
-<section><h2>Verification / evidence</h2><div class="row"><input id="runId" placeholder="run id"><button onclick="loadEvidence()">Load</button></div><div class="muted">Shows the verification report and the exported evidence bundle manifest/hashes.</div><pre id="evidence"></pre></section>
-<section><h2>Task controls</h2><div class="row"><input id="controlTaskId" placeholder="task id"><button onclick="taskControl('pause')">Pause</button><button onclick="taskControl('resume')">Resume</button><button onclick="taskControl('cancel')">Cancel</button></div><pre id="controlStatus" class="muted">No control action requested.</pre></section>
+<section><h2>Live events (durable cursor)</h2><div class="row"><input id="after" aria-label="Event sequence cursor" value="0" placeholder="after seq"><button onclick="connect()">Connect</button><button onclick="disconnect()">Disconnect</button></div><pre id="events"></pre></section>
+<section><h2>Source diff</h2><div class="row"><input id="diffRunId" aria-label="Run id for diff" placeholder="run id"><button onclick="loadDiff()">Load captured patch</button></div><div class="muted">The exact patch stored by the worker, with its SHA-256 and file list. Text is rendered literally, never as HTML.</div><pre id="diff"></pre></section>
+<section><h2>Verification / evidence</h2><div class="row"><input id="runId" aria-label="Run id for evidence" placeholder="run id"><button onclick="loadEvidence()">Load</button></div><div class="muted">Shows the verification report and the exported evidence bundle manifest/hashes.</div><pre id="evidence"></pre></section>
+<section><h2>Task controls</h2><div class="row"><input id="controlTaskId" aria-label="Task id for controls" placeholder="task id"><button onclick="taskControl('pause')">Pause</button><button onclick="taskControl('resume')">Resume</button><button onclick="taskControl('cancel')">Cancel</button></div><pre id="controlStatus" class="muted">No control action requested.</pre></section>
 </main>
 <script>
 const get = async p => {
@@ -149,7 +157,96 @@ async function loadRun() {
   renderPlanApprovals(planRes);
   renderTimeline(timelineRes);
   renderEvidenceGraph(evidenceRes);
+  loadDag(id);
+  loadTrace(id);
   refreshProjectsSummary();
+}
+
+// WP7: keyboard-first navigation. 1-9 focus the numbered panel; / focuses search.
+document.addEventListener('keydown', function (e) {
+  const tag = (e.target && e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  if (e.key >= '1' && e.key <= '9') {
+    const sections = document.querySelectorAll('main section');
+    const target = sections[Number(e.key) - 1];
+    if (target) { target.scrollIntoView({block: 'start'}); target.setAttribute('tabindex', '-1'); target.focus(); }
+  } else if (e.key === '/') {
+    e.preventDefault();
+    const box = document.getElementById('traceFilter');
+    if (box) box.focus();
+  }
+});
+
+let currentTrace = [];
+async function loadXray() {
+  const id = document.getElementById('xrayProjectId').value.trim();
+  const out = document.getElementById('xrayPanel');
+  if (!id) return;
+  out.textContent = 'loading…';
+  const res = await tryGet('/projects/' + encodeURIComponent(id) + '/xray');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'X-ray not available: ' + res.error, 'muted')); return; }
+  const v = res.value || {};
+  out.appendChild(kv('snapshot', v.snapshot_id || 'none'));
+  const coverage = v.coverage || {};
+  for (const [language, values] of Object.entries(coverage)) {
+    out.appendChild(el('div', language + ': ' + Object.entries(values).map(([k, n]) => k + '=' + n).join(', ')));
+  }
+  const symbols = Array.isArray(v.symbols) ? v.symbols : [];
+  out.appendChild(el('div', symbols.length + ' key symbols', 'muted'));
+  symbols.slice(0, 20).forEach(s => out.appendChild(el('div', s.name + ' — ' + (s.location || ''))));
+  out.appendChild(el('div', v.note || '', 'muted'));
+}
+
+async function loadDag(runId) {
+  const id = runId || document.getElementById('runLoadId').value.trim();
+  const out = document.getElementById('dagPanel');
+  if (!id) return;
+  const res = await tryGet('/runs/' + encodeURIComponent(id) + '/dag');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'DAG not available: ' + res.error, 'muted')); return; }
+  const v = res.value || {};
+  out.appendChild(kv('state', v.state));
+  (v.nodes || []).forEach(n => out.appendChild(el('div', n.type + ': ' + n.label + ' [' + n.status + ']')));
+  out.appendChild(el('div', 'recorded transitions: ' + ((v.transitions || []).length), 'muted'));
+}
+
+async function loadTrace(runId) {
+  const id = runId || document.getElementById('runLoadId').value.trim();
+  const out = document.getElementById('tracePanel');
+  if (!id) return;
+  const res = await tryGet('/runs/' + encodeURIComponent(id) + '/sessions');
+  if (!res.ok) { clear(out); out.appendChild(el('div', 'Trace not available: ' + res.error, 'muted')); return; }
+  currentTrace = (res.value && res.value.events) || [];
+  renderTrace();
+}
+function renderTrace() {
+  const out = document.getElementById('tracePanel');
+  const needle = (document.getElementById('traceFilter').value || '').toLowerCase();
+  clear(out);
+  const rows = currentTrace.filter(e => !needle || JSON.stringify(e).toLowerCase().includes(needle));
+  out.appendChild(el('div', rows.length + ' event(s)' + (needle ? ' (filtered)' : ''), 'muted'));
+  rows.slice(0, 100).forEach(e => out.appendChild(el('div', e.kind + ' — ' + fmt(e.payload))));
+  if (!rows.length) out.appendChild(el('div', '(no matching session events)', 'muted'));
+}
+
+async function loadProjectReport() {
+  const id = document.getElementById('reportProjectId').value.trim();
+  const out = document.getElementById('reportPanel');
+  if (!id) return;
+  out.textContent = 'loading…';
+  const res = await tryGet('/projects/' + encodeURIComponent(id) + '/report');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'Report not available: ' + res.error, 'muted')); return; }
+  const v = res.value || {};
+  out.appendChild(kv('project', (v.project || {}).name));
+  out.appendChild(kv('repositories', (v.repositories || []).length));
+  out.appendChild(kv('snapshots', (v.snapshots || []).length));
+  out.appendChild(kv('runs', v.runs));
+  out.appendChild(list('verification decisions', v.verification_decisions));
+  out.appendChild(kv('canonical sha256', v.canonical_sha256));
+  const pre = el('pre', JSON.stringify(v, null, 2));
+  out.appendChild(pre);
 }
 
 function renderWorkspace(res) {
@@ -277,6 +374,30 @@ function renderTimeline(res) {
       'Showing first ' + shown.length + ' of ' + items.length + ' items (capped at ' +
       MAX_TIMELINE_ITEMS + ').', 'muted'));
   }
+}
+
+async function loadR2IGraph() {
+  const id = document.getElementById('r2iProjectId').value.trim();
+  const out = document.getElementById('r2iGraphPanel');
+  if (!id) return;
+  out.textContent = 'loading…';
+  const res = await tryGet('/projects/' + encodeURIComponent(id) + '/r2i-graph');
+  clear(out);
+  if (!res.ok) { out.appendChild(el('div', 'R2I graph not available: ' + res.error, 'muted')); return; }
+  const g = res.value || {};
+  const counts = g.counts || {};
+  out.appendChild(el('div', 'claims: ' + (counts.claims || 0) + ' · mappings: ' +
+    (counts.mappings || 0) + ' · obligations: ' + (counts.obligations || 0)));
+  out.appendChild(el('div', 'snapshot: ' + (g.snapshot_id || 'none'), 'muted'));
+  const edges = Array.isArray(g.edges) ? g.edges : [];
+  if (!edges.length) out.appendChild(el('div', '(no claim-to-code or claim-to-obligation edges recorded)', 'muted'));
+  edges.forEach(e => {
+    const row = el('div');
+    row.appendChild(el('span', e.from + ' → ' + e.to));
+    row.appendChild(el('span', ' [' + (e.kind || 'link') + (e.status ? ':' + e.status : '') + ']', 'muted'));
+    out.appendChild(row);
+  });
+  out.appendChild(el('div', g.note || '', 'muted'));
 }
 
 const TIER_NAMES = ['METHOD_CODE_FOUND', 'METHOD_IMPLEMENTED',

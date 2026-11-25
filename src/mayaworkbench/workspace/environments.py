@@ -346,7 +346,12 @@ def build_plan(
     base = Path(info.root)
 
     steps: list[ProvisionStep] = [
-        ProvisionStep("verify-runtime", ("maya", "runner", "profiles", "--json")),
+        # Use the module entry point, not an assumed console-script on PATH:
+        # the editable install is mandatory in this project, the binary is not.
+        ProvisionStep(
+            "verify-runtime",
+            ("python", "-m", "mayaworkbench.cli.main", "--json", "runner", "profiles"),
+        ),
     ]
     notes: list[str] = []
 

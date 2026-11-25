@@ -37,7 +37,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from mayaworkbench.errors import PolicyError
 from mayaworkbench.workspace.runner import CommandRunner
@@ -648,9 +648,146 @@ __all__ = [
     "SessionCapability",
     "SessionCommand",
     "SessionEvent",
+    "ProcessSessionBackend",
+    "OciExecSessionBackend",
+    "accumulate_session_events",
     "SessionManager",
     "SessionRef",
     "UnavailableSessionBackend",
     "env_digest",
     "kill_process_group",
 ]
+
+
+@dataclass
+class _ProcessHandle:
+    process: subprocess.Popen
+    master_fd: int | None = None
+    cwd: str = ""
+    container_name: str | None = None
+    backend: Any | None = None
+
+
+class OciExecSessionBackend:
+    """A task-owned long-lived OCI container with ``podman exec`` sessions.
+
+    The keepalive container is created with the exact same isolation flags,
+    sanitized mounts and resource limits as one-shot task commands. The exec'd
+    session inherits the container's cgroup, network namespace and mounts. A
+    session stop kills the whole container, so no descendant survives — there
+    is no host ``Popen`` and no host fallback.
+    """
+
+    backend_id = "rootless-container-session"
+
+    def __init__(self, backend: Any, runtime: Any):
+        self.backend = backend
+        self.runtime = runtime
+        self._tool, _ = backend._detect_tool()
+
+    def supports_pty(self) -> bool:
+        # ``podman exec -t`` allocates a TTY in the container, but the local
+        # pty fd plumbing would then be a second, host-owned PTY. Refuse PTY
+        # explicitly rather than pretend the boundary is equivalent.
+        return False
+
+    def open(
+        self, argv: list[str], *, use_pty: bool, timeout_seconds: int
+    ) -> _ProcessHandle:
+        if use_pty:
+            raise PolicyError(
+                "PTY sessions are not available in the ROOTLESS_CONTAINER profile; "
+                "use a piped session (the tool is unavailable, not a host fallback)"
+            )
+        if not self._tool:
+            raise PolicyError("the rootless OCI runtime is unavailable for sessions")
+        # The inner argv must pass the same allowlist as run_command. Validation
+        # never resolves to a host path: the argv is executed inside the container.
+        validator = CommandRunner(
+            self.runtime.overlay.parent,
+            policy=self.backend.policy,
+            run_home=self.backend.run_home,
+        )
+        validated = validator.validate(argv, timeout_seconds=timeout_seconds)
+        session_id = "maya-ses-" + uuid.uuid4().hex[:16]
+        keepalive_argv = self.backend._oci_argv(self.runtime, ["sleep", "infinity"])
+        # Replace the one-shot container name with a session-specific one and
+        # make the container detached so it stays alive for exec.
+        names = [
+            i for i, flag in enumerate(keepalive_argv) if flag == "--name"
+        ]
+        for i in names:
+            keepalive_argv[i + 1] = session_id
+        detached = [keepalive_argv[0], "run", "-d", *keepalive_argv[2:]]
+        start = self._run_oci(detached, timeout=timeout_seconds)
+        if start.exit_code != 0:
+            raise PolicyError(
+                f"the session container could not be started: {(start.stderr or start.stdout).strip()[:300]}"
+            )
+        child = [
+            self._tool, "exec", "-i", session_id, *validated,
+        ]
+        process = subprocess.Popen(
+            child,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+        )
+        return _ProcessHandle(
+            process=process,
+            cwd="/work",
+            container_name=session_id,
+            backend=self.backend,
+        )
+
+    def _run_oci(self, argv: list[str], *, timeout: int) -> CommandResult:
+        """Run a trusted OCI client argv through the bounded host runner."""
+        from mayaworkbench.workspace.backends import CommandPolicy
+
+        policy = CommandPolicy(
+            profile="CPU_SMOKE",
+            trust_profile="LOCAL_TRUSTED",
+            allow_absolute_args=True,
+            network_policy="ALLOW_WITH_APPROVAL",
+            dependency_policy="DENY",
+            allowed_executables=(Path(argv[0]).name,),
+            max_runtime_seconds=max(timeout, 60),
+        )
+        runner = CommandRunner(self.backend.run_home, policy=policy, run_home=self.backend.run_home)
+        return runner.run(argv, timeout_seconds=timeout)
+
+    def stop(self, handle: _ProcessHandle, *, reason: str) -> None:
+        del reason
+        if handle.process.poll() is None:
+            try:
+                SessionManager._kill_pid(handle.process.pid)
+                handle.process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, ProcessLookupError):  # pragma: no cover
+                try:
+                    handle.process.kill()
+                except OSError:
+                    pass
+        # Killing the container kills every in-container descendant of the
+        # exec'd process. This is the session's authoritative teardown.
+        if handle.container_name:
+            try:
+                subprocess.run(
+                    [self._tool, "rm", "-f", handle.container_name],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):  # pragma: no cover
+                pass
+
+
+ProcessSessionBackend = SessionBackend  # additive compatibility alias
+
+
+def accumulate_session_events(events) -> str:
+    """Concatenate ordered session event chunks (chunk framing contract)."""
+    return "".join(event["data"] for event in events)

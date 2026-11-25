@@ -63,6 +63,12 @@ except ImportError:  # pragma: no cover - exercised only on Windows
     resource = None  # type: ignore[assignment]
 
 DEFAULT_EXECUTABLES = ("python", "python3", "pytest", "ruff", "mypy")
+#: Closed allowlist used ONLY by the approval-gated provisioning install runner.
+INSTALL_EXECUTABLES = (
+    "python", "python3", "pip", "pip3", "uv", "poetry",
+    "npm", "pnpm", "yarn", "cargo", "go", "mvn", "gradle",
+    "cmake", "make", "ctest", "maya",
+)
 MAX_ARGS = 64
 MAX_ARG_LENGTH = 4096
 MAX_TOTAL_ARG_BYTES = 16_384
@@ -167,6 +173,11 @@ class CommandPolicy:
     #: Only an isolated-runtime backend may enable this, and only for the
     #: trusted OCI client argv it constructs. Project/task argv never uses it.
     allow_absolute_args: bool = False
+    #: ONLY the approval-gated provisioning runner may set this. The normal
+    #: task command policy never permits dependency installation commands.
+    allow_dependency_install: bool = False
+    #: Wall-clock supervisor deadline (distinct from CPU time and core quota).
+    wall_time_seconds: int | None = None
     allowed_executables: tuple[str, ...] = DEFAULT_EXECUTABLES
     max_runtime_seconds: int = 1800
     max_output_bytes: int = 200_000
@@ -204,7 +215,17 @@ class CommandPolicy:
             max_runtime_seconds=constraints.max_runtime_seconds,
             max_output_bytes=constraints.max_output_bytes,
             max_processes=constraints.max_processes,
+            cpu_time_seconds=getattr(constraints, "cpu_time_seconds", None),
+            wall_time_seconds=constraints.max_runtime_seconds,
         )
+
+    @property
+    def effective_cpu_time_seconds(self) -> int | None:
+        return self.cpu_time_seconds
+
+    @property
+    def cpu_cores(self) -> float:
+        return getattr(self, "cpu_quota", 1.0)
 
     def describe(self) -> dict:
         return {
@@ -222,6 +243,7 @@ class CommandPolicy:
             "max_file_size_mb": self.max_file_size_mb,
             "cpu_time_seconds": self.cpu_time_seconds,
             "cpu_quota": self.cpu_quota,
+            "wall_time_seconds": self.wall_time_seconds or self.max_runtime_seconds,
             "max_arg_length": self.max_arg_length,
             "allow_multiline_args": self.allow_multiline_args,
             "shell": False,
@@ -250,6 +272,11 @@ class CommandResult:
     cleanup_succeeded: bool = True
     env_names: list[str] = field(default_factory=list)
     cwd: str = ""
+    #: Distinct budget dimensions (P1-01): a CPU-time budget is not a core
+    #: quota and neither is a wall-clock deadline; each is recorded separately.
+    cpu_time_seconds: int | None = None
+    cpu_cores: float | None = None
+    wall_time_seconds: int | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -848,6 +875,9 @@ class CommandRunner:
             cleanup_succeeded=cleanup_succeeded,
             env_names=sorted(env),
             cwd=str(self.workspace),
+            cpu_time_seconds=self.policy.effective_cpu_time_seconds,
+            cpu_cores=getattr(self.policy, "cpu_quota", None),
+            wall_time_seconds=timeout_seconds,
         )
 
     def _blocked_result(
@@ -880,6 +910,9 @@ class CommandRunner:
             limits=blocked_limits,
             env_names=sorted(env),
             cwd=str(self.workspace),
+            cpu_time_seconds=self.policy.effective_cpu_time_seconds,
+            cpu_cores=getattr(self.policy, "cpu_quota", None),
+            wall_time_seconds=self.policy.wall_time_seconds or self.policy.max_runtime_seconds,
         )
 
     # ------------------------------------------------------------- lifecycle

@@ -1,0 +1,128 @@
+{
+  "schema_version": "r2i-gold/1.1",
+  "is_seed_corpus": true,
+  "split": "development",
+  "provenance": "Internal development seed corpus, authored by the maintainers. NOT expert-labelled, NOT held-out, NOT an external benchmark.",
+  "cases": [
+    {
+      "case_id": "dev-softmax-stability",
+      "title": "Numerically stable softmax",
+      "paper_excerpt": "We compute the softmax in a numerically stable way by subtracting the row maximum before exponentiation and dividing by the sum of exponentials. Rows must sum to one.",
+      "claims": [
+        {"id": "d1-c1", "statement_fragments": ["subtracting the row maximum before exponentiation", "dividing by the sum of exponentials"], "kind": "PAPER_METHOD", "source_quote": "subtracting the row maximum before exponentiation and dividing by the sum of exponentials", "required": true},
+        {"id": "d1-c2", "statement_fragments": ["Rows must sum to one"], "kind": "VALIDATION_CLAIM", "source_quote": "Rows must sum to one.", "required": true}
+      ],
+      "mappings": [
+        {"claim_id": "d1-c1", "expected_status": "PRESENT", "relevant_paths": ["attention.py"], "uncertain": false},
+        {"claim_id": "d1-c2", "expected_status": "PRESENT", "relevant_paths": ["tests/test_math.py"], "uncertain": false}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-gradient-clipping",
+      "title": "Gradient norm clipping",
+      "paper_excerpt": "Gradients are clipped by global norm to a threshold of 1.0 before the optimizer step. We report the pre-clipping norm.",
+      "claims": [
+        {"id": "d2-c1", "statement_fragments": ["Gradients are clipped by global norm to a threshold of 1.0"], "kind": "PAPER_METHOD", "source_quote": "Gradients are clipped by global norm to a threshold of 1.0 before the optimizer step.", "required": true},
+        {"id": "d2-c2", "statement_fragments": ["We report the pre-clipping norm"], "kind": "PAPER_RESULT", "source_quote": "We report the pre-clipping norm.", "required": false}
+      ],
+      "mappings": [
+        {"claim_id": "d2-c1", "expected_status": "PRESENT", "relevant_paths": ["train.py"], "uncertain": false},
+        {"claim_id": "d2-c2", "expected_status": "ABSENT", "relevant_paths": [], "uncertain": true}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-layer-norm",
+      "title": "Layer normalization placement",
+      "paper_excerpt": "We apply layer normalization before each sublayer (pre-norm), not after. The residual stream is added before normalization.",
+      "claims": [
+        {"id": "d3-c1", "statement_fragments": ["apply layer normalization before each sublayer", "not after"], "kind": "PAPER_METHOD", "source_quote": "We apply layer normalization before each sublayer (pre-norm), not after.", "required": true},
+        {"id": "d3-c2", "statement_fragments": ["The residual stream is added before normalization"], "kind": "PAPER_METHOD", "source_quote": "The residual stream is added before normalization.", "required": true}
+      ],
+      "mappings": [
+        {"claim_id": "d3-c1", "expected_status": "PRESENT", "relevant_paths": ["model.py"], "uncertain": false},
+        {"claim_id": "d3-c2", "expected_status": "PARTIAL", "relevant_paths": ["model.py"], "uncertain": true}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-mixed-precision",
+      "title": "Mixed precision with loss scaling",
+      "paper_excerpt": "Training uses FP16 computation with dynamic loss scaling. Gradients are unscaled before clipping.",
+      "claims": [
+        {"id": "d4-c1", "statement_fragments": ["FP16 computation with dynamic loss scaling"], "kind": "PAPER_METHOD", "source_quote": "Training uses FP16 computation with dynamic loss scaling.", "required": true},
+        {"id": "d4-c2", "statement_fragments": ["Gradients are unscaled before clipping"], "kind": "PAPER_METHOD", "source_quote": "Gradients are unscaled before clipping.", "required": true}
+      ],
+      "mappings": [
+        {"claim_id": "d4-c1", "expected_status": "PRESENT", "relevant_paths": ["trainer.py"], "uncertain": false},
+        {"claim_id": "d4-c2", "expected_status": "ABSENT", "relevant_paths": [], "uncertain": true}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-beam-search",
+      "title": "Length-normalized beam search",
+      "paper_excerpt": "We decode with beam search of width 5 and normalize scores by sequence length. A coverage penalty is applied.",
+      "claims": [
+        {"id": "d5-c1", "statement_fragments": ["beam search of width 5", "normalize scores by sequence length"], "kind": "PAPER_METHOD", "source_quote": "We decode with beam search of width 5 and normalize scores by sequence length.", "required": true},
+        {"id": "d5-c2", "statement_fragments": ["A coverage penalty is applied"], "kind": "PAPER_METHOD", "source_quote": "A coverage penalty is applied.", "required": true}
+      ],
+      "mappings": [
+        {"claim_id": "d5-c1", "expected_status": "PRESENT", "relevant_paths": ["decode.py"], "uncertain": false},
+        {"claim_id": "d5-c2", "expected_status": "NOT_CHECKED", "relevant_paths": [], "uncertain": true}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-dropout-mask",
+      "title": "Dropout applied to attention weights",
+      "paper_excerpt": "Dropout with probability 0.1 is applied to the attention weights after softmax. At evaluation time dropout is disabled.",
+      "claims": [
+        {"id": "d6-c1", "statement_fragments": ["Dropout with probability 0.1", "applied to the attention weights after softmax"], "kind": "PAPER_METHOD", "source_quote": "Dropout with probability 0.1 is applied to the attention weights after softmax.", "required": true},
+        {"id": "d6-c2", "statement_fragments": ["At evaluation time dropout is disabled"], "kind": "VALIDATION_CLAIM", "source_quote": "At evaluation time dropout is disabled.", "required": true}
+      ],
+      "mappings": [
+        {"claim_id": "d6-c1", "expected_status": "PRESENT", "relevant_paths": ["attention.py"], "uncertain": false},
+        {"claim_id": "d6-c2", "expected_status": "PRESENT", "relevant_paths": ["model.py"], "uncertain": false}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-checkpoint-averaging",
+      "title": "Checkpoint averaging",
+      "paper_excerpt": "We average the last five checkpoints uniformly to reduce variance. The averaged model is evaluated on the validation set.",
+      "claims": [
+        {"id": "d7-c1", "statement_fragments": ["average the last five checkpoints uniformly"], "kind": "PAPER_METHOD", "source_quote": "We average the last five checkpoints uniformly to reduce variance.", "required": true},
+        {"id": "d7-c2", "statement_fragments": ["evaluated on the validation set"], "kind": "VALIDATION_CLAIM", "source_quote": "The averaged model is evaluated on the validation set.", "required": true}
+      ],
+      "mappings": [
+        {"claim_id": "d7-c1", "expected_status": "ABSENT", "relevant_paths": [], "uncertain": false},
+        {"claim_id": "d7-c2", "expected_status": "PRESENT", "relevant_paths": ["evaluate.py"], "uncertain": false}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    },
+    {
+      "case_id": "dev-temperature-schedule",
+      "title": "Cosine learning-rate schedule",
+      "paper_excerpt": "The learning rate follows a cosine decay with a linear warmup of 2000 steps. No restarts are used.",
+      "claims": [
+        {"id": "d8-c1", "statement_fragments": ["cosine decay with a linear warmup of 2000 steps"], "kind": "PAPER_METHOD", "source_quote": "The learning rate follows a cosine decay with a linear warmup of 2000 steps.", "required": true},
+        {"id": "d8-c2", "statement_fragments": ["No restarts are used"], "kind": "PAPER_METHOD", "source_quote": "No restarts are used.", "required": false}
+      ],
+      "mappings": [
+        {"claim_id": "d8-c1", "expected_status": "PRESENT", "relevant_paths": ["scheduler.py"], "uncertain": false},
+        {"claim_id": "d8-c2", "expected_status": "PRESENT", "relevant_paths": ["scheduler.py"], "uncertain": false}
+      ],
+      "provenance": "internal-development-seed",
+      "is_seed_corpus": true
+    }
+  ]
+}

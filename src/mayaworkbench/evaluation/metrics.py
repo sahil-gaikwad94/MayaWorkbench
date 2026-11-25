@@ -17,6 +17,23 @@ from typing import Any
 ACCEPTED_DECISIONS = frozenset({"ACCEPTED", "COMPLETED_WITH_LIMITATIONS"})
 
 
+def wilson_interval(successes: int, total: int, *, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for a binomial rate.
+
+    A single blended percentage is not a reportable evaluation result. Every
+    rate in the scorecard carries this interval (rounded to four decimals); a
+    zero denominator yields ``(0.0, 0.0)`` with no fabricated confidence.
+    """
+    if total <= 0:
+        return 0.0, 0.0
+    p = successes / total
+    z2 = z * z
+    denom = 1.0 + z2 / total
+    centre = (p + z2 / (2 * total)) / denom
+    half = (z / denom) * ((p * (1 - p) / total + z2 / (4 * total * total)) ** 0.5)
+    return round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)
+
+
 @dataclass(frozen=True)
 class TaskOutcome:
     task_id: str

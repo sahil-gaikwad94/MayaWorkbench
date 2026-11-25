@@ -31,6 +31,7 @@ from mayaworkbench.app.container import Services
 from mayaworkbench.config import AppPaths, load_settings, save_settings
 from mayaworkbench.domain.enums import CriterionStatus, TaskDecision, TaskType
 from mayaworkbench.errors import BudgetError, UsageError
+from mayaworkbench.evaluation.metrics import wilson_interval
 from mayaworkbench.evaluation.tasks import EvalTask, corpus_hash
 from mayaworkbench.models.base import (
     ModelCapabilities,
@@ -190,6 +191,10 @@ class TaskResult(BaseModel):
     tool_calls: int = 0
     model_tokens: int = 0
     cost_usd: float = 0.0
+    latency_ms: int = 0
+    provider_profile: str | None = None
+    control_mode: bool = False
+    trace: dict[str, Any] = Field(default_factory=dict)
     reason: str | None = None
     run_id: str | None = None
     verification_id: str | None = None
@@ -208,6 +213,10 @@ class EvalFlags(BaseModel):
     live_flag_present: bool = False
     key_present: bool = False
     gate_reasons: list[str] = Field(default_factory=list)
+    provider_profile: str | None = None
+    model_id: str | None = None
+    harness_version: str = "eval-harness/2.0"
+    control_mode: bool = False
 
 
 class EvalCounts(BaseModel):
@@ -237,6 +246,11 @@ class EvalMetrics(BaseModel):
     median_model_tokens: float = 0.0
     median_cost_usd: float = 0.0
     total_spend_usd: float = 0.0
+    #: Wilson 95% intervals -- a rate without an interval is not reportable.
+    verified_completion_rate_ci: list[float] = Field(default_factory=lambda: [0.0, 0.0])
+    anti_gaming_catch_rate_ci: list[float] = Field(default_factory=lambda: [0.0, 0.0])
+    median_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
 
 
 class EvalScorecard(BaseModel):
@@ -251,6 +265,7 @@ class EvalScorecard(BaseModel):
     metrics: EvalMetrics
     skip_breakdown: dict[str, int] = Field(default_factory=dict)
     failure_breakdown: dict[str, int] = Field(default_factory=dict)
+    family_breakdown: dict[str, dict[str, float]] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     budget_exceeded: bool = False
 
@@ -586,7 +601,13 @@ def _run_one(
     ledger: _BudgetLedger,
     task_cap: float | None,
     with_paper: bool,
+    control_mode: bool = False,
+    profile_id: str | None = None,
+    trace: bool = False,
 ) -> TaskResult:
+    import time
+
+    started_clock = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="maya-eval-") as tmp:
         root = Path(tmp)
         home = root / "home"
@@ -615,8 +636,13 @@ def _run_one(
                 snapshot = services.repository_service.create_snapshot(
                     attached.repository
                 ).snapshot
-                services.indexer.index(snapshot.id)
-                if with_paper:
+                # Control mode disables Maya's repository-context advantage:
+                # the same model/task runs without the symbol index or the
+                # orientation the workbench normally injects. Verification and
+                # approvals stay backend-owned in both arms.
+                if not control_mode:
+                    services.indexer.index(snapshot.id)
+                if with_paper and not control_mode:
                     paper_path = root / "paper.md"
                     _write(paper_path, _PAPER_MD)
                     services.ingestion.ingest_file(project, paper_path)
@@ -696,6 +722,20 @@ def _run_one(
                     tool_calls=int(run.tool_call_count),
                     model_tokens=int(run.model_tokens),
                     cost_usd=float(run.model_cost_usd),
+                    latency_ms=int((time.monotonic() - started_clock) * 1000),
+                    provider_profile=profile_id,
+                    control_mode=control_mode,
+                    trace=(
+                        {
+                            "task_id": task.id,
+                            "model_calls": int(run.model_tokens) > 0,
+                            "tool_calls": int(run.tool_call_count),
+                            "decision": report.decision.value,
+                            "evidence_missing": missing,
+                            "maya_context_disabled": control_mode,
+                        }
+                        if trace else {}
+                    ),
                     run_id=run.id,
                     verification_id=report.verification_id,
                 )
@@ -775,6 +815,7 @@ def build_scorecard(
         anti_gaming_caught=len(caught),
         budget_exceeded=sum(1 for item in skipped if "BUDGET_EXCEEDED" in (item.reason or "")),
     )
+    latencies = sorted(float(item.latency_ms) for item in executed)
     metrics = EvalMetrics(
         verified_completion_rate=verified_rate,
         unsupported_claim_rate=unsupported_rate,
@@ -784,7 +825,32 @@ def build_scorecard(
         median_model_tokens=_median([float(item.model_tokens) for item in executed], "median_model_tokens"),
         median_cost_usd=_median([float(item.cost_usd) for item in executed], "median_cost_usd"),
         total_spend_usd=round(sum(float(item.cost_usd) for item in rows), 4),
+        verified_completion_rate_ci=list(wilson_interval(len(verified), len(executed))),
+        anti_gaming_catch_rate_ci=list(wilson_interval(len(caught), len(anti))),
+        median_latency_ms=_median(latencies, "median_latency_ms"),
+        p95_latency_ms=round(latencies[max(0, math.ceil(0.95 * len(latencies)) - 1)], 2)
+        if latencies else 0.0,
     )
+    # Per-family rates, never one blended number pretending to describe all work.
+    family_breakdown: dict[str, dict[str, float]] = {}
+    families = sorted({item.family for item in rows})
+    for family in families:
+        group = [item for item in rows if item.family == family]
+        group_executed = [item for item in group if item.status == "EXECUTED"]
+        group_verified = [
+            item for item in group_executed
+            if item.decision in ACCEPTED_DECISIONS and item.evidence_complete
+        ]
+        lo, hi = wilson_interval(len(group_verified), len(group_executed))
+        family_breakdown[family] = {
+            "tasks": float(len(group)),
+            "executed": float(len(group_executed)),
+            "verified": float(len(group_verified)),
+            "verified_rate": round(len(group_verified) / len(group_executed), 4)
+            if group_executed else 0.0,
+            "ci_low": lo,
+            "ci_high": hi,
+        }
     skip_breakdown = dict(
         sorted(Counter(item.reason or "unspecified" for item in skipped).items())
     )
@@ -800,6 +866,7 @@ def build_scorecard(
         metrics=metrics,
         skip_breakdown=skip_breakdown,
         failure_breakdown=failure_breakdown,
+        family_breakdown=family_breakdown,
         notes=notes,
         budget_exceeded=counts.budget_exceeded > 0,
     )
@@ -812,6 +879,9 @@ def run_eval(
     provider: Any = None,
     max_spend_usd: float | None = None,
     task_limit: int | None = None,
+    control_mode: bool = False,
+    profile: Any = None,
+    trace: bool = False,
 ) -> EvalScorecard:
     """Run a labelled corpus through the real pipeline and score its evidence."""
     tasks = list(corpus)
@@ -829,6 +899,10 @@ def run_eval(
         task_limit=task_limit,
         live_flag_present=_flag_enabled(),
         key_present=_key_present(),
+        provider_profile=profile.id if profile is not None else None,
+        model_id=profile.model_id if profile is not None else None,
+        harness_version=profile.harness_version if profile is not None else "eval-harness/2.0",
+        control_mode=control_mode,
     )
     fingerprint = corpus_hash(tasks)
     selected = tasks[:task_limit] if task_limit is not None else tasks
@@ -870,6 +944,9 @@ def run_eval(
                     ledger=ledger,
                     task_cap=task_cap,
                     with_paper="PAPER_MD" in task.fixture_ref,
+                    control_mode=control_mode,
+                    profile_id=profile.id if profile is not None else None,
+                    trace=trace,
                 )
             )
         except _BudgetExceeded as exc:
@@ -880,6 +957,94 @@ def run_eval(
             )
 
     return build_scorecard(corpus_fingerprint=fingerprint, flags=flags, results=results)
+
+
+# ---------------------------------------------------------------- comparison
+class ComparisonReport(BaseModel):
+    """Two or more runs of the same corpus under distinct profiles/modes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: str = "eval-comparison/1.0"
+    corpus_hash: str
+    arms: dict[str, EvalScorecard]
+    deltas: dict[str, dict[str, float]]
+    notes: list[str] = Field(default_factory=list)
+
+
+def run_comparison(
+    corpus: Sequence[EvalTask],
+    *,
+    profiles: Sequence[Any] = (),
+    control_mode: bool = False,
+    max_spend_usd: float | None = None,
+    task_limit: int | None = None,
+    provider: Any = None,
+    trace: bool = False,
+) -> ComparisonReport:
+    """Run the same corpus with Maya and with its context disabled.
+
+    A model-only control plus at least one assisted arm is the only way to
+    attribute a difference to the workbench rather than to the model. All arms
+    use the same model id, decoding settings, token budget and tool schema; the
+    assisted arm is the default and the control disables repository indexing.
+    """
+    arms_spec: list[tuple[str, bool, Any]] = []
+    chosen = list(profiles)
+    if not chosen:
+        from mayaworkbench.evaluation.providers import default_profiles
+
+        chosen = list(default_profiles())
+    for item in chosen:
+        arms_spec.append((item.id, False, item))
+        # Every comparison always includes the same-model control arm; that is
+        # the only way to attribute a difference to the workbench.
+        arms_spec.append((item.id + "-control", True, item))
+    arms: dict[str, EvalScorecard] = {}
+    for name, is_control, profile in arms_spec:
+        arms[name] = run_eval(
+            corpus, live=False, provider=provider, max_spend_usd=max_spend_usd,
+            task_limit=task_limit, control_mode=is_control, profile=profile,
+            trace=trace,
+        )
+    first = next(iter(arms.values()))
+    deltas: dict[str, dict[str, float]] = {}
+    for name, card in arms.items():
+        if name == next(iter(arms)):
+            continue
+        deltas[name] = {
+            "verified_completion_rate_delta": round(
+                card.metrics.verified_completion_rate - first.metrics.verified_completion_rate, 4
+            ),
+            "median_cost_usd_delta": round(
+                card.metrics.median_cost_usd - first.metrics.median_cost_usd, 4
+            ),
+            "median_tool_calls_delta": round(
+                card.metrics.median_tool_calls - first.metrics.median_tool_calls, 4
+            ),
+        }
+    return ComparisonReport(
+        corpus_hash=first.corpus_hash,
+        arms=arms,
+        deltas=deltas,
+        notes=[
+            "Offline scripted arms; no live provider claim is made.",
+            "Control arm disables repository indexing/orientation only; "
+            "approvals and verification stay backend-owned in both arms.",
+        ],
+    )
+
+
+def load_model_safety_corpus() -> list[EvalTask]:
+    """Prompt-injection and connector-response probes (internal seed corpus)."""
+    from importlib.resources import files
+
+    from mayaworkbench.evaluation.tasks import load_corpus
+
+    resource = files("mayaworkbench.evaluation").joinpath("gold/model_safety_seed.json")
+    if not resource.is_file():
+        return []
+    return load_corpus(Path(str(resource)))
 
 
 # ------------------------------------------------------------------- rendering
@@ -893,6 +1058,9 @@ def render_markdown(scorecard: EvalScorecard) -> str:
         f"- corpus hash: `{scorecard.corpus_hash}`",
         f"- internal seed corpus: {'yes' if scorecard.is_seed_corpus else 'no'}",
         f"- mode: {'live' if scorecard.flags.live else 'dry-run (offline, scripted)'}",
+        f"- provider profile: {scorecard.flags.provider_profile or 'unspecified'} "
+        f"(model: {scorecard.flags.model_id or 'unspecified'})",
+        f"- control mode (Maya context disabled): {scorecard.flags.control_mode}",
         f"- spend cap: {scorecard.flags.max_spend_usd} "
         f"(source: {scorecard.flags.max_spend_source})",
         f"- tasks: {counts.tasks} (executed {counts.executed}, skipped {counts.skipped}, "
@@ -902,14 +1070,28 @@ def render_markdown(scorecard: EvalScorecard) -> str:
         "",
         "| metric | value |",
         "| --- | --- |",
-        f"| verified completion rate | {metrics.verified_completion_rate} |",
+        f"| verified completion rate | {metrics.verified_completion_rate} "
+        f"(95% CI {metrics.verified_completion_rate_ci}) |",
         f"| unsupported claim rate | {metrics.unsupported_claim_rate} |",
         f"| false verification rate | {metrics.false_verification_rate} |",
-        f"| anti-gaming catch rate | {metrics.anti_gaming_catch_rate} |",
+        f"| anti-gaming catch rate | {metrics.anti_gaming_catch_rate} "
+        f"(95% CI {metrics.anti_gaming_catch_rate_ci}) |",
         f"| median tool calls | {metrics.median_tool_calls} |",
         f"| median model tokens | {metrics.median_model_tokens} |",
         f"| median cost (USD) | {metrics.median_cost_usd} |",
         f"| total spend (USD) | {metrics.total_spend_usd} |",
+        f"| median latency (ms) | {metrics.median_latency_ms} |",
+        f"| p95 latency (ms) | {metrics.p95_latency_ms} |",
+        "",
+        "## Per-family rates",
+        "",
+        "| family | executed | verified | rate | 95% CI |",
+        "| --- | --- | --- | --- | --- |",
+        *[
+            f"| {family} | {int(values['executed'])} | {int(values['verified'])} | "
+            f"{values['verified_rate']} | [{values['ci_low']}, {values['ci_high']}] |"
+            for family, values in sorted(scorecard.family_breakdown.items())
+        ],
         "",
         "## Skips and failures",
         "",
@@ -956,6 +1138,9 @@ __all__ = [
     "live_gate_status",
     "resolve_spend_cap",
     "run_eval",
+    "run_comparison",
+    "ComparisonReport",
+    "load_model_safety_corpus",
     "build_scorecard",
     "render_markdown",
 ]

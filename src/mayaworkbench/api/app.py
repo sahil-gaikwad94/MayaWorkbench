@@ -157,6 +157,28 @@ class ControlPlane:
                 )
             return {"projects": rows}
 
+        # WP7 read-only workbench surfaces.
+        if path.startswith("/projects/") and path.endswith("/xray"):
+            identifier = path[len("/projects/"):-len("/xray")].strip("/")
+            return self._project_xray(svc.projects.get(identifier))
+        if path.startswith("/projects/") and path.endswith("/report"):
+            identifier = path[len("/projects/"):-len("/report")].strip("/")
+            return self._project_report(svc.projects.get(identifier))
+        if path.startswith("/runs/") and path.endswith("/dag"):
+            return self._run_dag(svc.runs.get(self._id_segment(path, "/runs/", suffix="/dag")))
+        if path.startswith("/runs/") and path.endswith("/sessions"):
+            return self._run_sessions(
+                svc.runs.get(self._id_segment(path, "/runs/", suffix="/sessions"))
+            )
+
+        # R2I signature surface: claim -> code -> obligation -> evidence graph.
+        # Read-only, derived from persisted records; no new verdict authority.
+        if path.startswith("/projects/") and path.endswith("/r2i-graph"):
+            raw = path[len("/projects/"):-len("/r2i-graph")]
+            identifier = raw.strip("/")
+            project = svc.projects.get(identifier)
+            return self._r2i_graph(project)
+
         if path.startswith("/projects/"):
             identifier = self._id_segment(path, "/projects/")
             project = svc.projects.get(identifier)
@@ -577,6 +599,176 @@ class ControlPlane:
             "steps": [_dump(step) for step in plan.steps] if plan is not None else [],
             "approvals": approvals,
             "workspace": workspace_view,
+        }
+
+    def _project_xray(self, project: Any) -> dict[str, Any]:
+        """Parser coverage and key symbols for the project's pinned snapshot."""
+        svc = self.svc
+        snapshots = svc.snapshots.list_for_project(project.id, limit=1)
+        snapshot = snapshots[0] if snapshots else None
+        if snapshot is None:
+            return {"project_id": project.id, "snapshot_id": None,
+                    "files": [], "symbols": [], "coverage": {},
+                    "note": "no snapshot has been pinned for this project"}
+        files = svc.files.list_by_snapshot(snapshot.id, limit=1000)
+        symbols = svc.symbols.top_level_symbols(snapshot.id, limit=80)
+        coverage: dict[str, dict[str, int]] = {}
+        for item in files:
+            bucket = coverage.setdefault(item.language or "unknown", {})
+            value = getattr(item.parse_coverage, "value", str(item.parse_coverage))
+            bucket[value] = bucket.get(value, 0) + 1
+        return {
+            "project_id": project.id,
+            "snapshot_id": snapshot.id,
+            "identity": snapshot.identity_label,
+            "files": [
+                {"path": item.path, "language": item.language,
+                 "coverage": getattr(item.parse_coverage, "value", str(item.parse_coverage)),
+                 "is_test": item.is_test}
+                for item in files[:200]
+            ],
+            "symbols": [
+                {"id": item.id, "name": item.name, "kind": getattr(item.kind, "value", str(item.kind)),
+                 "location": item.location, "confidence": getattr(item.confidence, "value", str(item.confidence))}
+                for item in symbols
+            ],
+            "coverage": coverage,
+            "symbol_counts": svc.symbols.count_by_kind(snapshot.id),
+            "note": "Lexical/heuristic coverage is not semantic parsing. Inspect exact spans before trusting an edge.",
+        }
+
+    def _project_report(self, project: Any) -> dict[str, Any]:
+        """An exportable, read-only project report built from stored records."""
+        import json as _json
+
+        from mayaworkbench.clock import to_iso
+
+        svc = self.svc
+        repositories = svc.repositories.list_by_project(project.id)
+        snapshots = svc.snapshots.list_for_project(project.id, limit=20)
+        runs = [item for item in svc.runs.list() if item.project_id == project.id]
+        decisions: list[str] = []
+        for run in runs:
+            report = svc.verification.latest_report(run.id)
+            if report is not None:
+                decisions.append(getattr(report.decision, "value", str(report.decision)))
+        payload = {
+            "project": {"id": project.id, "name": project.name, "slug": project.slug},
+            "repositories": [{"id": item.id, "root": item.root_path} for item in repositories],
+            "snapshots": [
+                {"id": item.id, "identity": item.identity_label,
+                 "indexed": to_iso(item.indexed_at) if item.indexed_at else None}
+                for item in snapshots
+            ],
+            "runs": len(runs),
+            "verification_decisions": decisions,
+            "note": "Derived read-only view. A decision is a backend verdict, not a scientific proof.",
+        }
+        payload["canonical_sha256"] = __import__("hashlib").sha256(
+            _json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+        return payload
+
+    def _run_dag(self, run: Any) -> dict[str, Any]:
+        """Plan steps plus recorded state transitions as an inspectable DAG."""
+        svc = self.svc
+        plan = svc.plans.get(run.plan_id) if run.plan_id else svc.plans.latest_for_run(run.id)
+        events = svc.events.list(run_id=run.id, limit=500)
+        nodes = [
+            {"id": f"step-{index}", "type": "step", "label": step.description[:160],
+             "status": "PLANNED"}
+            for index, step in enumerate(plan.steps)
+        ] if plan else []
+        nodes.append({"id": "run", "type": "state", "label": run.state.value, "status": run.state.value})
+        edges = [
+            {"from": f"step-{index}", "to": "run", "kind": "planned_for"}
+            for index in range(len(nodes) - 1)
+        ]
+        return {
+            "run_id": run.id, "state": run.state.value, "nodes": nodes, "edges": edges,
+            "transitions": [
+                {"event": getattr(item.event_type, "value", str(item.event_type)),
+                 "payload": item.payload}
+                for item in events
+                if getattr(item.event_type, "value", "") == "TASK_STATE_CHANGED"
+            ],
+            "note": "Plan steps are declarations; only recorded transitions are facts.",
+        }
+
+    def _run_sessions(self, run: Any) -> dict[str, Any]:
+        """Searchable session/tool event trace for one run (durable records only)."""
+        svc = self.svc
+        events = svc.events.list(run_id=run.id, limit=1000)
+        rows = [
+            {"event_id": item.event_id, "kind": getattr(item.event_type, "value", str(item.event_type)),
+             "timestamp": item.occurred_at.isoformat(),
+             "payload": item.payload}
+            for item in events
+            if "SESSION" in getattr(item.event_type, "value", "").upper()
+        ]
+        return {
+            "run_id": run.id, "events": rows,
+            "note": "Durable event record replay; no live process is reattached.",
+        }
+
+    def _r2i_graph(self, project: Any) -> dict[str, Any]:
+        """Build the claim -> code -> obligation graph from stored evidence."""
+        from mayaworkbench.research.obligations import obligations_for_claims
+
+        svc = self.svc
+        claims = svc.claims.list(project_id=project.id, limit=200)
+        snapshots = svc.snapshots.list_for_project(project.id, limit=1)
+        snapshot = snapshots[0] if snapshots else None
+        mappings = svc.mappings.list_by_snapshot(snapshot.id) if snapshot else []
+        claim_rows = [claim.model_dump(mode="json") for claim in claims]
+        obligations = obligations_for_claims(claim_rows)
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        for claim in claims:
+            nodes.append({
+                "id": claim.id, "type": "claim", "label": claim.statement[:160],
+                "kind": getattr(claim, "kind", None),
+                "review_status": getattr(claim, "review_status", None),
+            })
+        for mapping in mappings:
+            paths = sorted({
+                str(item.get("path") or item.get("span", {}).get("path", ""))
+                for item in (mapping.details or {}).get("evidence", [])
+                if isinstance(item, dict)
+            } - {""})
+            for path in paths:
+                node_id = f"code:{path}"
+                if not any(item["id"] == node_id for item in nodes):
+                    nodes.append({"id": node_id, "type": "code", "label": path})
+                edges.append({
+                    "from": mapping.claim_id, "to": node_id, "kind": "claim_to_code",
+                    "status": mapping.status.value, "confidence": "DERIVED",
+                })
+        for obligation in obligations:
+            node_id = f"obligation:{obligation.id}"
+            nodes.append({
+                "id": node_id, "type": "obligation",
+                "label": obligation.description[:160], "kind": getattr(obligation.kind, "value", obligation.kind),
+                "required": obligation.required,
+            })
+            edges.append({
+                "from": obligation.claim_id, "to": node_id,
+                "kind": "claim_to_obligation", "status": "DERIVED",
+            })
+        return {
+            "project_id": project.id,
+            "snapshot_id": snapshot.id if snapshot else None,
+            "nodes": nodes,
+            "edges": edges,
+            "counts": {
+                "claims": len(claims),
+                "mappings": len(mappings),
+                "obligations": len(obligations),
+            },
+            "note": (
+                "Derived read-only view. Edge status comes from deterministic mapping; "
+                "obligations are typed requirements, not evidence of implementation."
+            ),
         }
 
     def _evidence(self, run_id: str) -> dict[str, Any]:

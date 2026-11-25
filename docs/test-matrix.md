@@ -23,7 +23,7 @@ fail with `ModuleNotFoundError`, which is a setup error, not a product defect.
 ## Latest full-suite result
 
 ```
-844 collected, 837 passed, 7 skipped, 0 failed, 0 errors, 84.5 s
+892 collected, 882 passed, 10 skipped, 0 failed, 0 errors, 579.90 s
 (python -m pytest -q --junitxml=docs/reports/pytest-2026-11-23.xml, exit 0)
 ```
 

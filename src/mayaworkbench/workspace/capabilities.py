@@ -108,6 +108,106 @@ def _cgroup_probe() -> dict[str, Any]:
     }
 
 
+_OCI_LIMIT_PROBE = r"""
+import json, os, socket, sys
+
+port, expected_pids, expected_mem_mb, expected_cpus, secret_marker = sys.argv[1:6]
+report = {"limits": {}, "network": {}, "secrets": {}, "mounts": {}}
+
+# Effective cgroup v2 values as seen by THIS container.
+for name, path in (
+    ("pids", "/sys/fs/cgroup/pids.max"),
+    ("memory_bytes", "/sys/fs/cgroup/memory.max"),
+    ("cpu_quota", "/sys/fs/cgroup/cpu.max"),
+):
+    try:
+        with open(path, encoding="ascii", errors="replace") as handle:
+            report["limits"][name] = handle.read().strip()
+    except OSError as exc:
+        report["limits"][name] = "unreadable:" + type(exc).__name__
+
+# Active network probe: a --network none container cannot reach a listener
+# owned by the parent on loopback. Flag presence alone is not proof.
+try:
+    connection = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+    connection.close()
+    report["network"] = "REACHABLE"
+except OSError:
+    report["network"] = "DENIED"
+
+# Secret denial from every task-visible mount. The original worktree's .env and
+# git config must not exist in the sanitized snapshot at /src.
+for label, path in (
+    ("src_env", "/src/.env"),
+    ("src_git_config", "/src/.git/config"),
+    ("src_npmrc", "/src/.npmrc"),
+    ("src_credentials", "/src/config/credentials.json"),
+):
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(256).decode("utf-8", "replace")
+        report["secrets"][label] = "LEAK" if secret_marker in data else "READABLE"
+    except OSError:
+        report["secrets"][label] = "DENIED"
+
+# Mount visibility: /src must be a read-only bind, /work a writable bind.
+try:
+    with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as handle:
+        mountinfo = handle.read()
+    report["mounts"]["src"] = any(" /src " in line for line in mountinfo.splitlines())
+    report["mounts"]["work"] = any(" /work " in line for line in mountinfo.splitlines())
+except OSError:
+    pass
+
+print("MAYA_OCI_PROBE=" + json.dumps(report, sort_keys=True))
+"""
+
+
+def _verified_limit(
+    name: str, requested: Any, observed: Any, *, matcher=None
+) -> dict[str, Any]:
+    """Build per-limit evidence from an observed value (never from the policy)."""
+    ok = False
+    if matcher is not None:
+        try:
+            ok = bool(matcher(observed))
+        except (TypeError, ValueError):
+            ok = False
+    else:
+        # cgroup files report integers as strings; compare numerically when
+        # both sides are integral so a readback of "8" matches a request of 8.
+        candidate = observed
+        if isinstance(observed, str) and observed.isdigit():
+            candidate = int(observed)
+        ok = (
+            not isinstance(observed, bool)
+            and candidate == requested
+            and observed not in (None, "", "max", "unreadable")
+        )
+    return {
+        "requested": requested,
+        "observed": observed,
+        "status": "enforced" if ok else "not_applied",
+        "mechanism": "cgroup-v2-live-readback" if ok else None,
+        "detail": (
+            f"{name} read back inside the task container and matched the request"
+            if ok
+            else f"{name} could not be verified against the request inside the container"
+        ),
+    }
+
+
+def verified_limits_from_probe(oci: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract the enforced per-limit evidence from an OCI probe report."""
+    limits = oci.get("smoke_test", {}).get("limits", {})
+    return {
+        name: limits[name]
+        for name in ("cpu_quota", "memory_bytes", "pids")
+        if isinstance(limits.get(name), dict) and limits[name].get("status") == "enforced"
+    }
+
+
+
 def _oci_probe() -> dict[str, Any]:
     """Verify rootless OCI availability with a live, task-equivalent probe.
 
@@ -354,6 +454,9 @@ def probe_execution_capabilities() -> dict[str, Any]:
 
 __all__ = [
     "ExecutionCapabilityReport",
+    "_OCI_LIMIT_PROBE",
+    "_verified_limit",
+    "verified_limits_from_probe",
     "probe_execution_capability_report",
     "probe_execution_capabilities",
 ]

@@ -491,6 +491,124 @@ def test_a_check_that_cannot_fit_the_round_budget_is_not_run_not_failed(tmp_path
     assert not round_result.failures
 
 
+def _check_contract(check):
+    from mayaworkbench.domain.models import TaskContract, TaskScope
+
+    return TaskContract(
+        id="con_runtime",
+        task_id="task_runtime",
+        project_id="prj_runtime",
+        version=1,
+        task_type=TaskType.ENGINEERING_CHANGE,
+        goal="x",
+        repository_id="repo_runtime",
+        snapshot_id="snap_runtime",
+        scope=TaskScope(allowed_paths=["a.py"], base_commit_sha="0" * 40),
+        acceptance_criteria=["a"],
+        verification_checks=[check],
+        content_sha256="b" * 64,
+    )
+
+
+class _SpyRuntime:
+    """Records whether checks used the injected runtime or a host runner."""
+
+    def __init__(self, *, script: bool = False):
+        self.calls: list[tuple[str, object]] = []
+        self.script = script
+
+    def _result(self, argv):
+        from mayaworkbench.workspace.runner import CommandResult
+
+        return CommandResult(
+            argv=argv if isinstance(argv, list) else ["<script>"],
+            exit_code=0,
+            stdout='{"status": "PASS", "reason": "spy"}\n' if self.script else "ok\n",
+            stderr="",
+            duration_ms=1,
+            timed_out=False,
+            output_truncated=False,
+        )
+
+    def exec(self, argv, *, timeout_seconds, run_home=None):
+        self.calls.append(("exec", list(argv)))
+        return self._result(argv)
+
+    def exec_script(self, script, *, timeout_seconds, run_home=None):
+        self.calls.append(("exec_script", script))
+        return self._result(["<script>"])
+
+
+def test_inloop_command_check_uses_the_injected_task_runtime(tmp_path, monkeypatch):
+    """P0-03: a rootless check must not fall back to a host CommandRunner."""
+    from mayaworkbench.verification import execution as execution_mod
+
+    def _forbid_host_runner(*args, **kwargs):
+        raise AssertionError("the in-loop check tried to build a host CommandRunner")
+
+    monkeypatch.setattr(execution_mod, "make_runner", _forbid_host_runner)
+    spy = _SpyRuntime()
+    runner = DeclaredCheckRunner(
+        contract=_check_contract(command_check("python -c 'print(1)'", key="cmd")),
+        workspace=tmp_path,
+        run_home=tmp_path / "home",
+        authorized=True,
+        runtime=spy,
+        require_isolated_runtime=True,
+    )
+    round_result = runner.run()
+    assert round_result.passed
+    assert [name for name, _ in spy.calls] == ["exec"]
+    assert spy.calls[0][1][:2] == ["python", "-c"]
+
+
+def test_inloop_invariant_check_uses_runtime_exec_script(tmp_path, monkeypatch):
+    """P0-03: invariant scripts must also run through the shared runtime."""
+    from mayaworkbench.verification import execution as execution_mod
+    from mayaworkbench.verification.registry import invariant_check
+
+    def _forbid_host_runner(*args, **kwargs):
+        raise AssertionError("the invariant check tried to build a host CommandRunner")
+
+    monkeypatch.setattr(execution_mod, "make_runner", _forbid_host_runner)
+    spy = _SpyRuntime(script=True)
+    runner = DeclaredCheckRunner(
+        contract=_check_contract(
+            invariant_check("softmax_row_sum", module="m", callable_name="softmax", key="inv")
+        ),
+        workspace=tmp_path,
+        run_home=tmp_path / "home",
+        authorized=True,
+        runtime=spy,
+        require_isolated_runtime=True,
+    )
+    round_result = runner.run()
+    assert round_result.passed
+    assert [name for name, _ in spy.calls] == ["exec_script"]
+
+
+def test_missing_isolated_runtime_blocks_without_a_host_fallback(tmp_path, monkeypatch):
+    """P0-03: absence of the isolated runtime is a typed BLOCKED, not a downgrade."""
+    from mayaworkbench.verification import execution as execution_mod
+
+    def _forbid_host_runner(*args, **kwargs):
+        raise AssertionError("a missing isolated runtime must never build a host runner")
+
+    monkeypatch.setattr(execution_mod, "make_runner", _forbid_host_runner)
+    runner = DeclaredCheckRunner(
+        contract=_check_contract(command_check("python -c 'print(1)'", key="cmd")),
+        workspace=tmp_path,
+        run_home=tmp_path / "home",
+        authorized=True,
+        runtime=None,
+        require_isolated_runtime=True,
+    )
+    round_result = runner.run()
+    assert round_result.results[0].outcome == "BLOCKED"
+    assert round_result.results[0].infrastructure is True
+    assert "isolated execution runtime" in round_result.results[0].reason
+
+
 def test_feedback_round_does_not_call_a_not_run_check_a_pass(tmp_path):
     from mayaworkbench.domain.models import TaskConstraints, TaskContract, TaskScope
 

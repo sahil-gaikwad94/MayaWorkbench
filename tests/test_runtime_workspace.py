@@ -13,6 +13,8 @@ from mayaworkbench.workspace.runtime_workspace import (
     import_diff_to_worktree,
     manifest,
     populate_overlay,
+    sanitize_source_tree,
+    sanitized_policy_fingerprint,
 )
 from mayaworkbench.workspace.task_runtime import CommandRunnerTaskRuntime
 
@@ -51,6 +53,74 @@ def test_populate_overlay_is_clean_and_content_addressed(tmp_path):
     assert (overlay / "app.py").read_bytes() == (source / "app.py").read_bytes()
     assert not (overlay / ".env").exists()
     assert not (overlay / ".git").exists()
+
+
+def test_sanitize_source_tree_is_secret_free_immutable_and_matches_overlay(tmp_path):
+    """P0-01: a single canonical filter produces both task trees.
+
+    The sanitized /src reference must exclude every path and content pattern
+    the overlay excludes, must be non-writable, and must describe the exact same
+    files as the writable overlay.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (source / ".env").write_text("MAYA_MODEL_API_KEY=sk-canary-value\n", encoding="utf-8")
+    (source / ".npmrc").write_text("//registry.npmjs.org/:_authToken=secret\n", encoding="utf-8")
+    (source / ".git").mkdir()
+    (source / ".git" / "config").write_text("[remote]\n", encoding="utf-8")
+    (source / "config").mkdir()
+    (source / "config" / "credentials.json").write_text('{"token": "hunter2"}', encoding="utf-8")
+    (source / "notes.txt").write_text(
+        "token = AKIAIOSFODNN7EXAMPLE\n", encoding="utf-8"
+    )  # credential-shaped content in a benign filename
+    outside = tmp_path / "host-secret.txt"
+    outside.write_text("HOST-CANARY", encoding="utf-8")
+    (source / "link.txt").symlink_to(outside)
+
+    sanitized = tmp_path / "containers" / "one" / "src"
+    overlay = tmp_path / "containers" / "one" / "work"
+    source_digest = sanitize_source_tree(source, sanitized)
+    overlay_digest = populate_overlay(source, overlay)
+
+    assert source_digest == overlay_digest == {"app.py": source_digest["app.py"]}
+    # Path-based exclusions.
+    for excluded in (".env", ".npmrc", ".git", "config/credentials.json", "link.txt"):
+        assert not (sanitized / excluded).exists(), excluded
+        assert not (overlay / excluded).exists(), excluded
+    # Content-based exclusion (benign filename, credential-shaped content).
+    assert not (sanitized / "notes.txt").exists()
+    assert not (overlay / "notes.txt").exists()
+    # The ordinary project source survives, intact, in both trees.
+    assert (sanitized / "app.py").read_text() == "print('ok')\n"
+    assert (overlay / "app.py").read_text() == "print('ok')\n"
+    # The reference is immutable: no owner write bit on files or directories.
+    assert not (sanitized.stat().st_mode & 0o222)
+    assert not ((sanitized / "app.py").stat().st_mode & 0o222)
+    # The overlay stays writable so the agent can edit the project.
+    assert (overlay / "app.py").stat().st_mode & 0o200
+    # The policy fingerprint binds the manifest to the filter version.
+    expected = sanitized_policy_fingerprint(source_digest)
+    assert expected == sanitized_policy_fingerprint(overlay_digest)
+    assert expected != sanitized_policy_fingerprint({"app.py": "different-digest"})
+
+
+def test_frozen_sanitized_tree_can_be_cleaned_up(tmp_path):
+    """A 0555/0444 snapshot must not leak because rmtree lacks write bits."""
+    import shutil
+
+    from mayaworkbench.workspace.runtime_workspace import unfreeze_tree
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("x", encoding="utf-8")
+    (source / "lib").mkdir()
+    (source / "lib" / "mod.py").write_text("y", encoding="utf-8")
+    frozen = tmp_path / "frozen"
+    sanitize_source_tree(source, frozen)
+    unfreeze_tree(frozen)
+    shutil.rmtree(frozen)
+    assert not frozen.exists()
 
 
 def test_content_diff_reports_added_modified_and_deleted():

@@ -269,3 +269,30 @@ Release evidence: [docs/reports/test-run-2026-11-23.json](docs/reports/test-run-
 | Tests do not depend on globally installed optional packages | `sitecustomize` torch blocker | `tests/test_method_invariants.py` | `SHIPPED` |
 | Local API cannot be driven cross-origin or rebound | `guard_local_request`, security headers, remote-bind opt-in | `tests/test_api_local_security.py` | `SHIPPED` (no user auth by design) |
 | Environment provisioning / live evaluation / held-out corpora | — | — | `NOT_STARTED` (see the remediation page for the concrete blockers) |
+
+## 2026-11-24 merge of the parallel engineering release (both implementations)
+
+`main` carried a parallel commit (079b793) covering the same P0/runtime and
+provisioning scope with a different internal API; this branch carries the
+WP2–WP7 release. The merge keeps the more extensive runtime/provisioning/
+impact implementations from `main` and ports the additive guarantees from
+this branch (validation helpers, CPU-field aliases, capability probe evidence,
+session backend, sanitizer helpers, in-loop isolation guard) plus the unique
+packages that had no counterpart: `evaluation/providers.py`, `evaluation/r2i_grading.py`,
+`research/equations.py`, `verification/method_adapters.py`, `retrieval/evaluation.py`,
+`models/connectors/extended.py`, the R2I/impact/gold corpora, and the
+X-ray/DAG/trace/report workbench surfaces.
+
+| Package | Merged status | Evidence |
+|---|---|---|
+| P0 execution trust | `SHIPPED` (unit); `LIVE_VERIFIED` pending OCI host | `tests/test_execution_backends.py`, `tests/test_isolation_contract.py`, `tests/test_container_sessions.py` |
+| WP1 determinism/security | `SHIPPED` | chunk framing, hermetic torch, canonical JUnit, local API guards |
+| WP2 provisioning | `SHIPPED` (unit) | `tests/test_environment_provisioning.py`, `tests/test_provisioning.py` |
+| WP3 provider/eval | `IMPLEMENTED`/`UNIT_TESTED`; live quality pending keys | `tests/test_eval_live.py`, `tests/test_provider_adapters.py` |
+| WP4 R2I benchmark | contract + UI `SHIPPED`; held-out corpus pending experts | `tests/test_r2i_expansion.py` |
+| WP5 repo intelligence | `SHIPPED` (gold sets + impact + retrieval eval) | `tests/test_repo_intelligence_gold.py`, `tests/test_impact.py` |
+| WP6 connectors | `SHIPPED` (contracts; no live services) | `tests/test_extended_connectors.py` |
+| WP7 workbench | `SHIPPED` (local loopback) | `tests/test_workbench_polish.py`, `tests/test_workbench_ui.py` |
+
+Live OCI containment, real-provider task quality, expert-labelled held-out R2I
+and hosted tenancy remain gated in `docs/release-gates.md`.

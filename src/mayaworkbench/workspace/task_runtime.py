@@ -38,6 +38,10 @@ class TaskExecutionRuntime(Protocol):
         self, script: str, *, timeout_seconds: int, run_home: Path | None = None
     ) -> CommandResult: ...
 
+    def exec_install(
+        self, argv: list[str], *, timeout_seconds: int, run_home: Path | None = None
+    ) -> CommandResult: ...
+
     def collect_artifacts(self) -> list[Path]: ...
 
     def stop(self, *, reason: str, keep_overlay: bool = False) -> None: ...
@@ -52,10 +56,12 @@ class CommandRunnerTaskRuntime:
         workspace: RuntimeWorkspace,
         runner: object,
         trust_profile: str,
+        install_authorized: bool = False,
     ):
         self.workspace = workspace
         self.runner = runner  # CommandRunner or BackendCommandRunner
         self._trust_profile = trust_profile
+        self._install_authorized = install_authorized
 
     @property
     def trust_profile(self) -> str:
@@ -111,6 +117,49 @@ class CommandRunnerTaskRuntime:
     ) -> CommandResult:
         del run_home
         return self.runner.run_script(script, timeout_seconds=timeout_seconds)  # type: ignore[attr-defined]
+
+    def exec_install(
+        self, argv: list[str], *, timeout_seconds: int, run_home: Path | None = None
+    ) -> CommandResult:
+        """Run an explicitly approved dependency-install step.
+
+        Provisioning is a distinct authority from ordinary task commands. The
+        worker sets ``install_authorized`` only after a consumed provisioning
+        approval; the tool gateway never exposes this method. Isolated runtimes
+        refuse it rather than silently executing an install on the host.
+        """
+        from dataclasses import replace
+
+        from mayaworkbench.errors import PolicyError
+        from mayaworkbench.workspace.backends import BackendCommandRunner
+        from mayaworkbench.workspace.runner import (
+            INSTALL_EXECUTABLES,
+            CommandRunner,
+        )
+
+        if not self._install_authorized:
+            raise PolicyError(
+                "dependency installation was not authorized for this run",
+                hint="A consumed provisioning approval is required for install steps.",
+            )
+        if isinstance(self.runner, BackendCommandRunner):
+            raise PolicyError(
+                "dependency installation inside an isolated runtime requires a "
+                "provisioning-capable backend with approved network access; the "
+                "host runner is never used as a fallback"
+            )
+        base = self.runner.policy
+        home = Path(run_home) if run_home else self.runner.run_home / "provisioning"
+        install_policy = replace(
+            base,
+            profile="USER_APPROVED_LOCAL",
+            allow_dependency_install=True,
+            allowed_executables=INSTALL_EXECUTABLES,
+            network_policy="ALLOW_WITH_APPROVAL",
+            trust_profile="LOCAL_TRUSTED",
+        )
+        runner = CommandRunner(self.workspace.path, policy=install_policy, run_home=home)
+        return runner.run(argv, timeout_seconds=timeout_seconds)
 
     def collect_artifacts(self) -> list[Path]:
         return self.workspace.collect_artifacts()

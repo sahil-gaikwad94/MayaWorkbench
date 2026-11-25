@@ -208,3 +208,45 @@ def test_deny_by_default_requires_positive_namespace_proof(tmp_path):
         )
         assert result.blocked and "DENY_BY_DEFAULT" in (result.blocked_reason or "")
         assert not marker.exists()
+
+
+def test_cpu_time_and_core_quota_are_recorded_separately(tmp_path):
+    """Merged contract: CPU time and core quota are distinct dimensions."""
+    from mayaworkbench.domain.models import TaskConstraints
+
+    policy = CommandPolicy(
+        profile="CPU_SMOKE",
+        network_policy="ALLOW_WITH_APPROVAL",
+        dependency_policy="DENY",
+        cpu_time_seconds=30,
+        cpu_quota=2.0,
+        wall_time_seconds=120,
+    )
+    described = policy.describe()
+    assert described["cpu_time_seconds"] == 30   # cumulative CPU TIME budget
+    assert described["cpu_quota"] == 2.0          # concurrency QUOTA
+    assert described["wall_time_seconds"] == 120
+    assert policy.effective_cpu_time_seconds == 30
+    assert policy.cpu_cores == 2.0  # additive alias over their cpu_quota field
+
+    constraints = TaskConstraints(
+        cpu_time_seconds=5,
+        max_runtime_seconds=90,
+        compute_profile="CPU_SMOKE",
+    )
+    mapped = CommandPolicy.from_constraints(constraints)
+    assert mapped.cpu_time_seconds == 5
+
+
+def test_command_result_records_each_cpu_dimension_independently(tmp_path):
+    policy = CommandPolicy(
+        profile="CPU_SMOKE",
+        network_policy="ALLOW_WITH_APPROVAL",
+        dependency_policy="DENY",
+        cpu_time_seconds=15,
+        max_runtime_seconds=60,
+    )
+    runner = CommandRunner(tmp_path, policy=policy, run_home=tmp_path / "home")
+    result = runner.run(["python", "-c", "print('x')"], timeout_seconds=10)
+    assert result.cpu_time_seconds == 15
+    assert result.wall_time_seconds == 10

@@ -222,6 +222,101 @@ def guard_local_request(
         raise ApiError(403, "CROSS_SITE_REQUEST", "Cross-site mutations are refused.")
 
 
+# --------------------------------------------------------------------------
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+_PUBLIC_HOSTS = frozenset({"0.0.0.0", "", "[::]"})
+RATE_WINDOW_SECONDS = 10.0
+# Generous for a local UI (a page + its NDJSON polls + approvals), still a real
+# ceiling against accidental or deliberate local flooding. Tests override the
+# server's limiter threshold directly to exercise the 429 path deterministically.
+RATE_WINDOW_MAX = 600
+
+
+def scrub_secrets(value):  # type: ignore[no-untyped-def]
+    """Recursively replace credential-shaped substrings in a JSON-like value.
+
+    The control plane must never echo secrets back in timeline, event streams,
+    diagnostics or export bundles, even if a backend forgets to redact. This is
+    a last-line scrubber over the serialised shape, applied at the server
+    boundary; the authoritative redaction stays at the tool/storage layer.
+    """
+    from mayaworkbench.workspace.tools import redact
+
+    def walk(item):  # type: ignore[no-untyped-def]
+        if isinstance(item, str):
+            return redact(item)
+        if isinstance(item, list):
+            return [walk(child) for child in item]
+        if isinstance(item, tuple):
+            return [walk(child) for child in item]
+        if isinstance(item, dict):
+            out = {}
+            for key, val in item.items():
+                out[key if isinstance(key, str) else str(key)] = walk(val)
+            return out
+        if isinstance(item, float):
+            return item
+        return item
+
+    return walk(value)
+
+
+def check_host_header(
+    host_header: str | None,
+    *,
+    expected_hosts: set[str],
+) -> None:
+    """DNS-rebinding guard: the Host must name an address we actually bound.
+
+    A local-only API should not answer requests for arbitrary hostnames.
+    """
+    if not host_header:
+        return
+    normalized = host_header.strip().lower()
+    expected = {
+        item.strip().lower() for item in expected_hosts if item.strip()
+    }
+    if normalized in expected:
+        return
+    # Allow alternate loopback spellings with or without an explicit port.
+    base = normalized.split(":", 1)[0] if not normalized.startswith("[") else normalized
+    base = base.split("]", 1)[0].lstrip("[") if base.startswith("[") else base
+    if base in {"localhost", "127.0.0.1", "::1", "[::1]"}:
+        return
+    raise ApiError(403, "HOST_MISMATCH", f"Unexpected Host header: {host_header[:128]}.")
+
+
+def check_origin(origin_header: str | None, *, allowed_origins: set[str]) -> None:
+    """Cross-origin POST guard: refuse cross-origin browser-form POSTs.
+
+    Browsers cannot set ``Origin`` to another site, so any POST whose Origin
+    names a different origin than ours is a classic CSRF attempt. Non-browser
+    clients are expected to use the NDJSON/JSON API directly; they must still
+    present an allowed origin or no Origin header at all.
+    """
+    if not origin_header:
+        return
+    origin = origin_header.strip().lower()
+    if origin in allowed_origins:
+        return
+    raise ApiError(403, "ORIGIN_FORBIDDEN", f"Cross-origin request is not allowed: {origin[:128]}.")
+
+
+def compute_allowed_hosts(host: str, port: int) -> set[str]:
+    """The Host values the server may accept for a binding."""
+    hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", f"0.0.0.0:{port}"}
+    hosts.add(f"127.0.0.1")
+    if not host or host.strip() in _PUBLIC_HOSTS:
+        # Bound to all interfaces: accept the loopback names and the empty form.
+        hosts.add("")
+    return hosts
+
+
+def compute_allowed_origins(host: str, port: int) -> set[str]:
+    return {f"http://127.0.0.1:{port}", f"http://localhost:{port}", f"http://[::1]:{port}"}
+
+
 __all__ = [
     "MAX_BODY_BYTES",
     "ID_RE",
@@ -235,5 +330,12 @@ __all__ = [
     "parse_body",
     "guard_request_path",
     "guard_local_request",
+    "scrub_secrets",
+    "check_host_header",
+    "check_origin",
+    "compute_allowed_hosts",
+    "compute_allowed_origins",
+    "RATE_WINDOW_SECONDS",
+    "RATE_WINDOW_MAX",
     "host_without_port",
 ]

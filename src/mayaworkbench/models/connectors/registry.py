@@ -209,6 +209,9 @@ def build_advanced_connector_registry(
     db_path: str | None = None,
     log_paths: tuple[str, ...] = (),
     infra_paths: tuple[str, ...] = (),
+    notebook_runtime: Any = None,
+    container_client: Any = None,
+    schema_dirs: tuple[str, ...] = (),
 ) -> AdvancedConnectorRegistry:
     """Build the advanced registry with github (read + draft-PR), database, logs, infra."""
     from mayaworkbench.models.connectors.database import DatabaseConnector
@@ -233,6 +236,24 @@ def build_advanced_connector_registry(
         from mayaworkbench.models.connectors.mlflow import MlflowConnector
 
         registry.add(MlflowConnector(opener=http))
+    # WP6: optional connectors are added only when their boundary is supplied.
+    # No notebook/service/schema connector is ever created with a host fallback.
+    if notebook_runtime is not None:
+        from mayaworkbench.models.connectors.extended import JupyterConnector
+
+        registry.add(JupyterConnector(runtime=notebook_runtime))
+    if container_client is not None:
+        from mayaworkbench.models.connectors.extended import ContainerServicesConnector
+
+        registry.add(ContainerServicesConnector(client=container_client))
+    if schema_dirs:
+        from mayaworkbench.models.connectors.extended import DatabaseSchemaConnector
+
+        registry.add(DatabaseSchemaConnector(allowed_dirs=schema_dirs))
+    if http is not None:
+        from mayaworkbench.models.connectors.extended import ScholarlyConnector
+
+        registry.add(ScholarlyConnector(opener=http))
     return registry
 
 

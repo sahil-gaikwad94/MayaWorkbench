@@ -967,6 +967,10 @@ class TaskConstraints(Record):
     #: Execution boundary requested for this task. Isolated profiles block
     #: until a verified runtime backend is available.
     execution_trust: str = "LOCAL_TRUSTED"
+    #: Cumulative CPU seconds (RLIMIT_CPU) -- a TIME budget, not core count.
+    cpu_time_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    #: CPU concurrency / core quota (OCI --cpus or cgroup cpu.max).
+    cpu_cores: int | None = Field(default=None, ge=1, le=256)
     allow_file_deletion: bool = False
     # An unknown model price is not zero. Set this only when the user accepts
     # spend that the contract cannot bound.
