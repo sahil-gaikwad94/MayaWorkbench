@@ -35,6 +35,7 @@ from mayaworkbench.domain.enums import CheckKind, CheckOutcome, ExecutionTrust
 from mayaworkbench.domain.models import CheckSpec, TaskContract
 from mayaworkbench.errors import MayaError
 from mayaworkbench.verification import execution
+from mayaworkbench.tasks.failure_localization import localize_failures
 from mayaworkbench.verification.registry import render_invariant
 
 MAX_EXCERPT_CHARS = 3500
@@ -71,104 +72,33 @@ def redact_text(text: str) -> str:
     return redact(text)
 
 
-def _is_pytest(argv: Iterable[str]) -> bool:
-    args = [str(item) for item in argv]
-    if not args:
-        return False
-    executable = Path(args[0]).name
-    if executable in {"pytest", "py.test"}:
-        return True
-    return (
-        len(args) >= 3
-        and Path(args[0]).name.startswith("python")
-        and args[1] == "-m"
-        and args[2] == "pytest"
-    )
+from mayaworkbench.tasks.checkers import (
+    classify_exit as _classify_exit,
+    detect_family,
+    failing_tests as _failing_tests,
+    test_summary as _test_summary,
+)
 
 
-def classify_exit(argv: Iterable[str], exit_code: int | None, output: str = "") -> tuple[bool, str]:
-    """Return ``(is_infrastructure_failure, reason)`` for one command check.
+def classify_exit(argv, exit_code, output=""):
+    """Backward-compatible wrapper delegating to the checker registry."""
+    return _classify_exit(argv, exit_code, output)
 
-    A genuine assertion failure is attributable to the candidate tree. pytest's
-    non-test failure codes are not: they mean the command could not check
-    anything, so asking the model to "fix the code" would be misleading.
+
+def failing_tests(text, argv=None):
+    """Backward-compatible wrapper.
+
+    ``failing_tests(text)`` keeps the original pytest-only behaviour; pass
+    ``argv`` to select the checker family.
     """
-    if exit_code is None:
-        return True, "the check produced no exit code"
-    if exit_code == 0:
-        return False, "command exited 0"
-    lowered = output.lower()
-    # A checker that cannot import itself, or a command that does not exist,
-    # produced no verdict. exit 1 for "No module named pytest" is NOT a test
-    # failure; calling it one sends the model into a pointless repair loop.
-    broken_markers = (
-        "no module named",
-        "modulenotfounderror",
-        "importerror",
-        "command not found",
-        "not recognized as an internal or external command",
-        "no such file or directory",
-        "unrecognized arguments",
-        "no such option",
-    )
-    if any(marker in lowered for marker in broken_markers):
-        return True, "the checker could not start: the declared command cannot produce a verdict"
-    if exit_code == 127:
-        return True, "the checker executable was not found (exit 127)"
-    if _is_pytest(argv):
-        if "KeyboardInterrupt" in output:
-            return True, "the check was interrupted"
-        if exit_code == 1:
-            return False, "tests were collected and some failed"
-        if exit_code == 3:
-            return True, "pytest reported an internal error (exit 3); the checker is broken, not the code"
-        if exit_code == 4:
-            return True, "pytest reported a usage error (exit 4); the declared command cannot run"
-        if exit_code == 5:
-            return True, "pytest collected no tests (exit 5); the check proves nothing"
-        if exit_code == 6:
-            return True, "pytest exceeded its warning ceiling (exit 6); tests passed but the run is not clean"
-        if exit_code == 2:
-            return False, "pytest was interrupted or collection failed (exit 2)"
-        return False, f"pytest exited with {exit_code}"
-    if exit_code < 0:
-        return False, f"the command was killed by signal {-exit_code}"
-    return False, f"command exited {exit_code}"
-
-
-def failing_tests(text: str) -> list[str]:
-    """Extract failing/erroring test ids from pytest-style output."""
-    found: list[str] = []
-    for pattern in (_PYTEST_FAILED_RE, _PYTEST_HEADER_RE):
-        for match in pattern.finditer(text):
-            candidate = match.group(1).strip()
-            if not candidate or len(candidate) > 300:
-                continue
-            # The FAILURES header repeats the short name of a node id that the
-            # short summary spells in full; keep whichever identifies the test
-            # more precisely instead of listing the same failure twice.
-            duplicate = False
-            for index, item in enumerate(found):
-                if candidate == item or item.endswith(candidate):
-                    duplicate = True
-                    break
-                if candidate.endswith(item):
-                    found[index] = candidate
-                    duplicate = True
-                    break
-            if duplicate:
-                continue
-            found.append(candidate)
-            if len(found) >= MAX_FAILING_TESTS:
-                return found
-    return found
+    return _failing_tests(text, argv)
 
 
 def failure_excerpt(stdout: str, stderr: str, *, limit: int = MAX_EXCERPT_CHARS) -> str:
     """Keep the informative part of a failing command's output.
 
     The failure section (not the progress dots, not the full traceback of every
-    test) is what helps a repair. When no section is recognisable, the head and
+    test) is what helps a repair. When no recognisable, the head and
     tail are kept and the gap is marked, so a truncated excerpt is never
     mistaken for the complete output.
     """
@@ -192,12 +122,8 @@ def failure_excerpt(stdout: str, stderr: str, *, limit: int = MAX_EXCERPT_CHARS)
     return text[:head] + "\n[... output omitted ...]\n" + text[-tail:]
 
 
-def test_summary(text: str) -> str | None:
-    matches = _PYTEST_SUMMARY_RE.findall(strip_ansi(text))
-    if not matches:
-        return None
-    line = matches[-1].strip() if isinstance(matches[-1], str) else str(matches[-1])
-    return line[:300]
+def test_summary(text: str, argv=None) -> str | None:
+    return _test_summary(text, argv)
 
 
 @dataclass
@@ -214,6 +140,7 @@ class CheckFeedback:
     duration_ms: int = 0
     infrastructure: bool = False
     failing_tests: list[str] = field(default_factory=list)
+    localized_failures: list[dict[str, Any]] = field(default_factory=list)
     summary_line: str | None = None
     excerpt: str = ""
     skipped: bool = False
@@ -237,6 +164,8 @@ class CheckFeedback:
         }
         if self.failing_tests:
             payload["failing_tests"] = self.failing_tests
+        if self.localized_failures:
+            payload["localized_failures"] = self.localized_failures
         if self.summary_line:
             payload["summary"] = self.summary_line
         if self.skipped:
@@ -513,8 +442,9 @@ class DeclaredCheckRunner:
             exit_code=result.exit_code,
             duration_ms=result.duration_ms,
             infrastructure=infrastructure,
-            failing_tests=[] if script is not None else failing_tests(combined),
-            summary_line=test_summary(combined),
+            failing_tests=[] if script is not None else failing_tests(combined, argv),
+            localized_failures=[] if script is not None else [item.as_dict() for item in localize_failures(combined)],
+            summary_line=test_summary(combined, argv),
             excerpt=redact_text(excerpt),
             skipped=outcome == CheckOutcome.SKIPPED,
         )
@@ -559,6 +489,7 @@ __all__ = [
     "DeclaredCheckRunner",
     "classify_exit",
     "failing_tests",
+    "localize_failures",
     "failure_excerpt",
     "test_summary",
     "repair_payload",

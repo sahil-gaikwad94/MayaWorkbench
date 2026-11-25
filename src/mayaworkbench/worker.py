@@ -431,6 +431,7 @@ class Worker:
             heartbeat=heartbeat,
             orientation=orientation,
             events=self.services.events,
+            prior_attempts=self._prior_attempts(task),
         )
         heartbeat()
         try:
@@ -468,6 +469,34 @@ class Worker:
                 keep_overlay=(trust == ExecutionTrust.ROOTLESS_CONTAINER.value),
             )
         self._settle(job, outcome)
+
+    def _prior_attempts(self, task: Any) -> list[dict[str, Any]]:
+        """Recall confirmed prior failures that resemble this task, best-first.
+
+        Advisory only: the payload tells the implementer which approaches already
+        failed, never that an approach is forbidden. Unconfirmed attempts are
+        excluded by ``suggest_prior_attempts`` itself, so a run's own speculation
+        cannot come back as evidence against it.
+        """
+        try:
+            suggestions = self.services.memory.suggest_prior_attempts(
+                project_id=task.project_id, goal=task.goal, limit=5
+            )
+        except Exception as exc:  # noqa: BLE001 - recall must never block a run
+            log.warning("prior attempt recall unavailable", extra={"error": str(exc)})
+            return []
+        recalled: list[dict[str, Any]] = []
+        for item in suggestions:
+            recalled.append(
+                {
+                    "memory_id": item.get("memory_id"),
+                    "similarity": item.get("score"),
+                    "goal": item.get("goal", ""),
+                    "hypothesis": item.get("hypothesis", ""),
+                    "base_commit": item.get("base_commit"),
+                }
+            )
+        return recalled
 
     def _import_container_diff(self, run: Any) -> list[dict[str, str]]:
         """Bring the exact container overlay contents into the Git worktree.

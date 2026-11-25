@@ -111,11 +111,17 @@ invariants, independent review, reports and bundles are implemented in Phases
 11. **Experiments are single-host and wall-clock based.** Concurrency on the
     same machine is not controlled; the statistics model run-to-run variation,
     not host interference. Unknown environment fields are reported as gaps.
-12. **No power analysis.** `budget_runs` caps a definition; it does not tell the
-    user how many seeds are needed to detect a given effect.
-13. **Memory has no semantic reconciliation.** It stores scoped statements with
-    provenance but does not deduplicate near-identical entries or resolve
-    contradictions between confirmed memories.
+12. **Power analysis (planning) is now available** via `maya experiment power`
+    (`experiments/power.py`): required seed count for a target Cohen's d at a
+    chosen alpha/power, for paired and independent designs, plus the minimum
+    detectable effect for a given n. The result is a normal approximation to
+    the non-central t distribution and is labelled as a planning estimate, not
+    an exact probability; it does not replace pre-registration or a real run.
+13. **Memory reconciliation is now advisory only.** `memory/advanced.py` provides
+    `find_near_duplicates` (Jaccard similarity on token sets) and `reconcile`
+    (a plan grouping near-duplicates and existing conflicts) via
+    `maya memory reconcile`; nothing is mutated automatically, so contradictions
+    remain the user's to resolve. Near-identical paraphrases are now reported.
 
 ## 6. Phase 5 deliverables
 
@@ -157,11 +163,27 @@ engineering prerequisites for a public alpha are implemented:
 | CLI robustness | Implemented | broken pipe is success; non-encodable output replaced |
 | Real-repository validation | Done | [phase-6-report](phase-6-report.md) §5.2 |
 
-Deliberately still absent after Phase 6: runner-specific exit-code semantics for
-non-pytest checkers, cross-run repair memory, automatic failure localisation,
-language coverage beyond Python, hosted isolation and multi-user auth, and the
-labelled evaluation corpus. Each is a limitation statement in the README rather
-than a hidden stub.
+Deliberately still absent after Phase 6: language coverage beyond Python
+(beyond the Tree-sitter adapters already shipped),
+hosted isolation and multi-user auth, and the labelled evaluation corpus.
+Automatic failure localisation is now implemented in
+`tasks/failure_localization.py` (and the British-spelling alias
+`tasks/failure_localisation.py`): it parses pytest/cargo/go/tsc/eslint/ruff/
+mypy/flake8/gradle/make output and Python tracebacks into concrete
+file:line locations, optionally maps them to indexed symbols, and feeds
+`CheckFeedback.localized_failures` / repair payloads. Cross-run experience
+recall is now implemented: the worker recalls confirmed prior failed attempts
+that resemble the task and passes them to `ControlledAgent` as advisory
+`prior_failed_attempts` context, so the implementer knows which approaches
+already failed without being forbidden from editing. Unconfirmed attempts are
+never recalled, and a failing recall degrades to no advice rather than blocking
+the run; the in-loop repair budget itself remains per-run. Runner-specific
+exit-code semantics for common
+non-pytest checkers (jest/vitest, cargo, go test, tsc, eslint, ruff, mypy,
+flake8/pylint, gradle/maven, make) are now implemented in
+`tasks/checkers.py` and exercised by `tests/test_checkers.py`; unknown
+checkers fall through to the conservative generic family. Each remaining
+item is a limitation statement in the README rather than a hidden stub.
 
 ## 8. Risks to the next phase
 

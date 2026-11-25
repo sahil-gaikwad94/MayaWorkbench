@@ -110,6 +110,12 @@ def register_memory_commands(sub: argparse._SubParsersAction) -> None:  # type: 
     audit = memory_sub.add_parser("audit", help="Report conflicting confirmed memories")
     audit.add_argument("--project")
     audit.set_defaults(func=cmd_memory_audit)
+    reconcile = memory_sub.add_parser(
+        "reconcile", help="Advisory plan for near-duplicate and conflicting memories"
+    )
+    reconcile.add_argument("--project")
+    reconcile.add_argument("--threshold", type=float, default=0.78)
+    reconcile.set_defaults(func=cmd_memory_reconcile)
     retention = memory_sub.add_parser("retention", help="Retract memories past their window")
     retention.add_argument("--project")
     retention.add_argument("--max-age-days", type=int, default=365)
@@ -133,6 +139,21 @@ def cmd_memory_audit(args: argparse.Namespace) -> int:
     conflicts = find_conflicts(_services(args).memory_service, project.id)
     payload = {"conflicts": conflicts}
     console.json(payload) if console.json_mode else console.print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_memory_reconcile(args: argparse.Namespace) -> int:
+    from mayaworkbench.memory.advanced import reconcile
+
+    console = args.console
+    services = _services(args)
+    project = services.resolve_project(args.project)
+    payload = reconcile(
+        services.memory_service, project.id, duplicate_threshold=args.threshold
+    )
+    console.json(payload) if console.json_mode else console.print(
+        json.dumps(payload, indent=2)
+    )
     return 0
 
 

@@ -156,6 +156,7 @@ class ControlledAgent:
         heartbeat: Callable[[], bool] | None = None,
         orientation: dict[str, Any] | None = None,
         events: EventStore | None = None,
+        prior_attempts: list[dict[str, Any]] | None = None,
     ):
         self.settings = settings
         self.gateway = gateway
@@ -170,6 +171,9 @@ class ControlledAgent:
         self.heartbeat = heartbeat
         self.orientation = orientation
         self.events = events
+        #: Confirmed prior failed attempts for this project, recalled by the worker.
+        #: Advisory evidence only: they narrow where to look, never forbid an edit.
+        self.prior_attempts = list(prior_attempts or [])
         self._invalid_actions = 0
         self._last_parse_errors: list[str] = []
         self._recent_failures: list[str] = []
@@ -809,6 +813,15 @@ class ControlledAgent:
             },
             "last_error": last_error,
         }
+        if self.prior_attempts:
+            payload["prior_failed_attempts"] = {
+                "note": (
+                    "Confirmed failures recorded by earlier runs in this project. Treat them "
+                    "as advisory evidence about approaches that already failed; they do not "
+                    "forbid an edit, but repeating one without new evidence is likely wasted."
+                ),
+                "attempts": self.prior_attempts,
+            }
         if self._pending_repair is not None:
             payload["repair_required"] = self._pending_repair
         if self.orientation and run.step_count < ORIENTATION_STEPS:

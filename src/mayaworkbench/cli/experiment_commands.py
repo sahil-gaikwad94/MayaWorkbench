@@ -377,6 +377,28 @@ def register_experiment_commands(sub: argparse._SubParsersAction) -> None:  # ty
     adapter.add_argument("--out", required=True)
     adapter.set_defaults(func=cmd_experiment_export_adapter)
 
+    power = experiment_sub.add_parser(
+        "power", help="Plan the seed count needed to detect a given effect size"
+    )
+    power.add_argument(
+        "--effect-size",
+        type=float,
+        required=True,
+        help="Cohen's d (standardised mean difference) to detect",
+    )
+    power.add_argument("--alpha", type=float, default=0.05)
+    power.add_argument("--power", type=float, default=0.80, dest="target_power")
+    power.add_argument(
+        "--design",
+        choices=["paired", "independent"],
+        default="paired",
+        help="paired = same seeds both arms (default); independent = two arms",
+    )
+    power.add_argument("--max-seeds", type=int, default=1000)
+    power.add_argument("--ratio", type=float, default=1.0,
+                       help="candidate/baseline arm size ratio (independent only)")
+    power.set_defaults(func=cmd_experiment_power)
+
 
 def cmd_experiment_export_adapter(args: argparse.Namespace) -> int:
     from mayaworkbench.experiments.adapters import export_adapter
@@ -930,6 +952,58 @@ def cmd_experiment_verify_bundle(args: argparse.Namespace) -> int:
         for gap in reproduce["gaps"]:
             console.bullet(gap)
     return 0 if result.ok else 1
+
+
+def cmd_experiment_power(args: argparse.Namespace) -> int:
+    console = args.console
+    from mayaworkbench.experiments.power import (
+        required_seeds_independent,
+        required_seeds_paired,
+        minimum_detectable_effect,
+    )
+
+    effect_size = float(args.effect_size)
+    alpha = float(args.alpha)
+    target_power = float(args.target_power)
+    max_seeds = int(args.max_seeds)
+    if args.design == "paired":
+        analysis = required_seeds_paired(
+            effect_size, alpha=alpha, target_power=target_power, max_seeds=max_seeds
+        )
+    else:
+        analysis = required_seeds_independent(
+            effect_size,
+            alpha=alpha,
+            target_power=target_power,
+            max_seeds=max_seeds,
+            ratio=float(args.ratio),
+        )
+    # Also report the minimum detectable effect for the planned seed count, so
+    # the user can compare the plan against their practically important delta.
+    mde = minimum_detectable_effect(
+        analysis.required_seeds,
+        alpha=alpha,
+        target_power=target_power,
+        design=args.design,
+        ratio=float(args.ratio),
+    )
+    payload = analysis.as_dict()
+    payload["minimum_detectable_effect"] = mde
+    if console.json_mode:
+        console.json(payload)
+    else:
+        status = "achievable" if analysis.achievable else "NOT achievable within the seed ceiling"
+        console.print(
+            f"Design: {analysis.design}\n"
+            f"Effect size (Cohen's d): {analysis.effect_size:.4g}\n"
+            f"Alpha: {analysis.alpha:.4g}  Target power: {analysis.target_power:.4g}\n"
+            f"Required seeds: {analysis.required_seeds}  ({status})\n"
+            f"Achieved power at that n: {analysis.achieved_power:.4f}\n"
+            f"Minimum detectable effect at that n: {mde:.4g} (Cohen's d)\n"
+        )
+        for note in analysis.notes:
+            console.print(f"Note: {note}")
+    return 0
 
 
 __all__ = [

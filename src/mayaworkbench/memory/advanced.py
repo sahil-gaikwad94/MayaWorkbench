@@ -145,9 +145,105 @@ def import_bundle(
     return {"created": created, "skipped": skipped, "conflicts": conflicts}
 
 
+def find_near_duplicates(
+    service: Any,
+    project_id: str,
+    *,
+    threshold: float = 0.78,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Find pairs of memories whose statements are near-identical.
+
+    Unlike ``fingerprint`` (which is exact token-set equality), this uses
+    Jaccard similarity on token sets, so paraphrased or slightly reworded
+    entries are reported. Reporting only: nothing is merged or retracted.
+    """
+    if not 0.0 < threshold <= 1.0:
+        raise ProjectMemoryError("threshold must be in (0, 1]")
+    memories = service.list(project_id, limit=limit)
+    out: list[dict[str, Any]] = []
+    for i, left in enumerate(memories):
+        left_tokens = _tokens(left.statement) | _tokens(left.title)
+        if not left_tokens:
+            continue
+        for right in memories[i + 1 :]:
+            right_tokens = _tokens(right.statement) | _tokens(right.title)
+            if not right_tokens:
+                continue
+            union = left_tokens | right_tokens
+            if not union:
+                continue
+            similarity = len(left_tokens & right_tokens) / len(union)
+            if similarity < threshold:
+                continue
+            out.append(
+                {
+                    "left_id": left.id,
+                    "right_id": right.id,
+                    "similarity": round(similarity, 3),
+                    "left_title": left.title,
+                    "right_title": right.title,
+                    "same_kind": left.kind == right.kind,
+                    "advisory": "Reported only; no memory was changed.",
+                }
+            )
+    out.sort(key=lambda item: (-item["similarity"], item["left_id"], item["right_id"]))
+    return out
+
+
+def reconcile(
+    service: Any,
+    project_id: str,
+    *,
+    duplicate_threshold: float = 0.78,
+) -> dict[str, Any]:
+    """Produce an advisory reconciliation plan for a project's memory.
+
+    The plan groups near-duplicate pairs and existing conflicts into suggested
+    actions. It never mutates memory; the user (or a later explicit command)
+    decides whether to retract or supersede an item.
+    """
+    duplicates = find_near_duplicates(
+        service, project_id, threshold=duplicate_threshold
+    )
+    conflicts = find_conflicts(service, project_id)
+    plan: list[dict[str, Any]] = []
+    for item in duplicates:
+        plan.append(
+            {
+                "action": "merge_or_retract_one",
+                "ids": [item["left_id"], item["right_id"]],
+                "reason": "near-duplicate statements",
+                "similarity": item["similarity"],
+            }
+        )
+    for item in conflicts:
+        plan.append(
+            {
+                "action": "resolve_conflict",
+                "ids": [item["left_id"], item["right_id"]],
+                "reason": item.get("reason", "conflicting statements"),
+                "overlap": item.get("overlap"),
+            }
+        )
+    return {
+        "project_id": project_id,
+        "duplicate_threshold": duplicate_threshold,
+        "near_duplicates": duplicates,
+        "conflicts": conflicts,
+        "plan": plan,
+        "advisory": (
+            "Reconciliation is advisory. No memory was changed; confirm or "
+            "retract items explicitly."
+        ),
+    }
+
+
 __all__ = [
     "fingerprint",
     "find_conflicts",
+    "find_near_duplicates",
+    "reconcile",
     "expired_memory_ids",
     "apply_retention",
     "export_bundle",

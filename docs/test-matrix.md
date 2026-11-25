@@ -51,7 +51,11 @@ The slowest tests in this run were
 `test_child_environment_is_sanitized` (2.02 s); the full suite is well inside a
 ten-minute CI budget.
 
-Test collection grew from 782 (2026-11-22) to 834 after the provider hardening
+The checker-registry and failure-localisation packages added `tests/test_checkers.py`
+and `tests/test_failure_localization.py` (per-family exit-code semantics for
+non-pytest checkers and conservative file:line localisation); cross-run
+experience recall added `tests/test_cross_run_memory.py`. Counts above describe
+the 2026-11-23 baseline run and are not restated for later additions. Collection grew from 782 (2026-11-22) to 834 after the provider hardening
 pass. The 2026-11-23 package added
 sanitized-snapshot and mount-policy tests, evidence-based probe tests (including
 a runtime that silently ignores a flag), an injected-runtime in-loop check test,

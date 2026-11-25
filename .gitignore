@@ -23,3 +23,8 @@ htmlcov/
 
 # OS
 .DS_Store
+.polydev/
+
+# Internal tooling snapshot (duplicate of the tree, not source)
+.base/
+.polydev/
